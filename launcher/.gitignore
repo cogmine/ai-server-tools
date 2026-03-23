@@ -1,0 +1,11 @@
+# All machine-specific and runtime-generated data lives in user_data/
+user_data/
+
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Misc
+*.egg-info/
+.env

@@ -1,0 +1,15 @@
+---
+description: "Machine-specific system context for this ai-server-tools deployment. Auto-applied to all files."
+applyTo: "**"
+---
+
+## System
+
+- **Host**: `your-hostname` (user: `your-username`)
+- **GPUs**: N × GPU-model (VRAM GB each), topology notes
+- **CUDA**: version (PyTorch); any nvcc version notes
+- **GPU compute**: sm_XX — any capability notes
+- **RAM**: NNN GB
+- **Storage**: describe your storage layout; all paths configured in `user_data/config.toml`
+   - /path/to/fast/models/    Fast storage — active working set; preferred cache
+   - /path/to/slow/models/    Slow storage — secondary cache or master copy

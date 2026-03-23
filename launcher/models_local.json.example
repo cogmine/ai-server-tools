@@ -1,0 +1,78 @@
+{
+  "_comment": "Model catalog for the AI model launcher. Copy this file to models_local.json and replace with your own models. This file is .gitignored — edit freely.",
+  "_schema": {
+    "id":            "Unique slug — used as --served-model-name / llama.cpp --alias",
+    "name":          "Display name shown in the TUI",
+    "path":          "Absolute path to the model file or directory (NAS, local SSD, or any accessible location).",
+    "format":        "One of: gguf | safetensors_bf16 | safetensors_fp16 | safetensors_fp8 | int8_bnb | exl2 | pytorch_bin",
+    "ai_types":      "List of: text_gen | image_gen | embedding | speech",
+    "ctx":           "Native context window in tokens — set to 0 for image generation models where this is not applicable",
+    "size_gb":       "Approximate disk size in GB (used for VRAM fit warnings)",
+    "quant":         "(optional) Quantisation label for display, e.g. Q4_K_M — mainly for GGUF",
+    "note":          "(optional) Free-text note shown in the TUI",
+    "server_status": "(optional) Per-server test results: {server_id: good|bad|unknown}. Updated by the TUI g/x/? keys.",
+    "server_params": "(optional) Per-server parameter overrides merged on top of server defaults at launch time.",
+    "comfyui_subdir": "(optional, image_gen only) ComfyUI models/ subdirectory to stage into. Default: 'checkpoints'. Use 'diffusion_models' for FLUX UNets."
+  },
+  "models": [
+    {
+      "id": "my-model-bf16",
+      "name": "My Model 70B",
+      "path": "/mnt/nas/ai_models/text-generation/My-Model-70B",
+      "format": "safetensors_bf16",
+      "ai_types": ["text_gen"],
+      "ctx": 32768,
+      "size_gb": 140,
+      "note": "Example BF16 safetensors model"
+    },
+    {
+      "id": "my-model-q4km",
+      "name": "My Model 70B",
+      "path": "/mnt/nas/ai_models/text-generation/My-Model-70B-GGUF/my-model-70b.Q4_K_M.gguf",
+      "format": "gguf",
+      "ai_types": ["text_gen"],
+      "ctx": 32768,
+      "size_gb": 42,
+      "quant": "Q4_K_M"
+    },
+    {
+      "id": "my-model-custom-vllm",
+      "name": "My Model 7B (custom vLLM params)",
+      "path": "/mnt/nas/ai_models/text-generation/My-Model-7B",
+      "format": "safetensors_fp16",
+      "ai_types": ["text_gen"],
+      "ctx": 131072,
+      "size_gb": 14,
+      "server_status": {"vllm": {"none": "good"}},
+      "server_params": {
+        "vllm": {
+          "gpu_mem_util": 0.5,
+          "tensor_parallel": 1,
+          "pipeline_parallel": 1,
+          "executor_backend": "mp"
+        }
+      }
+    },
+    {
+      "id": "sdxl-base-fp16",
+      "name": "Stable Diffusion XL Base 1.0",
+      "path": "/mnt/nas/ai_models/image-generation/sd_xl_base_1.0.safetensors",
+      "format": "safetensors_fp16",
+      "ai_types": ["image_gen"],
+      "ctx": 0,
+      "size_gb": 6.5,
+      "note": "Example SDXL checkpoint"
+    },
+    {
+      "id": "flux-dev-bf16",
+      "name": "FLUX.1-dev",
+      "path": "/mnt/nas/ai_models/image-generation/flux1-dev.safetensors",
+      "format": "safetensors_bf16",
+      "ai_types": ["image_gen"],
+      "ctx": 0,
+      "size_gb": 24,
+      "comfyui_subdir": "diffusion_models",
+      "note": "Example FLUX.1 diffusion UNet — staged to ComfyUI models/diffusion_models/"
+    }
+  ]
+}

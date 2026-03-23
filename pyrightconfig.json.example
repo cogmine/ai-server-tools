@@ -1,0 +1,5 @@
+{
+    "venvPath": "/path/to/miniconda3/envs",
+    "venv": "ai-tools",
+    "pythonVersion": "3.11"
+}

@@ -1,0 +1,109 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Server Launcher — site configuration template
+#
+# Copy this file to config.toml and fill in your system's paths.
+#   cp launcher/config.toml.example launcher/config.toml
+#
+# config.toml is .gitignored.  This example file is tracked.
+# ~ and $VARS are expanded in all path values.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[paths]
+
+# Miniconda / Anaconda base directory
+conda_base = "~/miniconda3"
+
+# Names of the conda environments used by each server type
+vllm_env  = "vllm"
+tabby_env = "tabby"
+
+# Path to the compiled llama-server binary (from llama.cpp)
+llama_server = "~/llama.cpp/build/bin/llama-server"
+
+# tabbyAPI entry point and the staging directory where model symlinks are created
+tabby_main      = "~/tabbyAPI/main.py"
+tabby_model_dir = "~/tabbyAPI/models"
+
+# text-generation-webui (oobabooga) entry point and model staging directory
+# ooba_model_dir is where the launcher creates per-launch model symlinks.
+# It should match (or be inside) ooba's models directory so the UI can also browse them.
+ooba_env        = "textgen"
+ooba_main       = "~/text-generation-webui/server.py"
+ooba_model_dir  = "~/text-generation-webui/user_data/models"
+
+# SGLang server — conda environment name
+sglang_env      = "sglang"
+
+# ComfyUI — conda environment name, path to main.py, and base models directory.
+# The launcher stages symlinks for every catalog image_gen model under comfyui_models_dir,
+# organized by subdirectory (e.g. models/checkpoints/, models/diffusion_models/).
+# resolve_path() is used for each link target, so cached local copies are preferred.
+comfyui_env       = "comfyui"
+comfyui_main      = "~/ComfyUI/main.py"
+comfyui_models_dir = "~/ComfyUI/models"
+
+# Path to the ExLlamaV2 convert.py script used for EXL2 quantization.
+# If this file doesn't exist, the launcher falls back to -m exllamav2.convert
+# (the module entrypoint, available when exllamav2 is installed as a package).
+exl2_convert_script = "~/exllamav2/convert.py"
+
+# CUDA_HOME injected when launching tabbyAPI (needed for flash-attn)
+# Leave empty ("") to skip setting it.
+cuda_home_tabby  = "/usr/local/cuda-12.5"
+
+# CUDA_HOME injected when launching SGLang (directs flashinfer JIT to the right nvcc).
+# cuda-12.1 only supports gcc ≤ 12; use cuda-12.5 or later to support the system gcc.
+# Leave empty ("") to skip setting it.
+cuda_home_sglang = "/usr/local/cuda-12.5"
+
+# Which GPUs to expose to server processes (CUDA_VISIBLE_DEVICES).
+# "" → derive automatically: "0,1,...,N-1" where N = pipeline_parallel below.
+# Example: "0,1,2,3" to restrict to the first four GPUs.
+cuda_visible_devices = ""
+
+
+[gpu]
+
+# Number of GPUs to use for vLLM pipeline parallelism.
+# 0 = auto-detect via NVML at startup.
+# Set explicitly if auto-detection is unreliable in your environment.
+pipeline_parallel = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local cache mounts
+#
+# Each mount is checked in priority order (lowest number first) before
+# falling back to loading directly from the NAS.  The directory structure
+# under each mount root must mirror the NAS tree verbatim.
+#
+# Add or remove [[cache_mounts]] blocks to match your storage layout.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[cache_mounts]]
+label    = "NVMe (fast_models)"
+root     = "~/fast_models"
+priority = 0
+
+[[cache_mounts]]
+label    = "SATA (sda1)"
+root     = "/mnt/sda1/models"
+priority = 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Port overrides  (optional)
+#
+# Default ports are defined in data.py.  Override any server's port here.
+# Key is the server ID as it appears in data.py SERVERS list.
+# Omit keys to keep the defaults.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[ports]
+# vllm     = 5000
+# llamacpp = 5000
+# tabby    = 5000
+# ooba     = 5000      # API port
+# ooba_webui = 7860    # Gradio WebUI port (separate from the API port)
+# sglang   = 5000
+# comfyui  = 8188

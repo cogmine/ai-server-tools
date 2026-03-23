@@ -1,0 +1,15 @@
+# Personal/local files — not for version control
+user_data/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+.vscode/settings.json
+pyrightconfig.json
+.github/instructions/system-local.instructions.md
