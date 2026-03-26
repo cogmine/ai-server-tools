@@ -36,7 +36,7 @@ def _count_gpus() -> int:
 
 @dataclass
 class CacheMountConfig:
-    """One local storage tier that caches a subset of the NAS model library."""
+    """One local storage tier that caches a subset of the source model library."""
     label:    str
     root:     Path
     priority: int  # lower = checked first

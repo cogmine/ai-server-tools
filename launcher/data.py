@@ -116,7 +116,6 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.GGUF,
             ModelFormat.SAFETENSORS_BF16,
             ModelFormat.SAFETENSORS_FP16,
-            ModelFormat.SAFETENSORS_FP8,
             ModelFormat.AWQ,
             ModelFormat.GPTQ,
             ModelFormat.INT8_BNB,

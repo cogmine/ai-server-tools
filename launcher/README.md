@@ -1,6 +1,6 @@
 # Model Server Launcher
 
-A keyboard-driven Textual TUI for selecting and launching AI model inference servers. Supports vLLM, llama.cpp, tabbyAPI / ExLlamaV2, SGLang, ComfyUI, and more, with live VRAM readout, per-server test-result tracking, and NAS→local model caching.
+A keyboard-driven Textual TUI for selecting and launching AI model inference servers. Supports vLLM, llama.cpp, tabbyAPI / ExLlamaV2, SGLang, ComfyUI, and more, with live VRAM readout, per-server test-result tracking, and remote-to-local model caching.
 
 ![Launcher screenshot](../.github/assets/launcher.png)
 
@@ -95,7 +95,7 @@ Quick example:
 {
   "id":       "my-model-q4",
   "name":     "My Model 7B",
-  "path": "/mnt/nas/ai_models/text-generation/my-model.Q4_K_M.gguf",
+  "path": "/mnt/models/text-generation/my-model.Q4_K_M.gguf",
   "format":   "gguf",
   "ai_types": ["text_gen"],
   "ctx":      32768,

@@ -11,7 +11,7 @@ A toolkit for managing AI model servers on an NVIDIA multi-GPU workstation or se
 ## Tools
 
 ### [Launcher](launcher/README.md)
-A keyboard-driven Textual TUI for selecting and launching AI model inference servers (vLLM, llama.cpp, tabbyAPI / ExLlamaV2, SGLang, ComfyUI, and more). Features live VRAM readout, per-model/per-server test-result tracking, NAS→local model caching, and in-TUI quantization.
+A keyboard-driven Textual TUI for selecting and launching AI model inference servers (vLLM, llama.cpp, tabbyAPI / ExLlamaV2, SGLang, ComfyUI, and more). Features live VRAM readout, per-model/per-server test-result tracking, remote-to-local model caching, and in-TUI quantization.
 
 ![Launcher screenshot](.github/assets/launcher.png)
 

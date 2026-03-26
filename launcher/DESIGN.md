@@ -55,7 +55,7 @@ user_data/config.toml (gitignored)
 `data.py` contains the SERVERS list and CACHE_MOUNTS table — both are fully config-driven (paths come from CONFIG) and are safe to commit.
 
 `user_data/models_local.json` (gitignored) contains the AI_MODELS catalog. It is a plain JSON file: one object with a `"models"` array, each element corresponding to one `AIModel`. Being JSON rather than Python means:
-- A future NAS scanner can generate or update it without touching Python source
+- A future catalog scanner can generate or update it without touching Python source
 - Status updates (`save_server_status`) are a trivial `json.load` / mutate / `json.dump` — no regex surgery
 - Users can edit it without risk of breaking Python syntax
 
@@ -76,7 +76,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | Field | Purpose |
 |---|---|
 | `id` | Unique slug; becomes `--served-model-name` / llama.cpp `--alias` |
-| `path` | Absolute path to the model file or directory — any accessible location (NAS, local SSD, etc.) |
+| `path` | Absolute path to the model file or directory — any accessible location (local SSD, network share, etc.) |
 | `format` | Gates server compatibility (`ModelFormat` enum) |
 | `ai_types` | frozenset of AIType — determines which type-selection menus it appears in |
 | `ctx` | Native/trained maximum context length (tokens); used verbatim if no `ctx_override` is set |
@@ -86,6 +86,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `min_sm` | Minimum CUDA compute capability required to load this model (integer, e.g. `89` for sm_89+). `0` = no constraint. Checked against `system_min_sm()` at display time. |
 | `hw_note` | Optional human-readable explanation shown in the note bar when `hw_compat()` returns `False`. When omitted, `hw_compat_note` generates a default: `"Requires sm_{min_sm}+ GPU"`. |
 | `comfyui_subdir` | `image_gen` models only — ComfyUI `models/` subdirectory to stage into. Default: `"checkpoints"` (omit from JSON). Use `"diffusion_models"` for FLUX UNets. Extensible: any valid subdirectory name accepted by ComfyUI. |
+| `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time. Omitted from JSON when empty. |
 | `cached_path` | Optional absolute path to a faster local copy. Set by the TUI cache action; cleared on uncache. `resolve_path()` returns this when non-empty and present on disk, otherwise returns `path`. Multiple entries may share the same `cached_path` when they point to the same source directory — `save_cached_path()` fans out to all of them. || `server_status` | `{server_id: {quant_key: status}}` — outer key is server id; inner key is `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`); value is `"good"` / `"bad"` / `"unknown"`. Only one quant key may be `"good"` per server (exclusive). |
 | `server_params` | Per-server overrides merged on top of server defaults at launch time |
 
@@ -404,11 +405,11 @@ ComfyUI differs from text generation servers in one key way: **it does not accep
 | `"checkpoints"` (default) | `~/ComfyUI/models/checkpoints/` | SDXL / SD1.5 full checkpoints |
 | `"diffusion_models"` | `~/ComfyUI/models/diffusion_models/` | FLUX UNets / diffusion transformers |
 
-Each link target is `model.resolve_path()` — so a locally cached copy is used whenever one exists, and the NAS path is used otherwise. The symlink name is the **original source filename** (`Path(model.resolve_path()).name`) because ComfyUI workflows reference models by their natural filenames (e.g. `flux1-dev.safetensors`, `ae.safetensors`). This is controlled by `staging_use_source_filename=True` on the ComfyUI `ServerSoftware` entry.
+Each link target is `model.resolve_path()` — so a locally cached copy is used whenever one exists, and the source path is used otherwise. The symlink name is the **original source filename** (`Path(model.resolve_path()).name`) because ComfyUI workflows reference models by their natural filenames (e.g. `flux1-dev.safetensors`, `ae.safetensors`). This is controlled by `staging_use_source_filename=True` on the ComfyUI `ServerSoftware` entry.
 
 This is fully driven by catalog entries. Adding a model to the catalog (via `ingest --ai-type image_gen`) and launching ComfyUI is all that's needed for it to appear in ComfyUI's model picker.
 
-**Text encoders** (T5-XXL, CLIP-L) are not catalog entries — they are workflow components referenced directly by ComfyUI nodes. They are registered in `~/ComfyUI/extra_model_paths.yaml` under `text_encoders` pointing at the NAS `t5/` directory.
+**Text encoders** (T5-XXL, CLIP-L) are not catalog entries — they are workflow components referenced directly by ComfyUI nodes. They are registered in `~/ComfyUI/extra_model_paths.yaml` under `text_encoders` pointing at the `t5/` directory.
 
 **Installation**: Run directly from the cloned repo (`~/ComfyUI/`). `git pull` to update — no reinstallation needed. Dependencies live in the `comfyui` conda env (`requirements.txt` installed there).
 

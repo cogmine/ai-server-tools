@@ -29,6 +29,8 @@ A `changes` file lives in the repo root (gitignored). After every coding session
 
 **Format:** Use a blank line between logically distinct groups of changes. Within a group, one line per file or sub-topic. A group may be preceded by a short header line (no prefix) if it aids readability. Omit fine implementation details — describe *what* changed and *why* when not obvious, not *how*. For large refactors, a few summary lines beats a line-per-file inventory.
 
+Do not include changes to local settings files (e.g. `config.toml`) or to data files (e.g. `models_local.json`), as those files do not get committed.
+
 ## Agent Tool Notes
 
 ### Logs — sensitivity caution
@@ -189,6 +191,7 @@ Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted
 `min_sm` field: integer minimum CUDA compute capability (e.g. `89` for sm_89+); `0` = no constraint. Checked against `system_min_sm()` from `gpu.py` (cached). When `model.hw_compat(system_sm)` is `False`, the warn column shows `⛔` and the note bar below the model table shows `model.hw_note`.
 `hw_note` field: string explaining the hardware requirement — shown in the launcher note bar when incompatible. Omitted from JSON when empty.
 `comfyui_subdir` field: `image_gen` models only — ComfyUI `models/` subdirectory to stage into (e.g. `"checkpoints"` for SDXL, `"diffusion_models"` for FLUX UNets, `"vae"`, `"loras"`). Default `"checkpoints"` — key omitted from JSON for checkpoints. Staging uses the original source filename (`staging_use_source_filename=True` on ComfyUI's `ServerSoftware`) so ComfyUI workflows can reference models by their natural names (e.g. `flux1-dev.safetensors`, `ae.safetensors`).
+`mmproj_path` field: absolute path to the companion `mmproj-*.gguf` vision encoder file; omitted from JSON when empty. Auto-detected by `ingest`/`refresh` when found in the GGUF bundle root (flat layout) or bundle root one level above the quant subdir. Populated via `copy-mmproj` + `refresh` workflow. Passed as `--mmproj` to llama.cpp and ooba at launch time.
 Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. Default order: `fav → status → name`. Clicking a header promotes it to primary (ascending); clicking the primary toggles direction. `_STATUS_RANK` maps composite status symbols (✓, ✓?, ✓✗, ✗?, ✗, ?) to integers 0–5 for sort.
 
 **Log files**: `logs/{timestamp}_{server}_{model}.log`. Header contains metadata + a paste-ready command block (no `#` prefix on the command lines). Exit footer: `# exit: code N` or `# exit: killed by SIGSEGV (11)`. Captured via PTY so ANSI colours are preserved. SIGWINCH is forwarded to the PTY so progress bars resize live.

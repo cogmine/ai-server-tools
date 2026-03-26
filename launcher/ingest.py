@@ -1,5 +1,4 @@
-"""
-ingest.py — Tools for populating and enriching models_local.json from disk.
+"""ingest.py — Tools for populating and enriching models_local.json from disk.
 
 Subcommands:
   copy-configs <scan_root> [--dry-run]
@@ -8,6 +7,12 @@ Subcommands:
       original (non-GGUF) model and copy its config/tokenizer files across.
       Run this before ingesting a new GGUF bundle so that 'ingest' can read
       accurate context-window and architecture metadata from it.
+
+  copy-mmproj <scan_root> [--dry-run]
+      Scan scan_root for GGUF bundle directories that lack an mmproj-*.gguf
+      file.  For each, search for a matching original model directory and copy
+      its mmproj file into the bundle root.  Run this before ingesting (or
+      refreshing) vision GGUFs so that mmproj_path is populated automatically.
 
   ingest <scan_root> [--ai-type text_gen|image_gen] [--all] [--dry-run]
       Scan scan_root for models not already catalogued in models_local.json
@@ -23,12 +28,13 @@ Subcommands:
       Add a single specific model by absolute path.
 
 Usage:
-    python -m launcher.ingest copy-configs /mnt/nas/ai_models/text-generation [--dry-run]
-    python -m launcher.ingest ingest /mnt/nas/ai_models/text-generation [--dry-run]
-    python -m launcher.ingest ingest /mnt/nas/ai_models/text-generation --all [--dry-run]
-    python -m launcher.ingest ingest --path /mnt/nas/ai_models/text-generation/MyModel [--dry-run]
-    python -m launcher.ingest ingest /mnt/nas/ai_models/text-to-image/checkpoints --ai-type image_gen --all
-    python -m launcher.ingest ingest /mnt/nas/ai_models/text-to-image/flux --ai-type image_gen --all
+    python -m launcher.ingest copy-configs /mnt/models/text-generation [--dry-run]
+    python -m launcher.ingest copy-mmproj /mnt/models/text-generation [--dry-run]
+    python -m launcher.ingest ingest /mnt/models/text-generation [--dry-run]
+    python -m launcher.ingest ingest /mnt/models/text-generation --all [--dry-run]
+    python -m launcher.ingest ingest --path /mnt/models/text-generation/MyModel [--dry-run]
+    python -m launcher.ingest ingest /mnt/models/text-to-image/checkpoints --ai-type image_gen --all
+    python -m launcher.ingest ingest /mnt/models/text-to-image/flux --ai-type image_gen --all
 """
 from __future__ import annotations
 
@@ -84,7 +90,7 @@ def _save_catalog(path: Path, catalog: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# NAS scanning
+# Model directory scanning
 # ---------------------------------------------------------------------------
 
 def _looks_like_model_dir(path: Path) -> bool:
@@ -97,33 +103,43 @@ def _looks_like_model_dir(path: Path) -> bool:
     return False
 
 
-def _iter_candidates(nas_dir: Path):
-    """Yield (path, format) candidate pairs from nas_dir in sorted order.
+def _iter_candidates(scan_dir: Path):
+    """Yield (path, format) candidate pairs from scan_dir in sorted order.
 
     Yields:
-      - (gguf_file, "gguf") for each .gguf file inside a GGUF bundle directory,
-        so each quant variant becomes its own catalog entry.
+      - (gguf_file, "gguf") for each .gguf file inside a GGUF bundle directory.
+        Scans two levels deep: flat bundles (entry/*.gguf) and per-quant-subdir
+        bundles (entry/<quant>/*.gguf), so each quant variant becomes its own
+        catalog entry.
       - (hf_dir, fmt) for each format detected in an HF model directory.
         Directories with both safetensors and pytorch_bin weights yield one pair
         per format so each becomes a separate catalog entry.
       - (gguf_file, "gguf") for top-level .gguf files (unusual but handled).
     """
-    if not nas_dir.exists():
-        print(f"[ingest] NAS directory not found: {nas_dir}", file=sys.stderr)
+    if not scan_dir.exists():
+        print(f"[ingest] Directory not found: {scan_dir}", file=sys.stderr)
         return
 
-    for entry in sorted(nas_dir.iterdir()):
+    for entry in sorted(scan_dir.iterdir()):
         if entry.name.startswith("."):
             continue
         if entry.is_file():
-            if entry.suffix.lower() == ".gguf":
+            if entry.suffix.lower() == ".gguf" and not entry.stem.lower().startswith("mmproj"):
                 yield entry, "gguf"
         elif entry.is_dir():
+            # Check for GGUF files one level deep (flat bundle: entry/*.gguf,
+            # or per-quant subdirs: entry/<quant>/*.gguf).  Avoids rglob, which
+            # would recursively traverse large HF model directories on slow storage.
             gguf_files = sorted(entry.glob("*.gguf"))
+            if not gguf_files:
+                for subdir in sorted(entry.iterdir()):
+                    if subdir.is_dir() and not subdir.name.startswith("."):
+                        gguf_files.extend(sorted(subdir.glob("*.gguf")))
             if gguf_files:
-                # Yield each GGUF file individually
+                # Skip mmproj-* files (multimodal projectors — not standalone models).
                 for gguf_file in gguf_files:
-                    yield gguf_file, "gguf"
+                    if not gguf_file.stem.lower().startswith("mmproj"):
+                        yield gguf_file, "gguf"
             elif _looks_like_model_dir(entry):
                 cfg = _read_hf_config(entry)
                 for fmt in _detect_all_hf_formats(entry, cfg):
@@ -132,21 +148,21 @@ def _iter_candidates(nas_dir: Path):
 
 
 def find_new_model(
-    nas_dir: Path, known: set[tuple[str, str]]
+    scan_dir: Path, known: set[tuple[str, str]]
 ) -> tuple[Path, str] | None:
     """Return the first candidate (path, format) not already present in the catalog."""
-    for candidate, fmt in _iter_candidates(nas_dir):
+    for candidate, fmt in _iter_candidates(scan_dir):
         if (str(candidate), fmt) not in known:
             return candidate, fmt
     return None
 
 
 def find_all_new_models(
-    nas_dir: Path, known: set[tuple[str, str]]
+    scan_dir: Path, known: set[tuple[str, str]]
 ) -> list[tuple[Path, str]]:
     """Return all candidate (path, format) pairs not already present in the catalog."""
     return [
-        (c, f) for c, f in _iter_candidates(nas_dir)
+        (c, f) for c, f in _iter_candidates(scan_dir)
         if (str(c), f) not in known
     ]
 
@@ -732,7 +748,15 @@ def do_copy_configs(scan_root: Path, dry_run: bool) -> None:
                 continue
             if entry.name in seen:
                 continue
+            # Mirror _iter_candidates: check flat layout (entry/*.gguf) and
+            # one level of per-quant subdirs (entry/<quant>/*.gguf).
             gguf_files = list(entry.glob("*.gguf"))
+            if not gguf_files:
+                for subdir in sorted(entry.iterdir()):
+                    if subdir.is_dir() and not subdir.name.startswith("."):
+                        gguf_files.extend(subdir.glob("*.gguf"))
+                        if gguf_files:
+                            break  # one hit is enough to confirm it's a GGUF bundle
             if not gguf_files:
                 continue  # not a GGUF bundle dir
             seen.add(entry.name)
@@ -761,6 +785,79 @@ def do_copy_configs(scan_root: Path, dry_run: bool) -> None:
         print(f"\n[copy-configs] dry-run complete — {processed} director(ies) would be updated.")
     else:
         print(f"\n[copy-configs] Done — {processed} director(ies) updated.")
+
+
+def _find_mmproj(bundle_root: Path) -> Path | None:
+    """Return the first mmproj-*.gguf file found in bundle_root, or None."""
+    matches = sorted(bundle_root.glob("mmproj-*.gguf"))
+    return matches[0] if matches else None
+
+
+def do_copy_mmproj(scan_root: Path, dry_run: bool) -> None:
+    """Copy mmproj files from original model dirs into their GGUF bundle directories.
+
+    Scans scan_root and cache mount subdirs for GGUF bundle directories that
+    lack an mmproj-*.gguf file.  For each, searches for a matching original
+    model directory and copies its mmproj file into the bundle root.
+    """
+    all_roots = _all_roots(scan_root)
+    if not all_roots:
+        print(f"[copy-mmproj] No accessible roots found under {scan_root}.", file=sys.stderr)
+        return
+
+    processed = 0
+    seen: set[str] = set()
+    for root in all_roots:
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            if entry.name in seen:
+                continue
+            # Confirm it is a GGUF bundle (flat or per-quant-subdir layout).
+            gguf_files = list(entry.glob("*.gguf"))
+            if not gguf_files:
+                for subdir in sorted(entry.iterdir()):
+                    if subdir.is_dir() and not subdir.name.startswith("."):
+                        gguf_files.extend(subdir.glob("*.gguf"))
+                        if gguf_files:
+                            break
+            if not gguf_files:
+                continue
+            seen.add(entry.name)
+
+            if _find_mmproj(entry):
+                print(f"  {entry.name}: already has mmproj — skipping")
+                continue
+
+            original = _find_original_model(entry.name, all_roots)
+            if original is None:
+                print(f"  {entry.name}: original model not found — skipping")
+                continue
+
+            mmproj_found = sorted(original.glob("mmproj-*.gguf"))
+            if not mmproj_found:
+                # Not a vision model — silently skip.
+                continue
+
+            print(f"  {entry.name}  ←  {original}")
+            for src in mmproj_found:
+                dst = entry / src.name
+                if dry_run:
+                    print(f"    would copy  {src.name}")
+                else:
+                    shutil.copy2(src, dst)
+                    print(f"    copied      {src.name}")
+            processed += 1
+
+    if processed == 0:
+        print(
+            "[copy-mmproj] Nothing to do — all GGUF directories either already have "
+            "an mmproj file, no matching original was found, or no originals contain mmproj files."
+        )
+    elif dry_run:
+        print(f"\n[copy-mmproj] dry-run complete — {processed} director(ies) would be updated.")
+    else:
+        print(f"\n[copy-mmproj] Done — {processed} director(ies) updated.")
 
 
 # ---------------------------------------------------------------------------
@@ -792,8 +889,20 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     quant_suffix = f"-{_quant_slug(quant)}" if quant else ""
     entry_id = f"{_slugify(display_name)}{quant_suffix}"
 
-    # Use config.json from the GGUF bundle dir if available (placed by copy-configs)
+    # Collision guard: if this ID already belongs to a different path (e.g. a
+    # safetensors_bf16 dir whose format slug matches this quant slug), append
+    # "-gguf" to disambiguate rather than silently creating a duplicate key.
+    _id_to_path = {m["id"]: m["path"] for m in catalog.get("models", [])}
+    if entry_id in _id_to_path and _id_to_path[entry_id] != str(gguf_path):
+        entry_id = f"{entry_id}-gguf"
+
+    # Use config.json from the GGUF bundle dir if available (placed by copy-configs).
+    # For per-quant-subdir layout (bundle_root/QUANTNAME/file.gguf), parent is the quant
+    # subdir and config.json lives in the bundle root — walk up one extra level if needed.
     cfg = _read_hf_config(parent)
+    if not cfg:
+        # parent may be a quant subdir; try bundle root one level up
+        cfg = _read_hf_config(parent.parent)
     if cfg:
         ctx           = _detect_ctx(cfg)
         params_m      = _detect_params_m(cfg, gguf_path.stem)
@@ -808,6 +917,10 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
         moe_experts   = moe_active = 0
         vision        = False
         trust_rc      = False
+
+    # Only search for an mmproj file when this is a vision model — non-vision GGUFs
+    # never have one, and glob() on slow storage is expensive at catalog-refresh scale.
+    mmproj_path = (_find_mmproj(parent) or _find_mmproj(parent.parent)) if vision else None
 
     entry: dict[str, Any] = {
         "id": entry_id,
@@ -825,6 +938,7 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     if moe_experts:   entry["moe_experts"]  = moe_experts
     if moe_active:    entry["moe_active"]   = moe_active
     if vision:        entry["vision"]       = True
+    if mmproj_path:   entry["mmproj_path"]  = str(mmproj_path)
     if trust_rc:      entry["trust_remote_code"] = True
     return entry
 
@@ -860,7 +974,7 @@ def detect_hf_dir(
         entry_id = f"{_slugify(model_dir.name)}-{fmt_short}"
 
     print(
-        "[ingest] Computing directory size (may take a moment over NAS) …",
+        "[ingest] Computing directory size (may take a moment on slow storage) …",
         file=sys.stderr,
     )
     size_globs = _FORMAT_WEIGHT_GLOBS.get(fmt)
@@ -928,7 +1042,7 @@ def _detect_imagegen_comfyui_subdir(path: Path) -> str:
 
     FLUX diffusion model UNets go in diffusion_models/; standard checkpoints
     (SDXL, SD1.5) go in checkpoints/.  Detection uses the parent directory name
-    and filename, covering both the NAS layout and ad-hoc paths.
+    and filename, covering both the standard layout and ad-hoc paths.
     """
     name = path.name.lower()
     parent = path.parent.name.lower()
@@ -982,7 +1096,7 @@ def detect_image_gen(path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
 # favorite, server_status, server_params, min_sm, hw_note, comfyui_subdir,
 # quant, trust_remote_code) are never touched by refresh.
 _REFRESHABLE_FIELDS: frozenset[str] = frozenset({
-    "arch", "ctx", "moe_active", "moe_experts", "params_m", "size_gb", "vision",
+    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "params_m", "size_gb", "vision",
 })
 
 
@@ -1028,13 +1142,14 @@ def _refresh_one(
         if field == "params_m":              return int(raw)   if raw else 0
         if field == "size_gb":               return float(raw) if raw else 0.0
         if field in ("arch",):               return str(raw) if raw else ""
+        if field == "mmproj_path":            return str(raw) if raw else ""
         if field == "ctx":                   return int(raw) if raw else 32_768
         if field in ("moe_experts", "moe_active"): return int(raw) if raw else 0
         if field in ("vision",):              return bool(raw)
         return raw
 
     # Fields omitted from JSON when default — delete key rather than write falsy value
-    _omit_when_default = frozenset({"params_m", "arch", "moe_experts", "moe_active", "vision"})
+    _omit_when_default = frozenset({"params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path"})
 
     changes: list[str] = []
     updated = dict(entry)
@@ -1158,9 +1273,10 @@ def main() -> None:
         description="Tools for populating and enriching models_local.json from disk.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "subcommands:\n"
+            "Subcommands:\n"
             "  ingest         Add uncatalogued models (scan or specific path)\n"
             "  copy-configs   Copy HF config files into GGUF bundle directories\n"
+            "  copy-mmproj    Copy mmproj files into GGUF bundle directories\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", metavar="SUBCOMMAND")
@@ -1232,9 +1348,23 @@ def main() -> None:
     copy_p.add_argument(
         "scan_root",
         metavar="SCAN_ROOT",
-        help="Primary directory to scan (e.g. /mnt/nas/ai_models/text-generation).",
+        help="Primary directory to scan (e.g. /mnt/models/text-generation).",
     )
     _add_dry_run_arg(copy_p)
+
+    mmproj_p = subparsers.add_parser(
+        "copy-mmproj",
+        help=(
+            "Copy mmproj files from original model dirs into their "
+            "GGUF bundle directories."
+        ),
+    )
+    mmproj_p.add_argument(
+        "scan_root",
+        metavar="SCAN_ROOT",
+        help="Primary directory to scan (e.g. /mnt/models/text-generation).",
+    )
+    _add_dry_run_arg(mmproj_p)
 
     args = parser.parse_args()
 
@@ -1248,6 +1378,14 @@ def main() -> None:
         root_list = "\n  ".join(str(r) for r in all_roots)
         print(f"[copy-configs] Scanning roots:\n  {root_list}")
         do_copy_configs(scan_root, args.dry_run)
+        return
+
+    if args.command == "copy-mmproj":
+        scan_root = Path(args.scan_root)
+        all_roots = _all_roots(scan_root)
+        root_list = "\n  ".join(str(r) for r in all_roots)
+        print(f"[copy-mmproj] Scanning roots:\n  {root_list}")
+        do_copy_mmproj(scan_root, args.dry_run)
         return
 
     # ---- ingest ------------------------------------------------------------

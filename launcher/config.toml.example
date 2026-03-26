@@ -74,8 +74,8 @@ pipeline_parallel = 0
 # Local cache mounts
 #
 # Each mount is checked in priority order (lowest number first) before
-# falling back to loading directly from the NAS.  The directory structure
-# under each mount root must mirror the NAS tree verbatim.
+# falling back to loading directly from the source location.  The directory
+# structure under each mount root must mirror the source tree verbatim.
 #
 # Add or remove [[cache_mounts]] blocks to match your storage layout.
 # ─────────────────────────────────────────────────────────────────────────────

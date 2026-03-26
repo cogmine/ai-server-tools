@@ -112,6 +112,27 @@ class GGUFQuant(str, Enum):
     IQ4_XS  = "IQ4_XS"  # ~4.3 bpw  — often better than Q4_K_M at same size
     IQ4_NL  = "IQ4_NL"  # ~4.5 bpw  — non-linear 4-bit (llama.cpp NL tables)
 
+    # --- K-quant XL variants (Unsloth Dynamic extended-context) -------------
+    # Longer names must be listed so GGUF_QUANTS_LONGEST_FIRST auto-sorts them
+    # before their shorter K-quant prefixes (e.g. Q6_K_XL before Q6_K).
+    Q2_K_XL = "Q2_K_XL"
+    Q3_K_XL = "Q3_K_XL"
+    Q4_K_XL = "Q4_K_XL"
+    Q5_K_XL = "Q5_K_XL"
+    Q6_K_XL = "Q6_K_XL"
+    Q8_K    = "Q8_K"     # base 8-bit K-quant (Unsloth; not the same as Q8_0)
+    Q8_K_XL = "Q8_K_XL"
+
+    # --- K-quant Plus variants (Unsloth Dynamic) ----------------------------
+    Q3_K_P = "Q3_K_P"
+    Q4_K_P = "Q4_K_P"
+    Q5_K_P = "Q5_K_P"
+    Q6_K_P = "Q6_K_P"
+    Q8_K_P = "Q8_K_P"
+
+    # --- Architecture-specific custom quants --------------------------------
+    MXFP4_MOE = "MXFP4_MOE"  # NVIDIA Microscaling FP4 (MoE; requires sm_89+)
+
 
 # All GGUFQuant values sorted longest-first so that more-specific variants
 # (e.g. "IQ2_XXS") always match before their shorter prefixes ("IQ2_XS", "IQ2_S")
@@ -227,7 +248,7 @@ class AIModel:
     """
     id: str                        # unique slug; used as served-model-name / llama.cpp alias
     name: str                      # human display name, e.g. "BeMag 123B v0.1"
-    path: str                      # canonical source path (NAS, local, or any accessible location)
+    path: str                      # canonical source path — any accessible location
     format: ModelFormat            # storage / quantisation format
     ai_types: frozenset[AIType]    # capabilities this model exposes
     ctx: int = 32_768              # model's native/trained max context length (tokens)
@@ -238,6 +259,7 @@ class AIModel:
     moe_experts: int = 0           # routed expert count; 0 = dense model
     moe_active: int = 0            # experts active per token (0 when dense)
     vision: bool = False           # model accepts image/vision input
+    mmproj_path: str = ""          # path to companion mmproj .gguf file (vision GGUF only)
     trust_remote_code: bool = False  # servers must pass --trust-remote-code
     quant: str = ""                # quant suffix for display, e.g. "Q4_K_M" (mainly GGUF)
     note: str = ""                 # user-defined note shown in the status bar
@@ -280,6 +302,7 @@ class AIModel:
             moe_experts=int(d.get("moe_experts", 0)),
             moe_active=int(d.get("moe_active", 0)),
             vision=bool(d.get("vision", False)),
+            mmproj_path=d.get("mmproj_path", ""),
             trust_remote_code=bool(d.get("trust_remote_code", False)),
             quant=d.get("quant", ""),
             note=d.get("note", ""),

@@ -125,13 +125,15 @@ def _build_llamacpp(server: ServerSoftware, model: AIModel, p: dict) -> list[str
         "--log-prefix",
         "--log-timestamps",
     ]
+    if model.mmproj_path:
+        cmd += ["--mmproj", model.mmproj_path]
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
 
 def _build_tabby(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
     # model_dir is a staging directory; launch() creates a symlink named model.id
-    # there pointing to the resolved (cached or NAS) path before this builder runs.
+    # there pointing to the resolved (cached or source) path before this builder runs.
     cmd = [
         str(CONFIG.tabby_python), str(CONFIG.tabby_main),
         "--model-dir",    p["model_dir"],
@@ -173,6 +175,8 @@ def _build_ooba(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
         cmd += ["--gpu-layers", str(p["gpu_layers"])]
         if p.get("tensor_split"):
             cmd += ["--tensor-split", p["tensor_split"]]
+        if model.mmproj_path:
+            cmd += ["--mmproj", model.mmproj_path]
     if p.get("cache_type"):
         cmd += ["--cache-type", p["cache_type"]]
     rq = p.get("_runtime_quant")

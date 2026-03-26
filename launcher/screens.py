@@ -114,6 +114,7 @@ _SORT_KEY: dict[str, Callable[["AIModel"], Any]] = {
     "name":   lambda m: m.name.lower(),
     "status": lambda m: _STATUS_RANK.get(m.composite_status(SERVERS)[1], 5),
     "format": lambda m: m.format_tag.lower(),
+    "arch":   lambda m: m.arch.lower(),
     "size":   lambda m: m.size_gb,
     "params": lambda m: m.params_m,
     "ctx":    lambda m: m.ctx,
@@ -1027,6 +1028,7 @@ class ModelSelectScreen(DataTableScreen):
         table.add_column("Name",   key="name")
         table.add_column("👍",     key="status")  # composite status symbol
         table.add_column("Format", key="format")
+        table.add_column("Arch",   key="arch")
         table.add_column("",       key="warn")    # VRAM warning icon
         table.add_column("Size",   key="size")
         table.add_column("Params", key="params")
@@ -1070,6 +1072,17 @@ class ModelSelectScreen(DataTableScreen):
         # Only repopulate if this is the first result or available VRAM shifted ≥1 GB
         if prev_avail is None or abs(avail - prev_avail) >= 1.0:
             self._populate()
+
+    def _arch_cell(self, model: AIModel) -> str:
+        """Short architecture class name — strips common HF suffixes like ForCausalLM."""
+        arch = model.arch
+        if not arch:
+            return ""
+        for suffix in ("ForCausalLM", "ForConditionalGeneration", "ForSequenceClassification", "Model"):
+            if arch.endswith(suffix):
+                arch = arch[: -len(suffix)]
+                break
+        return arch
 
     def _warn_cell(self, model: AIModel) -> str:
         """Warning icon (with colour) if the model won't run or fit, else empty string."""
@@ -1168,6 +1181,7 @@ class ModelSelectScreen(DataTableScreen):
                 m.name,
                 f"[{color}]{symbol}[/]",
                 m.format_tag,
+                self._arch_cell(m),
                 self._warn_cell(m),
                 self._size_cell(m),
                 self._params_cell(m),
@@ -1216,8 +1230,6 @@ class ModelSelectScreen(DataTableScreen):
                 )
         # Build info line from structured fields + user note
         parts: list[str] = []
-        if model.arch:
-            parts.append(f"[dim]{model.arch}[/]")
         return "  [dim]·[/]  ".join(parts)
 
     def _refresh_note_bar(self) -> None:
@@ -1649,7 +1661,7 @@ class CacheActionScreen(ButtonMenuScreen):
 
     @work(thread=True)
     def _fetch_source_size(self) -> None:
-        """Compute the actual on-disk size of the model source path (may be slow on NAS)."""
+        """Compute the actual on-disk size of the model source path (may be slow on remote storage)."""
         size_gb = launcher.cache_source_size_gb(Path(self._model.path))
         self.app.call_from_thread(self._on_source_size_ready, size_gb)
 
