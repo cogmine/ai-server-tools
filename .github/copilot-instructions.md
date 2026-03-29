@@ -218,7 +218,11 @@ Path validation before GpuSelectScreen; missing files show a toast notification.
 `ModelManageScreen` overrides `_open_model()` (template method in `ModelSelectScreen`) to push `CacheActionScreen`. The template method pattern is necessary because Textual calls all MRO classes' message handlers regardless of override — only plain method calls respect the most-derived class.
 `CacheProgressScreen`: rsync launched with `--info=progress2`; stdout read via `select.select()` in a `@work(thread=True)` worker; `(\d+)%` regex drives a `ProgressBar` widget + speed/ETA detail label; `proc.wait()` called after stdout EOF before reading `returncode`. Single-file models detected with `src_p.is_file()` (not extension-based).
 
-**Catalog ingest**: `python -m launcher.ingest ingest <scan_root> [--all] [--dry-run]` — scans a directory for models not in the catalog and appends entries. `--path <path>` targets a specific model. `copy-configs <scan_root>` copies HF config/tokenizer files into GGUF bundle directories before ingesting.
+**Catalog ingest**: `python -m launcher.ingest <subcommand>` — four subcommands:
+- `ingest <scan_root> [--all] [--ai-type text_gen|image_gen] [--dry-run]` — scans a directory for models not in the catalog and appends entries. `--path <path>` targets a specific model. `--ai-type image_gen` for diffusion checkpoints/FLUX.
+- `refresh [--path <path>] [--dry-run]` — re-detects auto-derived fields (ctx, size_gb, params_m, arch, moe, vision, mmproj_path) for existing entries without touching user-curated fields.
+- `copy-configs <scan_root> [--dry-run]` — copies HF config/tokenizer files into GGUF bundle directories before ingesting.
+- `copy-mmproj <scan_root> [--dry-run]` — copies mmproj vision encoder files into GGUF bundle directories before ingesting/refreshing.
 
 **Catalog anomaly log**: `user_data/model_audit.md` — records format misclassifications, size corrections,
 and open items found during catalog audits. Gitignored (personal/local).

@@ -82,12 +82,68 @@ All system-specific paths live in **`user_data/config.toml`** (gitignored). The 
 
 Edit **`user_data/models_local.json`**. Each entry in the `"models"` array is a JSON object. See `models_local.json.example` for the full field schema and documentation.
 
-To scan a directory and auto-detect new models:
+### Ingest tool
+
+The ingest tool (`python -m launcher.ingest`) scans directories for models and manages the catalog from the command line. All subcommands support `--dry-run` to preview changes without writing.
+
+#### Subcommands
+
+| Subcommand | Purpose |
+|---|---|
+| `ingest` | Scan a directory for uncatalogued models and add them |
+| `refresh` | Re-detect auto-derived fields for existing catalog entries |
+| `copy-configs` | Copy HF config/tokenizer files from original model dirs into GGUF bundle dirs |
+| `copy-mmproj` | Copy mmproj vision encoder files from original model dirs into GGUF bundle dirs |
+
+#### ingest
+
 ```bash
-python -m launcher.ingest ingest /path/to/models [--all] [--dry-run]
+# Scan a directory — add the first uncatalogued model found
+python -m launcher.ingest ingest /path/to/models [--dry-run]
+
+# Scan and add ALL uncatalogued models at once
+python -m launcher.ingest ingest /path/to/models --all [--dry-run]
+
+# Add a single specific model by path
 python -m launcher.ingest ingest --path /path/to/specific/model [--dry-run]
-python -m launcher.ingest copy-configs /path/to/models   # copy HF configs into GGUF dirs first
+
+# Ingest image generation models (diffusion checkpoints, FLUX, etc.)
+python -m launcher.ingest ingest /path/to/models --ai-type image_gen --all [--dry-run]
 ```
+
+Without `--all`, scanning stops after the first new model (useful for testing detection). With `--all`, every uncatalogued model is added in one pass.
+
+Auto-detected fields: `id`, `name`, `format`, `ctx`, `size_gb`, `params_m`, `arch`, MoE expert counts, `vision`, `trust_remote_code`, `mmproj_path` (for vision GGUFs), and FP8 `min_sm` constraints.
+
+HF directories with both safetensors and pytorch_bin weights get a separate catalog entry per format. GGUF bundle directories yield one entry per quant variant.
+
+#### refresh
+
+Re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, MoE, `vision`, `mmproj_path`) for existing entries without touching user-curated fields (`id`, `name`, `format`, `server_status`, `favorite`, etc.):
+
+```bash
+# Refresh all entries (may be slow over NAS)
+python -m launcher.ingest refresh [--dry-run]
+
+# Refresh a single entry by path
+python -m launcher.ingest refresh --path /path/to/model [--dry-run]
+```
+
+#### copy-configs / copy-mmproj
+
+Preparation steps for GGUF bundles — run before `ingest` or `refresh` so that metadata detection has access to `config.json` and mmproj files:
+
+```bash
+# Copy HF config/tokenizer files into GGUF dirs that lack them
+python -m launcher.ingest copy-configs /path/to/models [--dry-run]
+
+# Copy mmproj-*.gguf vision encoder files into GGUF dirs that lack them
+python -m launcher.ingest copy-mmproj /path/to/models [--dry-run]
+```
+
+Both commands search for the matching original (non-GGUF) model directory across the scan root and all configured cache mount subdirs.
+
+### Manual entry
 
 Quick example:
 

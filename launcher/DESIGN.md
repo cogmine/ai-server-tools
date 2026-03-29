@@ -485,41 +485,82 @@ Statuses are stored as a nested dict: `server_status[server_id][quant_key] = sta
 ## Catalog Ingest Tool (ingest.py)
 
 ```
-python -m launcher.ingest ingest <scan_root> [--all] [--dry-run]
-python -m launcher.ingest ingest --path <path> [--dry-run]
+python -m launcher.ingest ingest <scan_root> [--all] [--ai-type text_gen|image_gen] [--dry-run]
+python -m launcher.ingest ingest --path <path> [--ai-type text_gen|image_gen] [--dry-run]
+python -m launcher.ingest refresh [--path <path>] [--dry-run]
 python -m launcher.ingest copy-configs <scan_root> [--dry-run]
+python -m launcher.ingest copy-mmproj <scan_root> [--dry-run]
 ```
 
-Scans a given `scan_root` directory for model paths not already in `models_local.json`, detects the first new entry, and appends it. One model per invocation; run again to continue.
+Scans a given `scan_root` directory for model paths not already in `models_local.json` and appends new entries. Without `--all`, stops after the first new model (useful for testing detection); with `--all`, ingests every uncatalogued model in one pass.
+
+### Subcommands
+
+| Subcommand | Purpose |
+|---|---|
+| `ingest` | Add uncatalogued models — scan a directory or target a specific path |
+| `refresh` | Re-detect auto-derived fields for existing entries without touching user-curated fields |
+| `copy-configs` | Copy HF config/tokenizer files from original model dirs into GGUF bundle directories |
+| `copy-mmproj` | Copy mmproj-*.gguf vision encoder files from original model dirs into GGUF bundle directories |
 
 ### Scanning order
 
 Entries are sorted alphabetically. For each item in `scan_root`:
 
 - **Top-level `.gguf` file** → yielded as a standalone candidate.
-- **Directory whose name contains "gguf"** → each `.gguf` file inside yielded individually (one entry per quant variant).
-- **HF model directory** (has `config.json` or weight files) → yielded as a whole directory.
+- **GGUF bundle directory** → each `.gguf` file inside yielded individually (one entry per quant variant). Scans flat bundles (`entry/*.gguf`) and per-quant-subdir bundles (`entry/<quant>/*.gguf`). Files named `mmproj-*` are excluded.
+- **HF model directory** (has `config.json` or weight files) → yielded as a whole directory. Directories with both safetensors and pytorch_bin weights yield one entry per format so each becomes a separate catalog entry.
 
 Directories with no `config.json` and no weight files are skipped.
 
 ### Detection — GGUF files
 
-- **`quant`**: matched against known `GGUFQuant` values by regex on the filename.
-- **`ctx`**: borrowed from the first same-directory sibling already in the catalog; `0` if none exists.
-- **`size_gb`**: from `stat().st_size`.
-- **`id`**: `<name-slug>-<quant-slug>` where quant slug drops underscores and trailing `0` (e.g. `Q8_0` → `q8`, `Q4_K_M` → `q4km`).
+- **`quant`**: matched against `GGUFQuant` values by regex on the filename (longest match first to avoid partial matches).
+- **`ctx`**: from `config.json` if present in the bundle dir (placed by `copy-configs`); falls back to borrowing from a sibling entry already in the catalog; `0` if neither available.
+- **`size_gb`**: from `stat().st_size` of the individual GGUF file.
+- **`params_m`**: from `config.json` `num_parameters` if present; falls back to regex extraction from filename (e.g. `70B` → 70000).
+- **`arch`**, **MoE**, **`vision`**, **`trust_remote_code`**: from `config.json` when present.
+- **`mmproj_path`**: auto-detected from `mmproj-*.gguf` in bundle root when `vision=True`.
+- **`id`**: `<name-slug>-<quant-slug>` where quant slug drops underscores and trailing `0` (e.g. `Q8_0` → `q8`, `Q4_K_M` → `q4km`). Collision guard appends `-gguf` if the ID already belongs to a different path.
 
 ### Detection — HF model directories
 
 Reads `config.json`:
 
-- **`format`**: `quantization_config.quant_type` first (gptq / awq / exl2 / int8_bnb), then `torch_dtype` for fp8/bf16/fp16, then file-type presence for pytorch_bin.
-- **`ctx`**: first of `max_position_embeddings`, `max_seq_len`, `seq_length`, `context_length`, `n_positions`.
-- **`note`**: `architectures[0]`.
-- **`size_gb`**: recursive `stat()` sum of all files.
-- **`id`**: `<name-slug>-<fmt-short>` (e.g. `…-bf16`, `…-fp16`, `…-int8`).
+- **`format`**: `quantization_config.quant_type` first (gptq / awq / exl2 / int8_bnb), then `quant_method` (fp8, bitsandbytes, modelopt), then `torch_dtype` for bf16/fp16/fp8, then file-type presence for pytorch_bin. Legacy GPTQ files detected by `4bit`/`8bit`/`gptq` patterns in safetensors filenames.
+- **`ctx`**: first of `max_position_embeddings`, `max_seq_len`, `seq_length`, `context_length`, `n_positions`; `model_max_length` preferred when strictly larger (covers RoPE-extended models). Falls back to `text_config` for multimodal models.
+- **`params_m`**: from `num_parameters` in `config.json`, or regex extraction from directory name.
+- **`arch`**: from `architectures[0]` in `config.json`.
+- **MoE fields**: `moe_experts` / `moe_active` from `num_local_experts` / `n_routed_experts` / `num_experts` and `num_experts_per_tok`.
+- **`vision`**: `True` when `vision_config` is present.
+- **`trust_remote_code`**: `True` when `auto_map` is present (custom architecture code).
+- **`min_sm`**: set to `89` for static FP8 quantisation (non-dequantise, non-block-wise); `0` for block-wise FP8 (dequantises to BF16 at runtime, works on sm_86).
+- **`size_gb`**: recursive `stat()` sum of weight files matching the format's glob patterns (format-aware — e.g. pytorch_bin counts only HF shard files, not unrelated `.bin` artefacts).
+- **`id`**: `<name-slug>-<fmt-short>` (e.g. `…-bf16`, `…-fp16`, `…-int8`). Collision guard falls back to the raw directory name.
 
-Fields left for manual review: `ctx` for new GGUF bundles, `server_params`.
+### Detection — image_gen models
+
+With `--ai-type image_gen`, each `.safetensors` file in the scan directory becomes its own catalog entry:
+
+- **`format`**: inferred from filename — `fp8`/`e4m3fn` → `safetensors_fp8`; `flux` → `safetensors_bf16`; everything else → `safetensors_fp16`.
+- **`comfyui_subdir`**: `"diffusion_models"` for FLUX/diffusion/unet; `"checkpoints"` for standard checkpoints (SDXL, SD1.5).
+- **`ai_types`**: `["image_gen"]`.
+
+### refresh subcommand
+
+`refresh` re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, `moe_experts`, `moe_active`, `vision`, `mmproj_path`) for existing catalog entries. User-curated fields (`id`, `name`, `format`, `path`, `cached_path`, `ctx_override`, `favorite`, `server_status`, `server_params`, `min_sm`, `hw_note`, `comfyui_subdir`, `quant`, `trust_remote_code`, `note`) are never touched.
+
+- `--path <path>` limits refresh to a single entry; otherwise all entries are refreshed.
+- Size recompute uses the stored (user-curated) format, not the freshly-detected one — if a format has been manually corrected, the size reflects the corrected format's weight files.
+- Zero-valued detections for `ctx` and `params_m` are treated as "unknown" and preserve the existing value rather than overwriting manually-set data.
+
+### copy-configs / copy-mmproj
+
+Preparation steps for GGUF bundles — run before `ingest` or `refresh` so that metadata detection has access to `config.json` and mmproj files.
+
+Both commands search `scan_root` plus cache mount subdirs mirroring the same leaf directory (e.g. if `scan_root` is `/mnt/nas/ai_models/text-generation`, also checks `~/fast_models/text-generation` from configured cache mounts). For each GGUF bundle directory that lacks the target files, the original (non-GGUF) model is located via normalised name matching and the files are copied across.
+
+Fields left for manual review: `ctx` for new GGUF bundles without config.json, `server_params`.
 
 ---
 
