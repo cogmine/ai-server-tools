@@ -43,8 +43,8 @@ comfyui_main      = "~/ComfyUI/main.py"
 comfyui_models_dir = "~/ComfyUI/models"
 
 # Path to the ExLlamaV2 convert.py script used for EXL2 quantization.
-# If this file doesn't exist, the launcher falls back to -m exllamav2.convert
-# (the module entrypoint, available when exllamav2 is installed as a package).
+# If this file doesn't exist, the launcher falls back to -m exllamav2.conversion.convert_exl2
+# (the module entrypoint for exllamav2 >= 0.3.x installed as a package).
 exl2_convert_script = "~/exllamav2/convert.py"
 
 # CUDA_HOME injected when launching tabbyAPI (needed for flash-attn)

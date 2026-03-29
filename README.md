@@ -4,9 +4,9 @@
 > **This project is under active development and is not yet stable.** Interfaces, data formats, and configuration may change without notice. Not recommended for production use.
 
 > [!NOTE]
-> **This project is written *with* AI (GitHub Copilot / Claude), under close human supervision and micro-management.**
+> **Note: Much of the code in this repository is AI-generated under close human direction. Design decisions are human-driven.**
 
-A toolkit for managing AI model servers on an NVIDIA multi-GPU workstation or server. Includes a keyboard-driven TUI launcher for spinning up inference servers and a standalone GPU stats monitor.
+A toolkit for viewing GPU status and managing AI models and model servers on an NVIDIA multi-GPU workstation or server. Includes a keyboard-driven TUI launcher for spinning up inference servers and a standalone GPU stats monitor.
 
 ## Tools
 

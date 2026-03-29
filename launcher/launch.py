@@ -369,7 +369,7 @@ def _build_exl2_convert(
     if script.exists():
         cmd_prefix = [str(CONFIG.tabby_python), str(script)]
     else:
-        cmd_prefix = [str(CONFIG.tabby_python), "-m", "exllamav2.convert"]
+        cmd_prefix = [str(CONFIG.tabby_python), "-m", "exllamav2.conversion.convert_exl2"]
     return [
         *cmd_prefix,
         "-i", model.resolve_path(),

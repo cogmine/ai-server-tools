@@ -60,7 +60,7 @@ class SiteConfig:
     cuda_home_sglang:     str    # CUDA_HOME set when launching SGLang (for flashinfer JIT)
     cuda_visible_devices: str    # explicit GPU list, or "" to derive from pipeline_parallel
     pipeline_parallel:    int    # GPU count for vLLM PP (never 0 after load)
-    exl2_convert_script:  Path   # path to ExLlamaV2 convert.py; falls back to -m exllamav2.convert if absent
+    exl2_convert_script:  Path   # path to ExLlamaV2 convert.py; falls back to -m exllamav2.conversion.convert_exl2 if absent
     comfyui_env:          str    # conda env name for ComfyUI
     comfyui_main:         Path   # path to ComfyUI main.py
     comfyui_models_dir:   Path   # base staging dir for ComfyUI symlinks (~/ComfyUI/models/)

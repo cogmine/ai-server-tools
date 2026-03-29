@@ -22,6 +22,14 @@ This project is in development mode. There are not yet any other project deploym
 
 ## Best Practices
 
+**Report issues** - If you encounter potential issues while working on the codebase, consider reporting them to the user. Don't work around a real issue to satisfy the request at hand.
+
+**Contribute creatively** - If you identify a missing feature or an area for improvement while working on the codebase, consider making a suggestion to the user. Don't get distracted, but don't limit your contributions to the specific request if you see an opportunity to add value.
+
+**Consult the user** - Consider consulting the user for clarification if you encounter ambiguities or difficulty discerning or obtaining information that the user might be able to clarify or easily obtain. It's better to clarify uncertainties than to make assumptions that might lead to incorrect implementations.
+
+**Narrow down the problem** - If you're expending a lot of effort investigating an issue, consider implementing temporary logging or composing a stand-alone test script to rule out entire code branches or categories of potential causes.
+
 **Ingesting models** - When using the ingest tool (`python -m launcher.ingest ingest`) or (`python -m launcher.ingest refresh`), prefer to first run it in `--dry-run` mode to review the changes it will make before applying them. This helps catch any unexpected modifications to the model catalog and ensures that only intended changes are made.
 
 ## Changes file

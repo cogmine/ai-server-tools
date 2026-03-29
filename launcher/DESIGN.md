@@ -315,7 +315,7 @@ Initial tools:
 | id | Input | Output | Binary |
 |---|---|---|---|
 | `llama-quantize` | `GGUF` | `GGUF` | `CONFIG.llama_quantize` (derived from `llama_server` sibling) |
-| `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | `CONFIG.exl2_convert_script` or `-m exllamav2.convert` |
+| `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | `CONFIG.exl2_convert_script` or `-m exllamav2.conversion.convert_exl2` |
 
 Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matching `_build_<id>` builder in `launch.py` registered in `_QUANT_BUILDERS`.
 
@@ -345,7 +345,7 @@ Follows the same PTY + log structure as `launch()`:
 
 `CONFIG.exl2_convert_script` (path, from `config.toml` key `exl2_convert_script`; default `~/exllamav2/convert.py`).  The `_build_exl2_convert` builder checks whether the script file exists on disk:
 - If yes → `<tabby_python> <script> -i ... -o ... -b ...`
-- If no → `<tabby_python> -m exllamav2.convert -i ... -o ... -b ...`
+- If no → `<tabby_python> -m exllamav2.conversion.convert_exl2 -i ... -o ... -b ...`
 
 `CONFIG.llama_quantize` is a derived property: `llama_server.parent / "llama-quantize"`. No extra config key needed.
 

@@ -39,6 +39,7 @@ from launcher.models import (
     AIType,
     AI_TYPE_LABELS,
     CacheMount,
+    FORMAT_SHORT,
     ModelFormat,
     QuantizationTool,
     RuntimeQuant,
@@ -113,7 +114,8 @@ _SORT_KEY: dict[str, Callable[["AIModel"], Any]] = {
     "fav":    lambda m: 0 if m.favorite          else 1,
     "name":   lambda m: m.name.lower(),
     "status": lambda m: _STATUS_RANK.get(m.composite_status(SERVERS)[1], 5),
-    "format": lambda m: m.format_tag.lower(),
+    "format": lambda m: FORMAT_SHORT.get(m.format, m.format.value).lower(),
+    "quant":  lambda m: m.quant.lower(),
     "arch":   lambda m: m.arch.lower(),
     "size":   lambda m: m.size_gb,
     "params": lambda m: m.params_m,
@@ -999,10 +1001,11 @@ class ModelSelectScreen(DataTableScreen):
         Binding("f5",            "dt_select",         "Select", key_display="↵/→/dbl-click"),
     ]
 
-    def __init__(self, ai_type: AIType) -> None:
+    def __init__(self, ai_type: AIType, preselect_model: "AIModel | None" = None) -> None:
         super().__init__()
-        self._ai_type  = ai_type
-        self._models   = models_for_type(AI_MODELS, ai_type)
+        self._ai_type         = ai_type
+        self._preselect_model = preselect_model
+        self._models          = models_for_type(AI_MODELS, ai_type)
         # Sort priority list: each entry is (column_key, reverse).  Index 0 is primary.
         # Default: favorites first → good/bad status → alphabetical by name.
         self._sort_keys: list[tuple[str, bool]] = [
@@ -1028,6 +1031,7 @@ class ModelSelectScreen(DataTableScreen):
         table.add_column("Name",   key="name")
         table.add_column("👍",     key="status")  # composite status symbol
         table.add_column("Format", key="format")
+        table.add_column("Quant",  key="quant")
         table.add_column("Arch",   key="arch")
         table.add_column("",       key="warn")    # VRAM warning icon
         table.add_column("Size",   key="size")
@@ -1046,7 +1050,7 @@ class ModelSelectScreen(DataTableScreen):
 
     def on_mount(self) -> None:
         self._sort_models()
-        self._populate()
+        self._populate(snap_to=self._preselect_model)
         self._refresh_vram()                       # immediate first poll
         self.set_interval(2.0, self._refresh_vram) # re-poll every 2 s automatically
 
@@ -1180,7 +1184,8 @@ class ModelSelectScreen(DataTableScreen):
                 "\u2605" if m.favorite else "",   # ★ or blank
                 m.name,
                 f"[{color}]{symbol}[/]",
-                m.format_tag,
+                FORMAT_SHORT.get(m.format, m.format.value),
+                m.quant,
                 self._arch_cell(m),
                 self._warn_cell(m),
                 self._size_cell(m),

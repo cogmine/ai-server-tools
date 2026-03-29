@@ -48,7 +48,7 @@ class ModelLauncherApp(App):
             # flow passes model=None so we fall through to normal startup.
             if model is not None:
                 ai_type = next(iter(model.ai_types))
-                self.push_screen(ModelSelectScreen(ai_type))
+                self.push_screen(ModelSelectScreen(ai_type, preselect_model=model))
                 self.push_screen(ServerSelectScreen(model, preselect_server_id=server.id))
                 return
         types = available_ai_types(AI_MODELS)
