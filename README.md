@@ -75,4 +75,4 @@ logs/                    Gitignored — server session logs
 
 ## License
 
-TBD. All rights reserved.
+This project is licensed under the [MIT License](LICENSE.md).
