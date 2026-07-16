@@ -48,9 +48,27 @@ SERVERS: list[ServerSoftware] = [
         default_params={
             "tensor_parallel":   1,
             "pipeline_parallel": CONFIG.pipeline_parallel,
-            "executor_backend":  "ray",
-            "gpu_mem_util":      0.97,
-            "max_num_seqs":      64,
+            # "" = let vLLM choose its own executor (mp for single-node, which is
+            # simpler and more robust than ray).  Set to "ray"/"mp" per-model to force.
+            "executor_backend":  "",
+            # "auto" respects the model's own torch_dtype from config.json.  Override
+            # per-model (e.g. "bfloat16") only when a checkpoint's native dtype is
+            # undesirable (e.g. a float32 checkpoint that would otherwise OOM).
+            "dtype":             "auto",
+            # 0.90 is vLLM's own default and leaves headroom; 0.97 left too little and
+            # was a frequent cause of load-time / CUDA-graph OOM.
+            "gpu_mem_util":      0.90,
+            # 0 = omit the flag (use vLLM's default of 256).  Set per-model to cap
+            # concurrency for very large / memory-tight models.
+            "max_num_seqs":      0,
+            # False = allow CUDA graphs (faster).  Set True per-model only if graph
+            # capture causes OOM.
+            "enforce_eager":     False,
+            # False = omit the flag (vLLM enables chunked prefill itself when helpful).
+            "chunked_prefill":   False,
+            # False = pass --no-enable-log-requests (quieter logs).  True enables
+            # per-request logging.
+            "log_requests":      False,
             "port":              CONFIG.server_ports.get("vllm", 5000),
             "extra_flags":       [],
         },
@@ -64,6 +82,17 @@ SERVERS: list[ServerSoftware] = [
         # the installed package.  CWD /tmp ensures no local vllm/ dir is on sys.path.
         strip_pythonpath=True,
         launch_cwd="/tmp",
+        # vLLM 0.25+ uses cu13 split wheels: shared libs live inside the Python package
+        # tree (nvidia/cu13/lib/) and are not automatically on LD_LIBRARY_PATH.
+        # CUDA_HOME points nvcc / JIT compilers at the bundled CUDA 13 toolkit.
+        # LIBRARY_PATH + the libcudart.so symlink let flashinfer's runtime JIT link
+        # against the bundled cudart (the wheel ships only libcudart.so.13).
+        cuda_home=CONFIG.vllm_cuda_home,
+        ld_library_path_prepend=CONFIG.vllm_cuda_libs,
+        library_path_prepend=CONFIG.vllm_cuda_libs,
+        lib_symlinks={"libcudart.so": "libcudart.so.13"},
+        # VLLM_SLEEP_WHEN_IDLE: avoid 100% CPU spin in the engine loop while idle.
+        extra_env={"VLLM_SLEEP_WHEN_IDLE": "1"},
         # pipeline_parallel must equal the number of GPUs selected; GpuSelectScreen
         # will auto-inject param_overrides["pipeline_parallel"] = selected_gpu_count.
         gpu_count_param="pipeline_parallel",

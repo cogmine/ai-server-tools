@@ -4,6 +4,7 @@ gpu.py — NVML polling (via pynvml) and the GpuTable Textual widget.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 
 _nvml: ModuleType | None = None
@@ -57,6 +58,7 @@ class GpuRow:
     error: str = ""          # non-empty → row is in error state
     uuid: str = ""           # first 8 hex chars of GPU UUID (stable across slot rotations)
     compute_cap: str = ""    # CUDA compute capability, e.g. "8.6" for sm_86
+    pci_root: str = ""       # root complex domain hex, e.g. "15" — GPUs sharing a root are on the same physical slot
 
     @property
     def mem_pct(self) -> float:
@@ -112,6 +114,55 @@ def _fmt_power(row: GpuRow) -> str:
     return f"[{color}]{row.power_w:.0f}[/]/{row.power_limit_w:.0f}W"
 
 
+def _pci_root(bus_addr: str) -> str:
+    """Resolve the PCIe root complex domain for a GPU via sysfs.
+
+    *bus_addr* is the NVML busId string, e.g. ``"00000000:16:00.0"``.
+    Returns the root complex hex string (e.g. ``"15"``), or ``""`` on failure.
+    The sysfs symlink path contains ``pci0000:XX`` where XX is the root.
+    """
+    # NVML uses 8-char domain; sysfs uses 4-char: 00000000:16:00.0 → 0000:16:00.0
+    # Lowercase: NVML may return uppercase hex (e.g. 8F) but sysfs uses lowercase.
+    sysfs_addr = bus_addr[4:].lower()
+    link = Path(f"/sys/bus/pci/devices/{sysfs_addr}")
+    try:
+        target = link.resolve().as_posix()  # e.g. .../pci0000:15/0000:15:01.0/0000:16:00.0
+        # Extract root complex from "pci0000:XX" segment
+        idx = target.find("/pci")
+        if idx >= 0:
+            # "pci0000:XX/" → grab the hex part after the colon
+            seg = target[idx + 4:]  # "0000:15/0000:15:01.0/..."
+            colon = seg.find(":")
+            slash = seg.find("/")
+            if colon >= 0 and slash > colon:
+                return seg[colon + 1 : slash].upper()
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def assign_slot_groups(rows: list[GpuRow]) -> dict[str, int]:
+    """Map each shared ``pci_root`` to a 1-based group number (ordered by bus_id).
+
+    Returns ``{pci_root: group_number}``.  Only roots hosting 2+ GPUs get a
+    group number; solitary roots are omitted (callers treat missing keys as
+    ungrouped).
+    """
+    # Count GPUs per root
+    root_count: dict[str, int] = {}
+    for row in rows:
+        if row.pci_root:
+            root_count[row.pci_root] = root_count.get(row.pci_root, 0) + 1
+
+    seen: dict[str, int] = {}
+    group = 0
+    for row in sorted(rows, key=lambda r: r.bus_id):
+        if row.pci_root and row.pci_root not in seen and root_count.get(row.pci_root, 0) >= 2:
+            group += 1
+            seen[row.pci_root] = group
+    return seen
+
+
 def poll_gpus() -> list[GpuRow]:
     """Return one GpuRow per GPU via direct NVML calls (pynvml)."""
     if not _ensure_nvml():
@@ -163,6 +214,7 @@ def poll_gpus() -> list[GpuRow]:
                 pcie_width=f"{width_cur}/{width_max}",
                 uuid=uid_short,
                 compute_cap=f"{cap_major}.{cap_minor}",
+                pci_root=_pci_root(bus_id),
             ))
         except nvml.NVMLError as exc:
             rows.append(GpuRow(

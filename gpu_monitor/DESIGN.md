@@ -20,8 +20,9 @@ A standalone full-screen Textual TUI that shows live per-GPU statistics for all 
 
 `launcher/gpu.py` contains:
 
-- `GpuRow` — dataclass holding one GPU's snapshot: index, bus_id, UUID, PCIe gen/width, memory used/total, utilisation, temperature, power used/limit, error flag.
-- `poll_gpus() → list[GpuRow]` — queries all GPUs via direct NVML calls (pynvml). On per-device error sets `row.error` and fills what it can. Returns `[]` if NVML is unavailable.
+- `GpuRow` — dataclass holding one GPU's snapshot: index, bus_id, pci_root, UUID, PCIe gen/width, memory used/total, utilisation, temperature, power used/limit, error flag. `pci_root` is the root complex domain hex (e.g. `"15"`) resolved from sysfs — GPUs sharing a root complex sit on the same physical PCIe slot (possibly via bifurcation).
+- `poll_gpus() → list[GpuRow]` — queries all GPUs via direct NVML calls (pynvml). On per-device error sets `row.error` and fills what it can. Returns `[]` if NVML is unavailable. Resolves `pci_root` via `/sys/bus/pci/devices/` symlinks (no root required).
+- `assign_slot_groups(rows) → dict[str, int]` — maps each *shared* `pci_root` (2+ GPUs) to a 1-based group number ordered by bus_id. Solitary roots are omitted so the UI shows "-" for ungrouped GPUs. Used by the GPU monitor to display a "Grp" column showing which GPUs share a physical slot.
 - Formatting helpers: `_fmt_mem`, `_fmt_util`, `_fmt_temp`, `_fmt_power` — each returns a Textual-markup string with colour thresholds.
 
 **Why pynvml over nvidia-smi subprocess?** Each `subprocess` spawn costs 5–50 ms (fork + exec + CSV parse). At the fast polling rate of 0.1 s that is 5–50% of the entire interval just spawning a process. pynvml calls the same underlying NVML C library directly; the cost per poll is sub-millisecond. pynvml also returns typed values (ints/floats), eliminating all string parsing and `[N/A]` edge-case handling.
@@ -74,6 +75,7 @@ Static identity/topology columns are listed first so they never shift while dyna
 |---|---|---|
 | `#` | Static | NVML device index — used for CUDA_VISIBLE_DEVICES ordering |
 | `ID` | Static | First 8 hex chars of UUID — stable across PCIe slot changes (slot can change after reboot if other cards are added/removed) |
+| `Grp` | Static | Physical slot group — GPUs with the same group number share a root complex (same physical x16 slot, possibly bifurcated). Derived from sysfs root complex mapping. Useful for diagnosing missing GPUs: a group with fewer cards than expected pinpoints the problem slot. |
 | `Slot` | Static | PCIe bus ID — useful for physical slot identification |
 | `SM` | Static | CUDA compute capability (e.g. `8.6` for RTX 3090). Used by the launcher to gate hw-incompatible models. |
 | `Gen` | Static | PCIe link generation current/max — diagnoses PCIe downgrade (important on x570 boards where x16 slots share bandwidth) |
@@ -83,7 +85,7 @@ Static identity/topology columns are listed first so they never shift while dyna
 | `Temp` | Dynamic | Core temperature °C; colour-coded |
 | `Power` | Dynamic | Current/TDP watts; colour-coded |
 
-The summary bar at the bottom aggregates total VRAM used vs. total across all GPUs — the single number most relevant when loading a large model.
+The summary bar at the bottom aggregates total VRAM used vs. total across all GPUs — the single number most relevant when loading a large model. It also shows a per-slot GPU count (e.g. `Slots: 1:1 2:2 3:3 4:3 5:1 6:1 7:1`) so a missing GPU is immediately visible as a group with fewer GPUs than expected.
 
 ---
 

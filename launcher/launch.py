@@ -5,6 +5,11 @@ build_cmd(server, model) → list[str]
     Merges server.default_params with model.server_params[server.id],
     then dispatches to the server-specific builder.
 
+compute_parallelism(gpu_count, model) → ParallelismPlan
+    Reads the model's HF config.json to determine valid TP×PP splits for the
+    given GPU count.  Prefers smallest TP (largest PP) for PCIe topology.
+    Reduces GPU count when model dimensions are incompatible.
+
 launch(server, model) → tuple[subprocess.Popen[bytes], Path, int]
     Builds the command, sets up the environment, spawns the process, and
     returns the Popen handle, the session log path, and the PTY master fd.
@@ -21,7 +26,9 @@ Adding a new server type:
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
+import math
 import os
 import pty
 import shlex
@@ -29,6 +36,7 @@ import shutil
 import struct
 import subprocess
 import termios
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +53,22 @@ _LOGS_DIR = Path(__file__).parent.parent / "logs"
 _CATALOG_PATH = Path(__file__).parent / "user_data" / "models_local.json"
 
 # Binary paths are resolved from CONFIG (launcher/user_data/config.toml) at import time.
+
+# Translation from canonical (vLLM) tool-call parser names to SGLang names.
+# Only entries where the names differ need to appear here; matching names
+# pass through unchanged.
+_SGLANG_TOOL_PARSER_MAP: dict[str, str] = {
+    "openai":       "gpt-oss",
+    "llama3_json":  "llama3",
+    "llama4_json":  "llama3",       # SGLang uses llama3 for all Llama models
+    "llama4_pythonic": "pythonic",
+    "deepseek_v3":  "deepseekv3",
+    "deepseek_v31": "deepseekv31",
+    "deepseek_v32": "deepseekv32",
+    "hermes":       "hermes",       # same — listed for documentation
+    "qwen3_xml":    "qwen3_coder",
+    "minimax_m2":   "minimax-m2",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +104,160 @@ def _patch_catalog(model_id: str, apply: "Callable[[dict], None]") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Parallelism computation (vLLM / SGLang)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParallelismPlan:
+    """Computed TP×PP parallelism for a multi-GPU server launch."""
+    tp: int            # tensor_parallel_size
+    pp: int            # pipeline_parallel_size
+    gpu_count: int     # effective GPU count (may be < user-selected count)
+    note: str = ""     # human-readable explanation when adjustments were made
+
+
+# Architectures validated to correctly scope MLP / attention parallelism
+# assertions to the TP group (get_tensor_model_parallel_world_size) rather
+# than the total process count.  For these, only standard TP divisibility
+# checks are needed.
+#
+# Unlisted or unknown architectures get an extra safety check:
+# intermediate_size must also divide evenly by the total GPU count, because
+# some model implementations assert ``intermediate_size % world_size == 0``
+# where world_size is the global process count (TP × PP).
+_TP_SCOPED_ARCHS: frozenset[str] = frozenset({
+    "BloomForCausalLM",
+    "CohereForCausalLM",
+    "DeepseekV2ForCausalLM",
+    "DeepseekV3ForCausalLM",
+    "GPT2LMHeadModel",
+    "GPTBigCodeForCausalLM",
+    "GPTJForCausalLM",
+    "GPTNeoForCausalLM",
+    "GPTNeoXForCausalLM",
+    "Gemma2ForCausalLM",
+    "LLaMAForCausalLM",
+    "Llama4ForConditionalGeneration",
+    "LlamaForCausalLM",
+    "Mistral3ForConditionalGeneration",
+    "MistralForCausalLM",
+    "MixtralForCausalLM",
+    "OPTForCausalLM",
+    "Phi3ForCausalLM",
+    "Qwen2ForCausalLM",
+    "Qwen3MoeForCausalLM",
+    "Qwen3NextForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "XGLMForCausalLM",
+})
+
+
+@functools.lru_cache(maxsize=64)
+def _read_hf_parallelism_fields(model_path: str) -> dict[str, Any] | None:
+    """Read parallelism-relevant fields from a model's HF config.json.
+
+    Returns None if config.json is absent or lacks num_attention_heads.
+    """
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    n_heads = raw.get("num_attention_heads", 0)
+    if not n_heads:
+        return None
+    architectures = raw.get("architectures", [])
+    return {
+        "num_attention_heads": n_heads,
+        "num_key_value_heads": raw.get("num_key_value_heads", n_heads),
+        "intermediate_size":   raw.get("intermediate_size", 0),
+        "num_hidden_layers":   raw.get("num_hidden_layers", 0),
+        "architecture":        architectures[0] if architectures else "",
+    }
+
+
+def _sorted_divisors(n: int) -> list[int]:
+    """Return the positive divisors of *n* in ascending order."""
+    small: list[int] = []
+    large: list[int] = []
+    for i in range(1, int(math.isqrt(n)) + 1):
+        if n % i == 0:
+            small.append(i)
+            if i != n // i:
+                large.append(n // i)
+    return small + large[::-1]
+
+
+def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismPlan:
+    """Compute optimal (TP, PP) for vLLM/SGLang given a GPU count and model.
+
+    Strategy for PCIe topology (no NVLink):
+      - Prefer smallest TP to minimise cross-GPU tensor traffic.
+      - TP must divide num_attention_heads, num_key_value_heads, and
+        intermediate_size.
+      - For architectures not in ``_TP_SCOPED_ARCHS``, intermediate_size must
+        also be divisible by the *total* GPU count.  Some model
+        implementations assert ``intermediate_size % world_size == 0`` using
+        the global process count rather than the TP group size; this check
+        prevents those assertion failures by reducing the GPU count to the
+        largest compatible value.
+    """
+    if model is None or gpu_count <= 1:
+        return ParallelismPlan(tp=1, pp=max(gpu_count, 1), gpu_count=max(gpu_count, 1))
+
+    cfg = _read_hf_parallelism_fields(model.resolve_path())
+    if cfg is None:
+        return ParallelismPlan(tp=1, pp=gpu_count, gpu_count=gpu_count)
+
+    n_heads      = cfg["num_attention_heads"]
+    n_kv_heads   = cfg["num_key_value_heads"]
+    intermediate = cfg["intermediate_size"]
+    n_layers     = cfg["num_hidden_layers"]
+
+    # Dimensions that TP must evenly divide.
+    tp_dims = [d for d in (n_heads, n_kv_heads, intermediate) if d > 0]
+    if not tp_dims:
+        return ParallelismPlan(tp=1, pp=gpu_count, gpu_count=gpu_count)
+
+    # For architectures not in _TP_SCOPED_ARCHS, check intermediate_size %
+    # total_gpus.  Fetch the arch from the catalog model or from config.json.
+    arch = model.arch or cfg.get("architecture", "")
+    check_global = (arch not in _TP_SCOPED_ARCHS) and intermediate > 0
+
+    def _find_plan(n: int) -> ParallelismPlan | None:
+        # Safety: some model implementations assert intermediate_size %
+        # world_size == 0 using the global process count rather than the
+        # TP group size.  Skip GPU counts that would trigger such failures
+        # for architectures not known to be safe.
+        if check_global and intermediate % n != 0:
+            return None
+        for tp in _sorted_divisors(n):
+            pp = n // tp
+            if all(d % tp == 0 for d in tp_dims) and (n_layers == 0 or n_layers >= pp):
+                return ParallelismPlan(tp=tp, pp=pp, gpu_count=n)
+        return None
+
+    # Try the requested GPU count first.
+    plan = _find_plan(gpu_count)
+    if plan is not None:
+        return plan
+
+    # Reduce until we find a compatible count.
+    for n in range(gpu_count - 1, 0, -1):
+        plan = _find_plan(n)
+        if plan is not None:
+            plan.note = (
+                f"intermediate_size ({intermediate}) not divisible by {gpu_count}"
+            )
+            return plan
+
+    return ParallelismPlan(tp=1, pp=1, gpu_count=1)
+
+
+# ---------------------------------------------------------------------------
 # Per-server command builders
 # ---------------------------------------------------------------------------
 
@@ -90,21 +268,36 @@ def _build_vllm(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
         "--served-model-name",            model.id,
         "--tensor-parallel-size",         str(p["tensor_parallel"]),
         "--pipeline-parallel-size",       str(p["pipeline_parallel"]),
-        "--distributed-executor-backend", p["executor_backend"],
-        "--dtype",                        "bfloat16",
         "--gpu-memory-utilization",       str(p["gpu_mem_util"]),
         "--max-model-len",                str(model.effective_ctx),
-        "--enable-chunked-prefill",
-        "--max-num-seqs",                 str(p["max_num_seqs"]),
-        "--enforce-eager",
         "--host",                         "0.0.0.0",
         "--port",                         str(p["port"]),
-        "--trust-remote-code",
-        "--no-enable-log-requests",
     ]
+    # Executor backend: omit to let vLLM choose (mp for single-node); only pass when
+    # explicitly set (e.g. "ray" for multi-node or "mp" to force it).
+    if p.get("executor_backend"):
+        cmd += ["--distributed-executor-backend", p["executor_backend"]]
+    # dtype: "auto" (default) respects the model's config.json torch_dtype; only pass
+    # the flag when a specific dtype is requested per-model.
+    if p.get("dtype") and p["dtype"] != "auto":
+        cmd += ["--dtype", p["dtype"]]
+    # Concurrency cap: 0 means use vLLM's own default (256).
+    if p.get("max_num_seqs"):
+        cmd += ["--max-num-seqs", str(p["max_num_seqs"])]
+    if p.get("chunked_prefill"):
+        cmd += ["--enable-chunked-prefill"]
+    if p.get("enforce_eager"):
+        cmd += ["--enforce-eager"]
+    # Only pass --trust-remote-code for models that actually require custom code.
+    if model.trust_remote_code:
+        cmd += ["--trust-remote-code"]
+    if not p.get("log_requests"):
+        cmd += ["--no-enable-log-requests"]
     rq = p.get("_runtime_quant")
     if rq == RuntimeQuant.BNB_INT8:
         cmd += ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"]
+    if model.tool_call_parser:
+        cmd += ["--enable-auto-tool-choice", "--tool-call-parser", model.tool_call_parser]
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -210,6 +403,9 @@ def _build_sglang(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
         or p.get("_runtime_quant") == RuntimeQuant.BNB_INT8
     ):
         cmd += ["--load-format", "bitsandbytes", "--quantization", "bitsandbytes"]
+    if model.tool_call_parser:
+        sglang_name = _SGLANG_TOOL_PARSER_MAP.get(model.tool_call_parser, model.tool_call_parser)
+        cmd += ["--tool-call-parser", sglang_name]
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -480,6 +676,26 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
     if server.cuda_home:
         env["CUDA_HOME"] = server.cuda_home
 
+    if server.ld_library_path_prepend:
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{server.ld_library_path_prepend}:{existing}" if existing else server.ld_library_path_prepend
+
+    if server.library_path_prepend:
+        # Ensure any missing linker-name symlinks exist (self-heals split-wheel CUDA
+        # toolkits that ship libfoo.so.NN but omit the libfoo.so name the linker needs).
+        lib_dir = Path(server.library_path_prepend)
+        for link_name, target in server.lib_symlinks.items():
+            link = lib_dir / link_name
+            if (lib_dir / target).exists() and not link.exists():
+                if link.is_symlink():
+                    link.unlink()  # replace a broken symlink
+                link.symlink_to(target)
+        existing = env.get("LIBRARY_PATH", "")
+        env["LIBRARY_PATH"] = f"{server.library_path_prepend}:{existing}" if existing else server.library_path_prepend
+
+    if server.extra_env:
+        env.update(server.extra_env)
+
     if server.uses_staging_dir:
         p = _merged(server, model)
         staging_base = Path(p["model_dir"])
@@ -672,27 +888,15 @@ def save_server_status(
 
     Mutates the in-memory model immediately, then rewrites the server_status
     entry for that model in the JSON catalog so it survives the next launch.
-    When status is 'good', any other quant entry that was 'good' for the same
-    server is demoted to 'unknown' (exclusive: one good quant per server).
     """
     qk = _quant_key(quant)
 
-    # 1. Enforce exclusivity: only one quant may be 'good' per (model, server).
-    if status == "good":
-        for k, v in list(model.server_status.get(server_id, {}).items()):
-            if k != qk and v == "good":
-                model.server_status[server_id][k] = "unknown"  # type: ignore[index]
-
-    # 2. Update in-memory object immediately.
+    # 1. Update in-memory object immediately.
     model.server_status.setdefault(server_id, {})[qk] = status  # type: ignore[assignment]
 
-    # 3. Persist to JSON catalog.
+    # 2. Persist to JSON catalog.
     def _apply(entry: dict) -> None:
         quant_dict = entry.setdefault("server_status", {}).setdefault(server_id, {})
-        if status == "good":
-            for k in list(quant_dict):
-                if k != qk and quant_dict[k] == "good":
-                    quant_dict[k] = "unknown"
         quant_dict[qk] = status
 
     _patch_catalog(model.id, _apply)

@@ -81,6 +81,28 @@ class SiteConfig:
         return self.conda_base / f"envs/{self.vllm_env}/bin/python"
 
     @property
+    def vllm_cuda_libs(self) -> str:
+        """Path to the CUDA split-wheel shared libraries bundled with the vLLM env.
+
+        vLLM 0.25+ installs cu13 split wheels whose .so files land inside the
+        Python package tree (nvidia/cu13/lib/) and are not automatically on
+        LD_LIBRARY_PATH.  Returns "" if the directory is not found.
+        """
+        from glob import glob as _glob
+        # Use [0-9][0-9] to match 2-digit minor versions (3.10, 3.11, …) and avoid
+        # spurious matches against python3.1 which conda also creates in lib/.
+        env_lib = self.conda_base / f"envs/{self.vllm_env}/lib"
+        pattern = str(env_lib / "python3.[0-9][0-9]" / "site-packages/nvidia/cu13/lib")
+        matches = sorted(_glob(pattern))
+        return matches[-1] if matches else ""
+
+    @property
+    def vllm_cuda_home(self) -> str:
+        """CUDA_HOME for the vLLM env — parent of vllm_cuda_libs (the cu13 toolkit root)."""
+        libs = self.vllm_cuda_libs
+        return str(Path(libs).parent) if libs else ""
+
+    @property
     def tabby_python(self) -> Path:
         return self.conda_base / f"envs/{self.tabby_env}/bin/python"
 

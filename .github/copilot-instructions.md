@@ -32,13 +32,6 @@ This project is in development mode. There are not yet any other project deploym
 
 **Ingesting models** - When using the ingest tool (`python -m launcher.ingest ingest`) or (`python -m launcher.ingest refresh`), prefer to first run it in `--dry-run` mode to review the changes it will make before applying them. This helps catch any unexpected modifications to the model catalog and ensures that only intended changes are made.
 
-## Changes file
-A `changes` file lives in the repo root (gitignored). After every coding session make sure it accurately reflects all uncommitted changes — suitable for use directly as a commit message. Keep it terse and actively remove entries for changes that were reverted or superseded. The user clears the file after committing. Run `git diff HEAD` at any time to see exactly what has changed since the last commit.
-
-**Format:** Use a blank line between logically distinct groups of changes. Within a group, one line per file or sub-topic. A group may be preceded by a short header line (no prefix) if it aids readability. Omit fine implementation details — describe *what* changed and *why* when not obvious, not *how*. For large refactors, a few summary lines beats a line-per-file inventory.
-
-Do not include changes to local settings files (e.g. `config.toml`) or to data files (e.g. `models_local.json`), as those files do not get committed.
-
 ## Agent Tool Notes
 
 ### Logs — sensitivity caution
@@ -116,7 +109,7 @@ Server tools scan config files at startup — on a NAS or slow drive this causes
 
 - **Conda env**: `tabby` (`~/miniconda3/envs/tabby/`)
 - **Entry point**: `~/tabbyAPI/main.py`
-- **Key advantage**: no attention-head divisibility constraint — uses all 11 GPUs via `--gpu-split-auto`
+- **Key advantage**: no attention-head divisibility constraint — uses all GPUs via `--gpu-split-auto`
 - **Formats**: EXL2, safetensors BF16/FP16, and legacy `.bin` — **GGUF is NOT supported** (use llama.cpp for GGUF; tabbyAPI's sister project YALS handles GGUF)
 - **flash-attn**: 2.8.3 — built from source in `tabby` env with `CUDA_HOME=/usr/local/cuda-12.5`; cached at `~/.cache/pip/wheels/`
 - **KV cache**: `--cache-mode Q8` (quantized KV, fast on Ampere)
@@ -152,32 +145,38 @@ Server tools scan config files at startup — on a NAS or slow drive this causes
 
 ## vLLM Configuration
 
+### Version / CUDA toolchain (cu13 split wheels)
+vLLM **0.25.1** with PyTorch **2.11.0+cu130** in the `vllm` conda env. The cu13 CUDA runtime
+is bundled as pip split wheels under `…/site-packages/nvidia/cu13/` (shared libs in `lib/`, nvcc
+in `bin/`, headers in `include/`). This is env-local — other envs stay on cu128.
+
+flashinfer JIT-compiles CUDA kernels (e.g. the sampler) at runtime, which requires a *consistent*
+bundled toolkit. Two constraints must hold, both wired into `launcher/data.py` / `launch.py`:
+- **Toolchain version pinning** — `nvidia-cuda-nvcc`, `nvidia-nvvm`, and `nvidia-cuda-crt` must all
+  match the bundled cudart header version (**13.0.88**, matching `nvidia-cuda-runtime` 13.0.x).
+  A plain `pip install vllm` pulls nvcc/nvvm 13.2+, which mismatches the 13.0 cudart headers
+  (libcudacxx "CUDA compiler and CUDA toolkit headers are incompatible") and generates PTX 9.2 that
+  the 13.0 `ptxas` rejects ("Unsupported .version 9.2"). **After any vLLM reinstall/upgrade, re-pin:**
+  `pip install "nvidia-cuda-nvcc==13.0.88" "nvidia-nvvm==13.0.88" "nvidia-cuda-crt==13.0.88"`.
+- **Link-time cudart** — the cu13 wheel ships `libcudart.so.13` but omits the `libcudart.so` linker
+  name and uses `lib/` (not `lib64/`). `launch.py` self-heals the `libcudart.so` symlink and sets
+  `LIBRARY_PATH`; `-lcuda` resolves against the system driver stub. All auto-applied at launch via
+  the vLLM `ServerSoftware` fields `cuda_home` / `ld_library_path_prepend` / `library_path_prepend`
+  / `lib_symlinks` (paths derived from `CONFIG.vllm_cuda_libs` / `vllm_cuda_home`, glob-discovered).
+
 ### Parallelism
-- `--distributed-executor-backend ray`
+- Executor backend is **not** forced by default — vLLM auto-selects `mp` (multiprocessing), which is simpler/more robust for this single node. Set `executor_backend` in `server_params["vllm"]` to `"ray"` only when a model needs it.
 - PCIe topology: pipeline parallelism preferred over tensor parallelism (activations only cross between adjacent GPU pairs)
 - **Attention-head constraint**: `--tensor-parallel-size` must evenly divide the model's attention head count (`num_attention_heads` in `config.json`). Use pipeline parallelism or tabbyAPI/ExLlamaV2 when TP=11 is not viable.
 
-### Critical patch applied to installed vLLM
-**File**: `~/miniconda3/envs/vllm/lib/python3.11/site-packages/vllm/v1/executor/ray_executor.py`
-
-Ray's compiled DAG defaults to `_max_inflight_executions=10`, but with `pp=11` the engine tries to
-submit 11 concurrent steps and crashes immediately on the first request. Patch (around line 632):
-
-```python
-_max_inflight = max(
-    self.parallel_config.pipeline_parallel_size + 1, 16
-)
-return forward_dag.experimental_compile(
-    enable_asyncio=enable_asyncio,
-    _overlap_gpu_communication=envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM,
-    _max_inflight_executions=_max_inflight,
-)
-```
-
 ### Launch flags
-- `--enforce-eager` — prevents CUDA graph pre-allocation OOM on large prompts with high gpu_mem_util
-- `--enable-chunked-prefill` — safe with pp>1
-- `--trust-remote-code` — needed for models that define custom architecture code (check `auto_map` in `config.json`)
+`_build_vllm` is minimal by default and data-driven via `default_params` (see launcher `DESIGN.md` → "vLLM launch flags"). Only always-on flags are `--model`, `--served-model-name`, `--tensor-parallel-size`, `--pipeline-parallel-size`, `--gpu-memory-utilization` (default **0.90**), `--max-model-len`, `--host`, `--port`. The rest are opt-in:
+- `--dtype` — omitted by default (`dtype="auto"` honours the model's `torch_dtype`); set per-model only when a checkpoint's native dtype must be overridden.
+- `--enforce-eager` — off by default (CUDA graphs enabled = faster); enable per-model (`enforce_eager: true`) only if graph capture OOMs.
+- `--enable-chunked-prefill` — off by default (vLLM enables it itself when helpful); enable per-model (`chunked_prefill: true`) if needed.
+- `--max-num-seqs` — omitted by default (vLLM default 256); set per-model to cap concurrency for tight-memory models.
+- `--trust-remote-code` — emitted only when the model's `trust_remote_code` field is `true` (check `auto_map` in `config.json`).
+- `--enable-auto-tool-choice --tool-call-parser <name>` — emitted when the model's `tool_call_parser` field is set.
 - `cd /tmp` before launching — prevents `~/vllm/` source tree from shadowing the installed package
 - **Port**: all scripts default to **5000**
 
@@ -193,13 +192,14 @@ Schema types live in `launcher/models.py` (`ModelFormat` enum, `AIModel.from_dic
 Server definitions (SERVERS list, CACHE_MOUNTS) live in `launcher/data.py` (safe to commit).
 `path` field: absolute path to the model — any location (NAS, local SSD, etc.). Replaces the old `nas_path` field.
 `cached_path` field: optional faster local copy; written by `save_cached_path()` in `launch.py` after a successful rsync, cleared by passing `""`. `resolve_path()` returns `cached_path` when set and present on disk, else `path`.
-Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted per `(model, server, quant)` triple via `save_server_status()` in `launch.py` (JSON roundtrip, no regex). `server_status` in JSON is a nested dict: `{server_id: {quant_key: status}}` where `quant_key` is `"none"` (full/stored precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`). Only one quant key per server may be `"good"` (exclusive — `save_server_status` clears others). `best_status_for(server_id)` returns the best status across all quant entries for a server. `_quant_key(quant)` maps `RuntimeQuant | None` → string key.
+Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted per `(model, server, quant)` triple via `save_server_status()` in `launch.py` (JSON roundtrip, no regex). `server_status` in JSON is a nested dict: `{server_id: {quant_key: status}}` where `quant_key` is `"none"` (full/stored precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`). Multiple quant keys per server may be `"good"`. `best_status_for(server_id)` returns the best status across all quant entries for a server. `_quant_key(quant)` maps `RuntimeQuant | None` → string key.
 `ctx_override` field: optional launch override; `0` = use native `ctx`. Can be higher or lower than `ctx` (e.g. for RoPE-extended inference). Set interactively with `l` on the model list (`SetCtxOverrideScreen`). Persisted via `save_ctx_override()` — same JSON roundtrip pattern as `save_server_status()`.
 `favorite` field: boolean; `True` pins the model to the top of the sorted list. Toggled with `f` in `ModelSelectScreen`. Persisted via `save_favorite()` — key omitted from JSON when `False`. The `★` column shows `★` for favorites.
 `min_sm` field: integer minimum CUDA compute capability (e.g. `89` for sm_89+); `0` = no constraint. Checked against `system_min_sm()` from `gpu.py` (cached). When `model.hw_compat(system_sm)` is `False`, the warn column shows `⛔` and the note bar below the model table shows `model.hw_note`.
 `hw_note` field: string explaining the hardware requirement — shown in the launcher note bar when incompatible. Omitted from JSON when empty.
 `comfyui_subdir` field: `image_gen` models only — ComfyUI `models/` subdirectory to stage into (e.g. `"checkpoints"` for SDXL, `"diffusion_models"` for FLUX UNets, `"vae"`, `"loras"`). Default `"checkpoints"` — key omitted from JSON for checkpoints. Staging uses the original source filename (`staging_use_source_filename=True` on ComfyUI's `ServerSoftware`) so ComfyUI workflows can reference models by their natural names (e.g. `flux1-dev.safetensors`, `ae.safetensors`).
 `mmproj_path` field: absolute path to the companion `mmproj-*.gguf` vision encoder file; omitted from JSON when empty. Auto-detected by `ingest`/`refresh` when found in the GGUF bundle root (flat layout) or bundle root one level above the quant subdir. Populated via `copy-mmproj` + `refresh` workflow. Passed as `--mmproj` to llama.cpp and ooba at launch time.
+`tool_call_parser` field: vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, vLLM emits `--enable-auto-tool-choice --tool-call-parser <name>` and SGLang emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP` in `launch.py`). Omitted from JSON when empty.
 Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. Default order: `fav → status → name`. Clicking a header promotes it to primary (ascending); clicking the primary toggles direction. `_STATUS_RANK` maps composite status symbols (✓, ✓?, ✓✗, ✗?, ✗, ?) to integers 0–5 for sort.
 
 **Log files**: `logs/{timestamp}_{server}_{model}.log`. Header contains metadata + a paste-ready command block (no `#` prefix on the command lines). Exit footer: `# exit: code N` or `# exit: killed by SIGSEGV (11)`. Captured via PTY so ANSI colours are preserved. SIGWINCH is forwarded to the PTY so progress bars resize live.

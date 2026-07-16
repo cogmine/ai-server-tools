@@ -267,6 +267,10 @@ class AIModel:
     favorite: bool = False         # pinned models float to the top of the sorted list
     min_sm: int = 0                # minimum CUDA compute capability required (e.g. 89 for sm_89+); 0 = no constraint
     hw_note: str = ""              # human-readable reason shown when hw_compat() is False
+    # vLLM/SGLang tool-call parser name (e.g. "openai", "hermes", "llama3_json").
+    # When set, builders emit --enable-auto-tool-choice / --tool-call-parser flags.
+    # Uses vLLM parser names as canonical; SGLang names are translated automatically.
+    tool_call_parser: str = ""
     # For image_gen models: which ComfyUI models/ subdirectory to stage into.
     # 'checkpoints' for standard SD/SDXL files; 'diffusion_models' for FLUX UNets.
     comfyui_subdir: str = "checkpoints"
@@ -310,6 +314,7 @@ class AIModel:
             favorite=bool(d.get("favorite", False)),
             min_sm=int(d.get("min_sm", 0)),
             hw_note=d.get("hw_note", ""),
+            tool_call_parser=d.get("tool_call_parser", ""),
             comfyui_subdir=d.get("comfyui_subdir", "checkpoints"),
             server_status={  # type: ignore[arg-type]
                 sid: ({"none": v} if isinstance(v, str) else v)
@@ -502,6 +507,12 @@ class ServerSoftware:
     # Launch-time environment / process setup — set in data.py, consumed by launch.py.
     strip_pythonpath: bool = False       # pop PYTHONPATH from env (prevents src-tree shadowing)
     cuda_home: str = ""                  # override CUDA_HOME in env when non-empty
+    ld_library_path_prepend: str = ""    # path prepended to LD_LIBRARY_PATH (runtime .so loading)
+    library_path_prepend: str = ""       # path prepended to LIBRARY_PATH (link-time -l resolution for JIT)
+    # Symlinks ensured inside library_path_prepend before launch: {link_name: target_basename}.
+    # Self-heals split-wheel CUDA toolkits that ship libfoo.so.NN but omit the libfoo.so linker name.
+    lib_symlinks: dict[str, str] = field(default_factory=dict)
+    extra_env: dict[str, str] = field(default_factory=dict)  # additional env vars merged at launch
     uses_staging_dir: bool = False       # create a symlink under model_dir before launch
     # Maps ModelFormat → suffix appended to the staging symlink name.
     # e.g. {ModelFormat.GGUF: ".gguf"} makes ooba's format scanner recognise the file.

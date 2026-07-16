@@ -24,7 +24,8 @@
     "trust_remote_code": "(optional) true if servers must pass --trust-remote-code for this model.",
     "server_status": "(optional) Per-server test results: {server_id: {quant_key: good|bad|unknown}}. Updated by the TUI g/x/? keys.",
     "server_params": "(optional) Per-server parameter overrides merged on top of server defaults at launch time.",
-    "comfyui_subdir": "(optional, image_gen only) ComfyUI models/ subdirectory to stage into. Default: 'checkpoints'. Use 'diffusion_models' for FLUX UNets."
+    "comfyui_subdir": "(optional, image_gen only) ComfyUI models/ subdirectory to stage into. Default: 'checkpoints'. Use 'diffusion_models' for FLUX UNets.",
+    "tool_call_parser": "(optional) vLLM tool-call parser name (e.g. 'openai', 'hermes', 'llama3_json'). When set, servers emit tool-calling flags automatically. Translated for SGLang."
   },
   "models": [
     {

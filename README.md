@@ -6,17 +6,17 @@
 > [!NOTE]
 > **Note: Much of the code in this repository is AI-generated under close human direction. Design decisions are human-driven.**
 
-A toolkit for viewing GPU status and managing AI models and model servers on an NVIDIA multi-GPU workstation or server. Includes a keyboard-driven TUI launcher for spinning up inference servers and a standalone GPU stats monitor.
+`ai-server-tools` is a small toolkit for operating a local NVIDIA multi-GPU AI machine. It combines a keyboard-driven launcher for browsing models and starting inference servers with a standalone monitor for watching VRAM, utilisation, thermals, power, and PCIe layout in real time. The goal is to make day-to-day server bring-up, model switching, and hardware visibility faster and less error-prone.
 
 ## Tools
 
 ### [Launcher](launcher/README.md)
-A keyboard-driven Textual TUI for selecting and launching AI model inference servers (vLLM, llama.cpp, tabbyAPI / ExLlamaV2, SGLang, ComfyUI, and more). Features live VRAM readout, per-model/per-server test-result tracking, remote-to-local model caching, and in-TUI quantization.
+A keyboard-driven Textual TUI for browsing a model catalog, selecting a serving backend, choosing GPUs, and launching inference servers such as vLLM, llama.cpp, tabbyAPI / ExLlamaV2, SGLang, and ComfyUI. It keeps the machine-specific launch details in one place, with live VRAM readout, per-model/per-server test-result tracking, remote-to-local caching, and in-TUI quantization.
 
 ![Launcher screenshot](.github/assets/launcher.png)
 
 ### [GPU Monitor](gpu_monitor/README.md)
-A full-screen live GPU stats display — per-GPU VRAM, utilization, temperature, power, and PCIe topology. Adaptive polling: fast (0.1 s) while active, slow (1.0 s) at idle. Useful to watch VRAM fill as a large model loads.
+A full-screen live dashboard for seeing what every NVIDIA GPU in the machine is doing right now. It shows per-GPU VRAM usage, compute utilisation, temperature, power, and PCIe topology, polling quickly under load and backing off at idle so you can watch a model load or serve requests without opening multiple tools.
 
 ![GPU Monitor screenshot](.github/assets/gpumonitor.png)
 

@@ -123,6 +123,7 @@ _SORT_KEY: dict[str, Callable[["AIModel"], Any]] = {
     "moe":    lambda m: m.moe_experts,
     "vision": lambda m: 0 if m.vision            else 1,
     "trc":    lambda m: 0 if m.trust_remote_code else 1,
+    "tool":   lambda m: 0 if m.tool_call_parser    else 1,
     "cache":  lambda m: (0, c.label) if (c := m.cached_in(CACHE_MOUNTS)) is not None else (1, ""),
     "note":   lambda m: m.note.lower(),
 }
@@ -561,6 +562,9 @@ class GpuSelectScreen(DataTableScreen):
         self._runtime_quant = runtime_quant
         # Non-error rows only — maps SelectionList index → GpuRow.
         self._valid_rows: list = []  # list[GpuRow]
+        # Parallelism plan for TP/PP servers (vLLM, SGLang); recomputed on
+        # every selection change so the status bar stays current.
+        self._plan: launcher.ParallelismPlan | None = None
 
     def compose(self) -> ComposeResult:
         model_part = f"  ·  {self._model.name}" if self._model else ""
@@ -581,9 +585,18 @@ class GpuSelectScreen(DataTableScreen):
             # GPU polling unavailable — skip straight to ConfirmLaunch with default devices.
             self.app.call_later(self._skip_to_confirm)
             return
+        # Pre-compute parallelism to determine how many GPUs to pre-select.
+        n_available = len(self._valid_rows)
+        if self._server.gpu_count_param == "pipeline_parallel" and self._model:
+            plan = launcher.compute_parallelism(n_available, self._model)
+            pre_select = plan.gpu_count
+        elif self._server.max_gpus == 1:
+            pre_select = 1
+        else:
+            pre_select = n_available
         sl = self.query_one(SelectionList)
         for i, row in enumerate(self._valid_rows):
-            initial = (self._server.max_gpus != 1) or (i == 0)
+            initial = i < pre_select
             free_gb = (row.mem_total_mib - row.mem_used_mib) / 1024
             free_ratio = free_gb / max(row.mem_total_gb, 1)
             free_color = "bright_green" if free_ratio > 0.8 else ("yellow" if free_ratio > 0.3 else "red")
@@ -623,14 +636,35 @@ class GpuSelectScreen(DataTableScreen):
         label = self.query_one("#gpu-status", Label)
         if not selected:
             label.update("[red]No GPUs selected — select at least one before confirming.[/]")
+            self._plan = None
             return
         devices_str = ",".join(str(i) for i in selected)
         parts = [
             f"[dim]CUDA_VISIBLE_DEVICES=[/][bold]{devices_str}[/]"
             f"  [dim]({n} GPU{'s' if n != 1 else ''})[/]"
         ]
-        if self._server.gpu_count_param:
+        if self._server.gpu_count_param == "pipeline_parallel" and self._model:
+            self._plan = launcher.compute_parallelism(n, self._model)
+            if self._plan.gpu_count < n:
+                adj = selected[:self._plan.gpu_count]
+                adj_str = ",".join(str(i) for i in adj)
+                parts = [
+                    f"[dim]CUDA_VISIBLE_DEVICES=[/][bold]{adj_str}[/]"
+                    f"  [yellow]({self._plan.gpu_count} of {n} GPUs)[/]"
+                ]
+            tp_pp = (
+                f"TP=[bold]{self._plan.tp}[/] × PP=[bold]{self._plan.pp}[/]"
+                if self._plan.tp > 1
+                else f"PP=[bold]{self._plan.pp}[/]"
+            )
+            parts.append(tp_pp)
+            if self._plan.note:
+                parts.append(f"[yellow]{self._plan.note}[/]")
+        elif self._server.gpu_count_param:
+            self._plan = None
             parts.append(f"[dim]{self._server.gpu_count_param}[/] → [bold]{n}[/]")
+        else:
+            self._plan = None
         label.update("   ·   ".join(parts))
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -648,8 +682,20 @@ class GpuSelectScreen(DataTableScreen):
         if not selected:
             self.notify("Select at least one GPU", severity="warning", timeout=3)
             return
-        cuda_devices    = ",".join(str(i) for i in selected)
-        param_overrides = {self._server.gpu_count_param: len(selected)} if self._server.gpu_count_param else None
+        if self._plan is not None:
+            if self._plan.gpu_count < len(selected):
+                selected = selected[:self._plan.gpu_count]
+            cuda_devices    = ",".join(str(i) for i in selected)
+            param_overrides: dict[str, Any] | None = {
+                "tensor_parallel":   self._plan.tp,
+                "pipeline_parallel": self._plan.pp,
+            }
+        elif self._server.gpu_count_param:
+            cuda_devices    = ",".join(str(i) for i in selected)
+            param_overrides = {self._server.gpu_count_param: len(selected)}
+        else:
+            cuda_devices    = ",".join(str(i) for i in selected)
+            param_overrides = None
         try:
             cmd = launcher.build_cmd(self._server, self._model, self._runtime_quant, param_overrides=param_overrides)
         except Exception as e:
@@ -1040,6 +1086,7 @@ class ModelSelectScreen(DataTableScreen):
         table.add_column("MoE",    key="moe")    # expert count (blank for dense)
         table.add_column("👁",     key="vision")  # vision/multimodal flag
         table.add_column("TRC",    key="trc")    # --trust-remote-code required
+        table.add_column("🔧",     key="tool")   # tool-call parser configured
         table.add_column("Cache",  key="cache")
         table.add_column("Note",   key="note")   # user note (rightmost)
         yield table
@@ -1123,6 +1170,10 @@ class ModelSelectScreen(DataTableScreen):
         """Checkmark when --trust-remote-code is required, blank otherwise."""
         return "[yellow]✓[/]" if model.trust_remote_code else ""
 
+    def _tool_cell(self, model: AIModel) -> str:
+        """Wrench emoji when model has a tool-call parser configured, blank otherwise."""
+        return "🔧" if model.tool_call_parser else ""
+
     def _params_cell(self, model: AIModel) -> str:
         """Parameter count formatted as XB (≥1000M) or XM (<1000M); blank if unknown."""
         m = model.params_m
@@ -1195,6 +1246,7 @@ class ModelSelectScreen(DataTableScreen):
                 self._moe_cell(m),
                 self._vision_cell(m),
                 self._trc_cell(m),
+                self._tool_cell(m),
                 self._cache_cell(m),
                 m.note,
                 key=m.id,

@@ -87,6 +87,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `hw_note` | Optional human-readable explanation shown in the note bar when `hw_compat()` returns `False`. When omitted, `hw_compat_note` generates a default: `"Requires sm_{min_sm}+ GPU"`. |
 | `comfyui_subdir` | `image_gen` models only — ComfyUI `models/` subdirectory to stage into. Default: `"checkpoints"` (omit from JSON). Use `"diffusion_models"` for FLUX UNets. Extensible: any valid subdirectory name accepted by ComfyUI. |
 | `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time. Omitted from JSON when empty. |
+| `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. |
 | `cached_path` | Optional absolute path to a faster local copy. Set by the TUI cache action; cleared on uncache. `resolve_path()` returns this when non-empty and present on disk, otherwise returns `path`. Multiple entries may share the same `cached_path` when they point to the same source directory — `save_cached_path()` fans out to all of them. || `server_status` | `{server_id: {quant_key: status}}` — outer key is server id; inner key is `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`); value is `"good"` / `"bad"` / `"unknown"`. Only one quant key may be `"good"` per server (exclusive). |
 | `server_params` | Per-server overrides merged on top of server defaults at launch time |
 
@@ -271,7 +272,9 @@ The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived vi
 - `→`/`Enter` confirms. Status bar shows the live `CUDA_VISIBLE_DEVICES` string and, when applicable, the auto-adjusted parallelism param.
 - If `poll_gpus()` returns no valid rows (NVML unavailable), the screen skips itself and pushes `ConfirmLaunch` directly with the default device list.
 
-**`gpu_count_param` auto-adjustment**: vLLM and SGLang require their `pipeline_parallel` setting to equal the number of GPUs. When `server.gpu_count_param` is set, `GpuSelectScreen.action_confirm()` builds `param_overrides = {gpu_count_param: n}` and passes it through `build_cmd(param_overrides=...)` and `launch(param_overrides=...)`. This is the final merge layer in `_merged()` — it overrides both `default_params` and `model.server_params`. No auto-adjustment for tabbyAPI (`--gpu-split-auto`) or llama.cpp (distributes layers to visible GPUs automatically).
+**`gpu_count_param` auto-adjustment**: vLLM and SGLang require their parallelism flags to match the GPU count. When `server.gpu_count_param == "pipeline_parallel"`, `GpuSelectScreen` calls `compute_parallelism(n, model)` to determine the optimal TP×PP split and builds `param_overrides = {"tensor_parallel": tp, "pipeline_parallel": pp}`. The status bar shows the computed split (e.g. `PP=12` or `TP=2 × PP=7`). No auto-adjustment for tabbyAPI (`--gpu-split-auto`) or llama.cpp (distributes layers to visible GPUs automatically).
+
+**Parallelism computation** (`compute_parallelism` in `launch.py`): reads the model's HF `config.json` for `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, and `num_hidden_layers`. For PCIe topology (no NVLink), prefers the smallest valid TP (largest PP) to minimise cross-GPU tensor traffic. TP must evenly divide all three dimension fields. Additionally, for architectures *not* in `_TP_SCOPED_ARCHS`, `intermediate_size` must also be divisible by the total GPU count — this guards against model implementations that assert `intermediate_size % world_size == 0` using the global process count rather than the TP group size. When no valid plan exists for the selected GPU count, the count is automatically reduced to the largest compatible value and a note is shown in the status bar. Architecture is read from `model.arch` (catalog) with a fallback to `architectures[0]` in `config.json`. Results of `_read_hf_parallelism_fields` are LRU-cached per model path.
 
 **`build_cmd` / `launch` signatures**:
 - `build_cmd(server, model, runtime_quant, param_overrides)` — `param_overrides` is merged last in `_merged()`.
@@ -442,11 +445,40 @@ Statuses are stored as a nested dict: `server_status[server_id][quant_key] = sta
 
 | Constraint | Root cause | Mitigations in this codebase |
 |---|---|---|
-| TP size must divide attention head count | `num_attention_heads` in model's `config.json` must be divisible by `--tensor-parallel-size` | Use pipeline parallelism or tabbyAPI/ExLlamaV2 when TP=11 is not viable |
-| PCIe topology, no NVLink | Tensor parallel cross-GPU communication is expensive on PCIe | Prefer pipeline parallel (only activations cross GPU boundaries between adjacent pairs) |
-| Ray compiled DAG limit | Default `_max_inflight_executions=10`; pp=11 submits 11 steps at once | Patch `ray_executor.py`: set `max(pp+1, 16)` |
+| TP size must divide model dimensions | `num_attention_heads`, `num_key_value_heads`, and `intermediate_size` must be divisible by `--tensor-parallel-size` | `compute_parallelism()` picks the smallest valid TP for the selected GPU count |
+| Global world_size assertions | Some model implementations assert `intermediate_size % world_size == 0` using total GPU count, not TP size | `compute_parallelism()` checks this for architectures not in `_TP_SCOPED_ARCHS` and auto-reduces GPU count |
+| PCIe topology, no NVLink | Tensor parallel cross-GPU communication is expensive on PCIe | `compute_parallelism()` prefers smallest TP (largest PP) — only activations cross GPU boundaries |
+| Ray compiled DAG limit | Default `_max_inflight_executions=10`; pp=11 submits 11 steps at once | Only relevant when `executor_backend="ray"` is set explicitly (no longer the default). Patch `ray_executor.py`: set `max(pp+1, 16)` |
 | PYTHONPATH shadowing | `~/vllm/` source tree on `PYTHONPATH` shadows installed package | `launch()` removes `PYTHONPATH` from env before spawning vLLM |
-| CUDA graph OOM | Graph pre-allocation on large prompts with high `gpu_mem_util` | `--enforce-eager` always set |
+
+### vLLM launch flags — data-driven, minimal by default
+
+`_build_vllm` emits only the flags that are actually needed. Historically it force-set
+`--distributed-executor-backend ray`, `--dtype bfloat16`, `--enable-chunked-prefill`,
+`--enforce-eager`, `--max-num-seqs 64`, `--gpu-memory-utilization 0.97`, and an
+unconditional `--trust-remote-code`. Several of these caused hard-to-diagnose load
+failures (ray init/compiled-DAG issues, CUDA-graph OOM from `enforce-eager` + `0.97`
+utilization, dtype mismatches). They are now optional and driven by `default_params`:
+
+| Param (`default_params`) | Default | Flag emitted |
+|---|---|---|
+| `executor_backend` | `""` | `--distributed-executor-backend <v>` only when non-empty (else vLLM auto-picks `mp` for single-node) |
+| `dtype` | `"auto"` | `--dtype <v>` only when not `"auto"` (else vLLM honours the model's `torch_dtype`) |
+| `gpu_mem_util` | `0.90` | `--gpu-memory-utilization` always (vLLM default, leaves headroom) |
+| `max_num_seqs` | `0` | `--max-num-seqs <v>` only when non-zero (else vLLM default 256) |
+| `chunked_prefill` | `False` | `--enable-chunked-prefill` only when True |
+| `enforce_eager` | `False` | `--enforce-eager` only when True (default allows faster CUDA graphs) |
+| `log_requests` | `False` | `--no-enable-log-requests` when False; nothing when True |
+
+Always-on flags: `--model`, `--served-model-name`, `--tensor-parallel-size`,
+`--pipeline-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`
+(`model.effective_ctx`), `--host`, `--port`. `--trust-remote-code` is emitted only when
+the model's `trust_remote_code` field is True. `--enable-auto-tool-choice
+--tool-call-parser <name>` is emitted when the model's `tool_call_parser` is set.
+
+Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
+"gpu_mem_util": 0.8}`) and are merged over these defaults at launch time.
+
 
 ---
 

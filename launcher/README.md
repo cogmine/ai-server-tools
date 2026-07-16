@@ -1,6 +1,6 @@
 # Model Server Launcher
 
-A keyboard-driven Textual TUI for selecting and launching AI model inference servers. Supports vLLM, llama.cpp, tabbyAPI / ExLlamaV2, SGLang, ComfyUI, and more, with live VRAM readout, per-server test-result tracking, and remote-to-local model caching.
+Model Server Launcher is a keyboard-driven Textual control panel for a local AI workstation or server. It lets you browse a catalog of models, pick a serving backend, choose which GPUs to use, apply supported runtime quantization, and launch the server with your site-specific defaults from one place. It is designed for machines that host multiple model formats and backends, where repeatedly assembling the right command by hand is slow and error-prone.
 
 ![Launcher screenshot](../.github/assets/launcher.png)
 

@@ -1,6 +1,6 @@
 # GPU Monitor
 
-A full-screen, live-updating Textual TUI that shows per-GPU stats for all NVIDIA GPUs in the system. Polls at 0.1 s when any GPU is active, 1.0 s when all are idle. Useful to watch VRAM fill up as a large model loads.
+GPU Monitor is a full-screen Textual dashboard for watching all NVIDIA GPUs in a machine in real time. It surfaces the hardware signals that matter when loading or serving models: VRAM usage, compute utilisation, temperature, power draw, and PCIe topology. The refresh rate stays fast while any GPU is active and backs off when the system is idle, so you can leave it running alongside the launcher or a server process and see changes as they happen.
 
 ![GPU Monitor screenshot](../.github/assets/gpumonitor.png)
 
