@@ -298,10 +298,12 @@ All builders receive `model.effective_ctx` (not `model.ctx` directly) so that `c
 
 **Why inject `_model_path` into params rather than pass it separately?** To keep all builder functions with the same signature `(server, model, params) → list[str]`. New builders registered in `_BUILDERS` follow the same pattern without touching `build_cmd()`.
 
-**Per-server environment injection**: `launch()` reads per-server launch fields from the `ServerSoftware` instance (set in `data.py`) rather than branching on `server.id`:
+**Per-server environment injection**: `launch()` reads per-server launch fields from the `ServerSoftware` instance (set in `data.py`) rather than branching on `server.id`. Rather than mutating the child process's environment, the launcher-injected variables are assembled into a leading `env KEY=VALUE …` **command prefix** (using the `env` utility). This keeps the exact command written to the session log fully reproducible by copy/paste — the vars are visible in the log and can be tweaked and re-run directly. `os.environ` is still inherited as the base; the prefix assignments override it. Injected vars:
 - `CUDA_VISIBLE_DEVICES` — set for all servers from `CONFIG.resolved_cuda_devices`
-- `strip_pythonpath=True` (vLLM): removes `PYTHONPATH` to prevent source-tree shadowing of the installed package
-- `cuda_home` (tabbyAPI, SGLang): sets `CUDA_HOME` in the environment; enforces the correct nvcc for flash-attn / flashinfer JIT compilation
+- `strip_pythonpath=True` (vLLM): removes `PYTHONPATH` (applied to the inherited base env, not the prefix) to prevent source-tree shadowing of the installed package
+- `cuda_home` (tabbyAPI, SGLang, vLLM): sets `CUDA_HOME`; enforces the correct nvcc for flash-attn / flashinfer JIT compilation
+- `ld_library_path_prepend` / `library_path_prepend` (vLLM): prepend the split-wheel CUDA lib dir to `LD_LIBRARY_PATH` (runtime `.so` load) / `LIBRARY_PATH` (link-time `-l` resolution); the existing value is captured inline so the logged command reproduces exactly. `lib_symlinks` self-heals missing linker-name symlinks (e.g. `libcudart.so` → `libcudart.so.13`) on disk before spawn
+- `extra_env` (vLLM): arbitrary extra `KEY=VALUE` pairs merged into the prefix
 - `uses_staging_dir=True` (tabbyAPI, ooba, ComfyUI): creates symlinks under `model_dir`; `staging_format_suffixes` maps `ModelFormat` → file extension suffix; `stage_all_models=True` (ComfyUI) stages every compatible catalog model rather than only the selected one; `staging_subdir_attr="comfyui_subdir"` (ComfyUI) routes each model to `model_dir/<model.comfyui_subdir>/` — `launch.py` reads `getattr(model, staging_subdir_attr)` generically with no branching on `server.id`
 - `launch_cwd` (vLLM → `/tmp`, ooba → install dir): sets the working directory for the spawned process; vLLM avoids any `vllm/` directory on `sys.path`; ooba needs CWD at its install root because Gradio resolves `allowed_paths` relative to CWD
 
@@ -341,7 +343,7 @@ The output directory is shown to the user in `ConfirmQuantize` before they confi
 Follows the same PTY + log structure as `launch()`:
 - Log named `logs/{timestamp}_quantize_{tool.id}_{model.id}_{quant_option}.log`
 - Output directory created before spawn
-- `CUDA_HOME` set from `tool.cuda_home` when non-empty
+- `CUDA_HOME` set from `tool.cuda_home` when non-empty, via the same leading `env KEY=VALUE` command prefix as `launch()`
 - Same PTY window-size stamping and bash wrapper
 
 ### `exl2_convert_script` config field
@@ -365,13 +367,12 @@ After the TUI exits, `launch()` in `launch.py` creates a log file and spawns the
    # model:  <id>  (<format>, <size_gb> GB)
    # server: <server_id>
    # path:   <resolved_path>
-   # CUDA_VISIBLE_DEVICES=...
    #
    # command:
    <paste-ready command, one arg per line with backslash continuation>
    # ────────────────────────────────────────────────────────────────────────
    ```
-   The command block has no `#` prefix so it can be copied directly to a terminal.
+   The command block has no `#` prefix so it can be copied directly to a terminal. It begins with an `env KEY=VALUE …` prefix carrying all launcher-injected environment variables (including `CUDA_VISIBLE_DEVICES`), so pasting the block reproduces the run exactly.
 
 2. **PTY** — `pty.openpty()` creates a master/slave pair. The slave fd is given to the child as stdout+stderr. `TIOCSWINSZ` stamps the slave with the real terminal dimensions so width-sensitive output (tqdm progress bars etc.) renders correctly.
 

@@ -278,14 +278,20 @@ def _quant_slug(quant: str) -> str:
 
 def _dir_to_display_name(dirname: str) -> str:
     """Convert a directory/file name to a human-readable display string."""
-    # Strip common format/provenance suffixes (case-insensitive comparison)
+    # Strip common format/provenance suffixes (case-insensitive comparison).
+    # Chained suffixes (e.g. "...-BF16-GGUF") are stripped repeatedly until
+    # none remain, so the quant tag doesn't linger and later get duplicated
+    # by the quant_suffix appended in the caller.
     strip_suffixes = [
         "-GGUF", "_GGUF", "-BF16", "-FP16", "-FP8", "-INT8",
         "-EXL2", "-AWQ", "-GPTQ", "-hf",
     ]
-    for suffix in strip_suffixes:
-        if dirname.upper().endswith(suffix.upper()):
-            dirname = dirname[: -len(suffix)]
+    while True:
+        for suffix in strip_suffixes:
+            if dirname.upper().endswith(suffix.upper()):
+                dirname = dirname[: -len(suffix)]
+                break
+        else:
             break
     # Replace common separators with spaces, but preserve dots that are
     # part of a version number (digit.digit, e.g. V3.2, v0.1).

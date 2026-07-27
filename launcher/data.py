@@ -104,7 +104,7 @@ SERVERS: list[ServerSoftware] = [
         supported_formats=frozenset({ModelFormat.GGUF}),
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
         default_params={
-            "n_gpu_layers": 99,
+            "n_gpu_layers": "auto",
             "split_mode":   "layer",
             "parallel":     1,
             "threads":      16,
@@ -158,7 +158,7 @@ SERVERS: list[ServerSoftware] = [
             # Valid: Transformers, llama.cpp, ExLlamav3_HF, ExLlamav3
             "loader":       "",
             # llama.cpp loader options
-            "gpu_layers":   99,     # offload all layers
+            "gpu_layers":   -1,     # offload all layers
             "tensor_split": "",     # "" = no flag; "1,1,...,1" for equal N-GPU split
             "cache_type":   "",     # "" = default; "q8_0" llama.cpp; "q8" ExLlama
             "api_port":     CONFIG.server_ports.get("ooba", 5000),

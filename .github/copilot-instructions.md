@@ -146,7 +146,8 @@ Server tools scan config files at startup — on a NAS or slow drive this causes
 ## vLLM Configuration
 
 ### Version / CUDA toolchain (cu13 split wheels)
-vLLM **0.25.1** with PyTorch **2.11.0+cu130** in the `vllm` conda env. The cu13 CUDA runtime
+vLLM **0.26.0** with PyTorch **2.11.0+cu130** in the `vllm` conda env (0.26.0 keeps the same torch
+as 0.25.1, so the cu13 toolchain is unchanged). The cu13 CUDA runtime
 is bundled as pip split wheels under `…/site-packages/nvidia/cu13/` (shared libs in `lib/`, nvcc
 in `bin/`, headers in `include/`). This is env-local — other envs stay on cu128.
 
@@ -163,6 +164,12 @@ bundled toolkit. Two constraints must hold, both wired into `launcher/data.py` /
   `LIBRARY_PATH`; `-lcuda` resolves against the system driver stub. All auto-applied at launch via
   the vLLM `ServerSoftware` fields `cuda_home` / `ld_library_path_prepend` / `library_path_prepend`
   / `lib_symlinks` (paths derived from `CONFIG.vllm_cuda_libs` / `vllm_cuda_home`, glob-discovered).
+- **flashinfer-cubin version lock** — vLLM 0.26.0 pins `flashinfer-python==0.6.14` and hard-checks
+  that any installed `flashinfer-cubin` matches exactly (else `RuntimeError: flashinfer-cubin
+  version does not match flashinfer version`). When the cubin package lags behind (0.6.14 unpublished
+  as of this writing, max 0.6.13), **uninstall `flashinfer-cubin`** so flashinfer JIT-compiles the
+  0.6.14 kernels itself (needs `CUDA_HOME` + the link-time cudart fix above). Re-add the matching
+  `flashinfer-cubin` once its version catches up to skip JIT.
 
 ### Parallelism
 - Executor backend is **not** forced by default — vLLM auto-selects `mp` (multiprocessing), which is simpler/more robust for this single node. Set `executor_backend` in `server_params["vllm"]` to `"ray"` only when a model needs it.

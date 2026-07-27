@@ -130,16 +130,21 @@ _TP_SCOPED_ARCHS: frozenset[str] = frozenset({
     "CohereForCausalLM",
     "DeepseekV2ForCausalLM",
     "DeepseekV3ForCausalLM",
+    "DeepseekV4ForCausalLM",
     "GPT2LMHeadModel",
     "GPTBigCodeForCausalLM",
     "GPTJForCausalLM",
     "GPTNeoForCausalLM",
     "GPTNeoXForCausalLM",
     "Gemma2ForCausalLM",
+    "KimiK25ForConditionalGeneration",
+    "LagunaForCausalLM",
     "LLaMAForCausalLM",
     "Llama4ForConditionalGeneration",
     "LlamaForCausalLM",
+    "Ministral3ForCausalLM",
     "Mistral3ForConditionalGeneration",
+    "MiniMaxM2ForCausalLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
     "OPTForCausalLM",
@@ -148,6 +153,7 @@ _TP_SCOPED_ARCHS: frozenset[str] = frozenset({
     "Qwen3MoeForCausalLM",
     "Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
+    "SarvamMLAForCausalLM",
     "XGLMForCausalLM",
 })
 
@@ -314,7 +320,6 @@ def _build_llamacpp(server: ServerSoftware, model: AIModel, p: dict) -> list[str
         "--threads",      str(p["threads"]),
         "--host",         "0.0.0.0",
         "--port",         str(p["port"]),
-        "--verbose-prompt",
         "--log-prefix",
         "--log-timestamps",
     ]
@@ -668,17 +673,26 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
     param_overrides: merged on top of server/model params (e.g. pipeline_parallel → GPU count).
     """
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = cuda_devices if cuda_devices is not None else CONFIG.resolved_cuda_devices
 
     if server.strip_pythonpath:
         env.pop("PYTHONPATH", None)
 
+    # Launcher-injected environment variables are passed as a leading `env KEY=VALUE …`
+    # prefix on the command line (not mutated into the child's environment) so that the
+    # exact command written to the session log is fully reproducible by copy/paste.
+    # os.environ is still inherited as the base; these assignments override it.
+    env_prefix: dict[str, str] = {
+        "CUDA_VISIBLE_DEVICES": cuda_devices if cuda_devices is not None else CONFIG.resolved_cuda_devices,
+    }
+
     if server.cuda_home:
-        env["CUDA_HOME"] = server.cuda_home
+        env_prefix["CUDA_HOME"] = server.cuda_home
 
     if server.ld_library_path_prepend:
-        existing = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = f"{server.ld_library_path_prepend}:{existing}" if existing else server.ld_library_path_prepend
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        env_prefix["LD_LIBRARY_PATH"] = (
+            f"{server.ld_library_path_prepend}:{existing}" if existing else server.ld_library_path_prepend
+        )
 
     if server.library_path_prepend:
         # Ensure any missing linker-name symlinks exist (self-heals split-wheel CUDA
@@ -690,11 +704,13 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
                 if link.is_symlink():
                     link.unlink()  # replace a broken symlink
                 link.symlink_to(target)
-        existing = env.get("LIBRARY_PATH", "")
-        env["LIBRARY_PATH"] = f"{server.library_path_prepend}:{existing}" if existing else server.library_path_prepend
+        existing = os.environ.get("LIBRARY_PATH", "")
+        env_prefix["LIBRARY_PATH"] = (
+            f"{server.library_path_prepend}:{existing}" if existing else server.library_path_prepend
+        )
 
     if server.extra_env:
-        env.update(server.extra_env)
+        env_prefix.update(server.extra_env)
 
     if server.uses_staging_dir:
         p = _merged(server, model)
@@ -730,6 +746,10 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
     model_slug = model.id if model is not None else "no-model"
     log_path = _LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{server.id}_{model_slug}.log"
     cmd = build_cmd(server, model, runtime_quant=runtime_quant, param_overrides=param_overrides)
+    # Prepend the env-var assignments via the `env` utility so they appear in the logged
+    # command and reproduce exactly on copy/paste.  `env` parses each NAME=VALUE argv
+    # token robustly (values may contain spaces or colons).
+    cmd = ["env", *(f"{k}={v}" for k, v in env_prefix.items()), *cmd]
     quant_str = f" + {runtime_quant.value}" if runtime_quant else ""
     if model is not None:
         model_line = f"# model:  {model.id}  ({model.format.value}{quant_str}, {model.size_gb} GB)\n"
@@ -743,7 +763,6 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
         f"{model_line}"
         f"# server: {server.id}\n"
         f"{path_line}"
-        f"# CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}\n"
         f"#\n"
         f"# command:\n"
         f"{format_cmd(cmd)}\n"
@@ -767,13 +786,15 @@ def quantize(
     Returns (proc, log_path, master_fd).
     """
     cmd, output_path = build_quantize_cmd(tool, model, quant_option, dest)
+    if tool.cuda_home:
+        # Pass CUDA_HOME as a leading `env KEY=VALUE` so the logged command reproduces
+        # by copy/paste (same rationale as launch()).
+        cmd = ["env", f"CUDA_HOME={tool.cuda_home}", *cmd]
 
     # output_path is always a directory — create it before the process starts.
     output_path.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
-    if tool.cuda_home:
-        env["CUDA_HOME"] = tool.cuda_home
 
     _LOGS_DIR.mkdir(exist_ok=True)
     safe_quant = quant_option.replace("/", "-")
