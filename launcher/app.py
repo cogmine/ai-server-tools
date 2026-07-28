@@ -22,6 +22,7 @@ from textual.app import App
 from textual.binding import Binding
 
 from launcher.data import AI_MODELS, SERVERS
+from launcher.launch import QuantizeJob, finalize_quantization
 from launcher.models import AIModel, ServerSoftware, available_ai_types, uses_hub_flow
 from launcher.screens import AITypeScreen, ImageGenHubScreen, ModelSelectScreen, ServerSelectScreen
 
@@ -35,9 +36,14 @@ class ModelLauncherApp(App):
         Binding("q", "quit_app", "Quit", show=False),
     ]
 
-    def __init__(self, preselect: "tuple[AIModel, ServerSoftware] | None" = None) -> None:
+    def __init__(
+        self,
+        preselect: "tuple[AIModel, ServerSoftware] | None" = None,
+        preselect_model: "AIModel | None" = None,
+    ) -> None:
         super().__init__()
         self._preselect = preselect
+        self._preselect_model = preselect_model
 
     def on_mount(self) -> None:
         if self._preselect is not None:
@@ -51,6 +57,10 @@ class ModelLauncherApp(App):
                 self.push_screen(ModelSelectScreen(ai_type, preselect_model=model))
                 self.push_screen(ServerSelectScreen(model, preselect_server_id=server.id))
                 return
+        if self._preselect_model is not None:
+            ai_type = next(iter(self._preselect_model.ai_types))
+            self.push_screen(ModelSelectScreen(ai_type, preselect_model=self._preselect_model))
+            return
         types = available_ai_types(AI_MODELS)
         if len(types) == 1:
             if uses_hub_flow(SERVERS, types[0]):
@@ -99,21 +109,26 @@ def _tee_output(master_fd: int, log_path: Path) -> None:
 def run(no_menu: bool = False, default: int | None = None) -> None:
     """Entry point called from __main__.py."""
     preselect: "tuple[AIModel, ServerSoftware] | None" = None
+    preselect_model: "AIModel | None" = None
     while True:
-        app = ModelLauncherApp(preselect=preselect)
+        app = ModelLauncherApp(preselect=preselect, preselect_model=preselect_model)
         result = app.run()
         preselect = None  # consumed; clear for any subsequent loops
+        preselect_model = None
 
-        # result is a (factory, model, server) tuple set by ConfirmLaunch/ConfirmQuantize.
-        # server is None for quantize jobs (ConfirmQuantize passes None as the third element).
-        if not isinstance(result, tuple) or len(result) != 3:
+        quantize_job = result if isinstance(result, QuantizeJob) else None
+        if quantize_job is not None:
+            factory = quantize_job.factory
+            model = quantize_job.model
+            server = None
+        elif isinstance(result, tuple) and len(result) == 3:
+            factory, model, server = cast(
+                "tuple[Callable[[], tuple[subprocess.Popen, Path, int]], AIModel, ServerSoftware | None]",
+                result,
+            )
+        else:
             # User quit the menu without launching — exit to bash.
             sys.exit(0)
-
-        factory, model, server = cast(
-            "tuple[Callable[[], tuple[subprocess.Popen, Path, int]], AIModel, ServerSoftware | None]",
-            result,
-        )
         proc, log_path, master_fd = factory()
         print(f"Logging to: {log_path}", flush=True)
         tee = threading.Thread(target=_tee_output, args=(master_fd, log_path), daemon=True)
@@ -157,6 +172,15 @@ def run(no_menu: bool = False, default: int | None = None) -> None:
             # just reopen the top-level menu (no preselect).
             if server is not None and model is not None:
                 preselect = (model, server)
+            continue
+
+        if quantize_job is not None:
+            if rc == 0:
+                try:
+                    preselect_model = finalize_quantization(quantize_job)
+                    print(f"Added quantized model: {preselect_model.id}", flush=True)
+                except Exception as exc:
+                    print(f"Failed to finalize quantized model: {exc}", file=sys.stderr)
             continue
 
         sys.exit(rc or 0)

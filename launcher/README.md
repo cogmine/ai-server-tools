@@ -191,6 +191,10 @@ Override server defaults per model with a `server_params` key:
 | `f` | Toggle favorite pin for focused model (model list) |
 | `z` | Quantize focused model — opens tool/quant/destination picker (model list) |
 | `g` / `x` / `?` | Mark focused server as good / bad / unknown (server list) |
+| `Ctrl+Enter` | Execute the edited command (final Ready to launch screen) |
+| `Ctrl+Q` | Quit from the final command editor (`q` inserts text there) |
+
+The final **Ready to launch** screen is an editor containing the exact shell command that will run. Launcher-controlled values such as `CUDA_VISIBLE_DEVICES`, non-default `CUDA_HOME` and library paths, `PYTHONPATH` removal, and the launch working directory are explicit in that command. Edit any part of it to test alternate arguments or environment values; the edited text is written unchanged to the session log and executed through Bash.
 
 ## File map
 
@@ -234,7 +238,7 @@ Press `z` on any model in the model list to start a quantization job.  Only mode
 3. Pick an output destination — one of the configured `[[cache_mounts]]`, with current free space shown.
 4. Review the full command and output path, then confirm.
 
-The TUI exits, the conversion runs in your terminal with live output, and the log is written to `logs/`.
+The TUI temporarily exits while the conversion runs in your terminal with live output, and the log is written to `logs/`. Outputs are placed under the AI-type subdirectory of the chosen cache mount (for example, `~/fast_models/text-generation/`). After a successful conversion, the launcher copies required EXL2 config/tokenizer metadata, removes resumable conversion work files, adds the generated model to `user_data/models_local.json`, and reopens with that model focused. Failed or interrupted outputs retain their work files and are not added to the catalog.
 
 ### Supported tools
 

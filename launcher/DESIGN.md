@@ -183,9 +183,9 @@ App.on_mount
 
 `uses_hub_flow(servers, ai_type)` returns `True` when every server for a given AI type has `stage_all_models=True`. The check lives in `models.py` (domain logic) so neither `screens.py` nor `app.py` need to know about `stage_all_models` directly.
 
-`App.exit(result)` where `result` is a `(factory, model, server_or_none)` 3-tuple — the TUI tears down, then `app.py::run()` calls `factory()` and blocks on `proc.wait()`. This means the TUI process *is* the parent process, so `Ctrl-C` propagates naturally.
+`App.exit(result)` returns either a `(factory, model, server)` server-launch tuple or a `QuantizeJob`. The TUI tears down, then `app.py::run()` calls the process factory and blocks on `proc.wait()`. This means the TUI process *is* the parent process, so `Ctrl-C` propagates naturally.
 
-For server launches `server` is a `ServerSoftware` instance; for quantize jobs it is `None`. `run()` uses `server is not None and model is not None` to decide whether to re-open the menu with a preselect (useful after a Ctrl-C to mark the test result immediately). Image-gen launches (model=None) do not generate a preselect — the menu re-opens from the top.
+For server launches, `run()` uses `server is not None and model is not None` to decide whether to re-open the menu with a preselect after Ctrl-C (useful for marking the test result immediately). Image-gen launches (`model=None`) and interrupted quantization jobs reopen from the top. Successful quantization jobs finalize and focus the generated model.
 
 **`ImageGenHubScreen`**: Two-button menu. "Launch Server" pushes `ServerSelectScreen(model=None, ai_type=...)` which filters servers by type (via `servers_for_type()`), skips path validation, and suppresses g/x/? status marking. "Manage Models" pushes `ModelManageScreen` — all catalog management bindings work identically to `ModelSelectScreen`; `→`/`Enter` open `CacheActionScreen` for the focused model (cache/uncache) rather than advancing toward a server launch. Both buttons use `variant="primary"`.
 
@@ -236,10 +236,10 @@ ModelSelectScreen → z
     → (>1 tool) QuantizeToolScreen   — choose tool; skipped when exactly one applies
     → QuantizeOptionScreen            — choose quant level / bpw from tool.quant_options
     → QuantizeDestScreen              — choose output destination (CACHE_MOUNTS with free space)
-    → ConfirmQuantize                 — show command + output path; exits TUI on confirm
+    → ConfirmQuantize                 — show command + output path; runs job outside TUI
 ```
 
-`ConfirmQuantize.action_confirm()` calls `app.exit((factory, model, None))`. The `None` third element signals `run()` that this is a quantize job, not a server launch.
+  `ConfirmQuantize.action_confirm()` returns a `QuantizeJob` containing the process factory and finalization metadata. After the child exits, `run()` reopens the launcher. Exit code 0 copies standard config/tokenizer files into EXL2 outputs, removes resumable converter work artifacts, adds the output to `models_local.json`, updates the in-memory catalog, and focuses the new model. Failed or interrupted jobs retain their work artifacts and are not catalogued.
 
 **Multi-column sort**: `ModelSelectScreen` tracks an ordered list of `(column_key, reverse)` pairs in `_sort_keys`. Index 0 is the primary sort, index 1 secondary, and so on. Clicking a column header:
 - If it is the current primary column → toggles its sort direction.
@@ -278,7 +278,10 @@ The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived vi
 
 **`build_cmd` / `launch` signatures**:
 - `build_cmd(server, model, runtime_quant, param_overrides)` — `param_overrides` is merged last in `_merged()`.
-- `launch(server, model, runtime_quant, cuda_devices, param_overrides)` — `cuda_devices` overrides `CONFIG.resolved_cuda_devices`; `param_overrides` is forwarded to `build_cmd`.
+- `build_launch_command(server, model, runtime_quant, cuda_devices, param_overrides)` — wraps `build_cmd()` in the explicit environment and working-directory shell syntax shown in `ConfirmLaunch`.
+- `launch(server, model, runtime_quant, cuda_devices, param_overrides, command)` — `command` is the shell text edited in `ConfirmLaunch`; it is logged and executed verbatim. Callers that omit it get the default from `build_launch_command()`.
+
+**Editable confirmation**: `ConfirmLaunch` displays the complete shell command in a focused `TextArea`. The user may change arguments, environment assignments, or shell syntax before launching with `Ctrl+Enter` or the Launch button. The edited text becomes the zero-argument process factory returned through `App.exit()`, so the preview, session log, and command passed to Bash cannot diverge. `Ctrl+Q` quits from this screen because plain `q` must remain available for editing.
 
 ---
 
@@ -298,14 +301,14 @@ All builders receive `model.effective_ctx` (not `model.ctx` directly) so that `c
 
 **Why inject `_model_path` into params rather than pass it separately?** To keep all builder functions with the same signature `(server, model, params) → list[str]`. New builders registered in `_BUILDERS` follow the same pattern without touching `build_cmd()`.
 
-**Per-server environment injection**: `launch()` reads per-server launch fields from the `ServerSoftware` instance (set in `data.py`) rather than branching on `server.id`. Rather than mutating the child process's environment, the launcher-injected variables are assembled into a leading `env KEY=VALUE …` **command prefix** (using the `env` utility). This keeps the exact command written to the session log fully reproducible by copy/paste — the vars are visible in the log and can be tweaked and re-run directly. `os.environ` is still inherited as the base; the prefix assignments override it. Injected vars:
+**Per-server environment injection**: `build_launch_command()` reads per-server launch fields from the `ServerSoftware` instance (set in `data.py`) rather than branching on `server.id`. Rather than mutating the child process's environment, launcher-controlled values are assembled into a leading `env KEY=VALUE …` **command prefix** (using the `env` utility). This keeps the confirmation editor and session log fully reproducible by copy/paste. `os.environ` is still inherited as the base; the explicit command assignments override it. Injected behavior:
 - `CUDA_VISIBLE_DEVICES` — set for all servers from `CONFIG.resolved_cuda_devices`
-- `strip_pythonpath=True` (vLLM): removes `PYTHONPATH` (applied to the inherited base env, not the prefix) to prevent source-tree shadowing of the installed package
+- `strip_pythonpath=True` (vLLM): emits `env -u PYTHONPATH` to prevent source-tree shadowing of the installed package
 - `cuda_home` (tabbyAPI, SGLang, vLLM): sets `CUDA_HOME`; enforces the correct nvcc for flash-attn / flashinfer JIT compilation
 - `ld_library_path_prepend` / `library_path_prepend` (vLLM): prepend the split-wheel CUDA lib dir to `LD_LIBRARY_PATH` (runtime `.so` load) / `LIBRARY_PATH` (link-time `-l` resolution); the existing value is captured inline so the logged command reproduces exactly. `lib_symlinks` self-heals missing linker-name symlinks (e.g. `libcudart.so` → `libcudart.so.13`) on disk before spawn
 - `extra_env` (vLLM): arbitrary extra `KEY=VALUE` pairs merged into the prefix
 - `uses_staging_dir=True` (tabbyAPI, ooba, ComfyUI): creates symlinks under `model_dir`; `staging_format_suffixes` maps `ModelFormat` → file extension suffix; `stage_all_models=True` (ComfyUI) stages every compatible catalog model rather than only the selected one; `staging_subdir_attr="comfyui_subdir"` (ComfyUI) routes each model to `model_dir/<model.comfyui_subdir>/` — `launch.py` reads `getattr(model, staging_subdir_attr)` generically with no branching on `server.id`
-- `launch_cwd` (vLLM → `/tmp`, ooba → install dir): sets the working directory for the spawned process; vLLM avoids any `vllm/` directory on `sys.path`; ooba needs CWD at its install root because Gradio resolves `allowed_paths` relative to CWD
+- `launch_cwd` (vLLM → `/tmp`, ooba → install dir): emits a leading `cd <dir> &&` in the command; vLLM avoids any `vllm/` directory on `sys.path`; ooba needs CWD at its install root because Gradio resolves `allowed_paths` relative to CWD
 
 ---
 
@@ -328,13 +331,13 @@ Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matchi
 
 `compute_quant_output_path(tool, model, quant_option, dest)` in `launch.py` always returns a **directory**. Every job gets its own uniquely-named directory so that removal is always consistent: delete the directory and its contents, regardless of format.
 
-- **GGUF re-quantize**: `<dest.root>/<stem_no_quant>-GGUF-<quant>/`
+- **GGUF re-quantize**: `<dest.root>/<model.cache_subdir>/<stem_no_quant>-GGUF-<quant>/`
   — The `.gguf` file inside is `<stem_no_quant>.<quant>.gguf`, placed there by the builder.
-  Example: `<dest>/MyModel-GGUF-Q4_K_M/MyModel.Q4_K_M.gguf`
+  Example: `<dest>/text-generation/MyModel-GGUF-Q4_K_M/MyModel.Q4_K_M.gguf`
 
-- **EXL2 convert**: `<dest.root>/<source_dirname>-exl2-<bpw>bpw/`
+- **EXL2 convert**: `<dest.root>/<model.cache_subdir>/<source_dirname>-exl2-<bpw>bpw/`
   — `source_dirname` is `Path(model.resolve_path()).name`.
-  Example: `<dest>/MyModel-exl2-4.0bpw/`
+  Example: `<dest>/text-generation/MyModel-exl2-4.0bpw/`
 
 The output directory is shown to the user in `ConfirmQuantize` before they confirm.
 
@@ -345,6 +348,8 @@ Follows the same PTY + log structure as `launch()`:
 - Output directory created before spawn
 - `CUDA_HOME` set from `tool.cuda_home` when non-empty, via the same leading `env KEY=VALUE` command prefix as `launch()`
 - Same PTY window-size stamping and bash wrapper
+- On exit code 0, `finalize_quantization()` copies EXL2 metadata, removes converter work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), and registers the explicit output path through `ingest_model()`
+- The launcher then reopens with the generated model focused; failed or interrupted outputs remain on disk for inspection/resume but are not registered
 
 ### `exl2_convert_script` config field
 
@@ -372,11 +377,11 @@ After the TUI exits, `launch()` in `launch.py` creates a log file and spawns the
    <paste-ready command, one arg per line with backslash continuation>
    # ────────────────────────────────────────────────────────────────────────
    ```
-   The command block has no `#` prefix so it can be copied directly to a terminal. It begins with an `env KEY=VALUE …` prefix carrying all launcher-injected environment variables (including `CUDA_VISIBLE_DEVICES`), so pasting the block reproduces the run exactly.
+  The command block has no `#` prefix so it can be copied directly to a terminal. It is the exact text accepted from `ConfirmLaunch`, with a default `env KEY=VALUE …` prefix carrying all launcher-injected environment variables (including `CUDA_VISIBLE_DEVICES`) and a visible `cd` prefix when needed.
 
 2. **PTY** — `pty.openpty()` creates a master/slave pair. The slave fd is given to the child as stdout+stderr. `TIOCSWINSZ` stamps the slave with the real terminal dimensions so width-sensitive output (tqdm progress bars etc.) renders correctly.
 
-3. **Bash wrapper** — the actual command is wrapped as `bash -c "<shlex.join(cmd)>"`. This ensures shell signal diagnostics ("Segmentation fault (core dumped)") appear in the output and that the exit code uses bash's `128+signum` convention.
+3. **Bash wrapper** — the exact edited command is passed to `bash -c`. This honors user-added shell syntax, ensures shell signal diagnostics ("Segmentation fault (core dumped)") appear in the output, and uses Bash's `128+signum` exit-code convention.
 
 4. **Tee thread** — `_tee_output(master_fd, log_path)` runs in a background thread, reading from the PTY master and writing to both `sys.stdout` (terminal output) and the log file (`"ab"` mode to preserve the header). `OSError`/EIO on the read signals child EOF.
 

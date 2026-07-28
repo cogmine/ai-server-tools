@@ -90,6 +90,11 @@ label    = "SATA (sda1)"
 root     = "/mnt/sda1/models"
 priority = 1
 
+[[cache_mounts]]
+label    = "eSATA RAID0 (sda2)"
+root     = "/mnt/sdb2/models"
+priority = 2
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Port overrides  (optional)

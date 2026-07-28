@@ -30,6 +30,7 @@ from textual.widgets import (
     ProgressBar,
     SelectionList,
     Static,
+    TextArea,
 )
 from textual.containers import Horizontal, Vertical
 
@@ -184,17 +185,17 @@ class ButtonMenuScreen(Screen):
 # ---------------------------------------------------------------------------
 
 class ConfirmLaunch(ButtonMenuScreen):
-    """Show what will be launched and ask for confirmation."""
+    """Let the user edit the exact shell command before launching it."""
 
     BINDINGS: ClassVar = [
-        Binding("q",             "quit_app",       "Quit"),
-        Binding("escape,b,left", "cancel",         "Back",   key_display="esc/←"),
-        Binding("enter,right",   "press_focused",  "Launch", key_display="↵/→/Space"),
+        Binding("ctrl+q",        "quit_app", "Quit"),
+        Binding("escape",        "cancel",   "Back",   key_display="esc"),
+        Binding("ctrl+enter",    "confirm",  "Launch", key_display="Ctrl+Enter"),
     ]
 
-    def __init__(self, description: str, proc_factory, model: "AIModel | None", server: ServerSoftware) -> None:
+    def __init__(self, command: str, proc_factory, model: "AIModel | None", server: ServerSoftware) -> None:
         super().__init__()
-        self._description = description
+        self._command = command
         self._proc_factory = proc_factory
         self._model  = model
         self._server = server
@@ -202,7 +203,8 @@ class ConfirmLaunch(ButtonMenuScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Vertical(
-            Static(f"[bold]Ready to launch:[/]\n\n{self._description}", id="confirm-text"),
+            Static("[bold]Ready to launch:[/]", id="confirm-title"),
+            TextArea(self._command, language="bash", soft_wrap=True, id="confirm-command"),
             Horizontal(
                 Button("Launch", variant="success", id="btn-launch"),
                 Button("Back",   variant="default", id="btn-back"),
@@ -213,11 +215,19 @@ class ConfirmLaunch(ButtonMenuScreen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#btn-launch", Button).focus()
+        self.query_one("#confirm-command", TextArea).focus()
+
+    def action_confirm(self) -> None:
+        command = self.query_one("#confirm-command", TextArea).text
+        if not command.strip():
+            self.notify("Command cannot be empty", severity="warning", timeout=3)
+            return
+        factory = functools.partial(self._proc_factory, command)
+        self.app.exit((factory, self._model, self._server))
 
     @on(Button.Pressed, "#btn-launch")
-    def action_confirm(self) -> None:
-        self.app.exit((self._proc_factory, self._model, self._server))
+    def on_launch_pressed(self) -> None:
+        self.action_confirm()
 
     @on(Button.Pressed, "#btn-back")
     def action_cancel(self) -> None:
@@ -609,10 +619,10 @@ class GpuSelectScreen(DataTableScreen):
         """Fall back to ConfirmLaunch with the default CUDA_VISIBLE_DEVICES when no GPUs found."""
         self.app.pop_screen()
         server, model, quant = self._server, self._model, self._runtime_quant
-        cmd  = launcher.build_cmd(server, model, quant)
-        desc = launcher.format_cmd(cmd)
+        command = launcher.build_launch_command(server, model, quant)
+        factory = lambda edited, s=server, m=model, q=quant: launcher.launch(s, m, q, command=edited)
         self.app.push_screen(
-            ConfirmLaunch(desc, lambda s=server, m=model, q=quant: launcher.launch(s, m, q), model, server)
+            ConfirmLaunch(command, factory, model, server)
         )
 
     @on(SelectionList.SelectionToggled)
@@ -697,18 +707,21 @@ class GpuSelectScreen(DataTableScreen):
             cuda_devices    = ",".join(str(i) for i in selected)
             param_overrides = None
         try:
-            cmd = launcher.build_cmd(self._server, self._model, self._runtime_quant, param_overrides=param_overrides)
+            command = launcher.build_launch_command(
+                self._server,
+                self._model,
+                self._runtime_quant,
+                cuda_devices=cuda_devices,
+                param_overrides=param_overrides,
+            )
         except Exception as e:
             self.notify(str(e), severity="error", timeout=5)
             return
-        gpu_note = f"GPUs (CUDA_VISIBLE_DEVICES): {cuda_devices}"
-        if param_overrides:
-            for k, v in param_overrides.items():
-                gpu_note += f"\n{k}: {v}"
-        desc = gpu_note + "\n\n" + launcher.format_cmd(cmd)
         server, model, quant, d, po = self._server, self._model, self._runtime_quant, cuda_devices, param_overrides
-        factory = lambda s=server, m=model, q=quant, d=d, po=po: launcher.launch(s, m, q, cuda_devices=d, param_overrides=po)
-        self.app.push_screen(ConfirmLaunch(desc, factory, model, server))
+        factory = lambda edited, s=server, m=model, q=quant, d=d, po=po: launcher.launch(
+            s, m, q, cuda_devices=d, param_overrides=po, command=edited
+        )
+        self.app.push_screen(ConfirmLaunch(command, factory, model, server))
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +978,8 @@ class QuantizeDestScreen(ButtonMenuScreen):
                     lambda t=self._tool, m=self._model, q=self._quant_option, d=mount:
                         launcher.quantize(t, m, q, d),
                     self._model,
+                    self._tool,
+                    self._quant_option,
                     output_path,
                 )
             )
@@ -988,12 +1003,16 @@ class ConfirmQuantize(ButtonMenuScreen):
         description: str,
         proc_factory,
         model: AIModel,
+        tool: QuantizationTool,
+        quant_option: str,
         output_path: "Path",
     ) -> None:
         super().__init__()
         self._description  = description
         self._proc_factory = proc_factory
         self._model        = model
+        self._tool         = tool
+        self._quant_option = quant_option
         self._output_path  = output_path
 
     def compose(self) -> ComposeResult:
@@ -1019,9 +1038,13 @@ class ConfirmQuantize(ButtonMenuScreen):
 
     @on(Button.Pressed, "#btn-launch")
     def action_confirm(self) -> None:
-        # Third element is None — signals app.py that this is a quantize job,
-        # not a server launch (no model+server preselect after Ctrl-C).
-        self.app.exit((self._proc_factory, self._model, None))
+        self.app.exit(launcher.QuantizeJob(
+            self._proc_factory,
+            self._model,
+            self._tool,
+            self._quant_option,
+            self._output_path,
+        ))
 
     @on(Button.Pressed, "#btn-back")
     def action_cancel(self) -> None:

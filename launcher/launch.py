@@ -71,6 +71,35 @@ _SGLANG_TOOL_PARSER_MAP: dict[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class QuantizeJob:
+    """A quantization process plus the information needed to finalize it."""
+
+    factory: Callable[[], tuple[subprocess.Popen[bytes], Path, int]]
+    model: AIModel
+    tool: QuantizationTool
+    quant_option: str
+    output_path: Path
+
+
+_EXL2_WORK_ARTIFACTS = (
+    "cal_data.safetensors",
+    "hidden_states.safetensors",
+    "job_new.json",
+    "measurement.json",
+    "out_tensor",
+)
+
+
+def _remove_exl2_work_artifacts(output_path: Path) -> None:
+    for name in _EXL2_WORK_ARTIFACTS:
+        artifact = output_path / name
+        if artifact.is_dir():
+            shutil.rmtree(artifact)
+        elif artifact.exists():
+            artifact.unlink()
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -525,21 +554,22 @@ def compute_quant_output_path(
     is always consistent: delete the directory and its contents.
 
     GGUF re-quantize:
-        <dest.root>/<stem_no_quant>-GGUF-<quant>/
-        e.g. ~/fast_models/BeMag-123B-v0.1-GGUF-Q4_K_M/
+        <dest.root>/<model.cache_subdir>/<stem_no_quant>-GGUF-<quant>/
+        e.g. ~/fast_models/text-generation/BeMag-123B-v0.1-GGUF-Q4_K_M/
         The .gguf file inside is <stem_no_quant>.<quant>.gguf,
         constructed by _build_llama_quantize.
 
     EXL2 convert:
-        <dest.root>/<source_dirname>-exl2-<bpw>bpw/
-        e.g. ~/fast_models/BeMag-123B-v0.1-exl2-4.0bpw/
+        <dest.root>/<model.cache_subdir>/<source_dirname>-exl2-<bpw>bpw/
+        e.g. ~/fast_models/text-generation/BeMag-123B-v0.1-exl2-4.0bpw/
     """
     src = Path(model.resolve_path())
+    output_root = dest.root / model.cache_subdir
     if tool.output_format == ModelFormat.GGUF:
         stem = _strip_gguf_quant(src.stem)
-        return dest.root / f"{stem}-GGUF-{quant_option}"
+        return output_root / f"{stem}-GGUF-{quant_option}"
     else:
-        return dest.root / f"{src.name}-exl2-{quant_option}bpw"
+        return output_root / f"{src.name}-exl2-{quant_option}bpw"
 
 
 def _build_llama_quantize(
@@ -630,12 +660,46 @@ def format_cmd(cmd: list[str]) -> str:
     return " \\\n  ".join(shlex.quote(c) for c in cmd)
 
 
+def build_launch_command(
+    server: ServerSoftware,
+    model: "AIModel | None",
+    runtime_quant: "RuntimeQuant | None" = None,
+    cuda_devices: str | None = None,
+    param_overrides: dict[str, Any] | None = None,
+) -> str:
+    """Return the complete paste-ready shell command for a server launch."""
+    env_cmd = ["env"]
+    if server.strip_pythonpath:
+        env_cmd += ["-u", "PYTHONPATH"]
+    env_vars: dict[str, str] = {
+        "CUDA_VISIBLE_DEVICES": cuda_devices if cuda_devices is not None else CONFIG.resolved_cuda_devices,
+    }
+    if server.cuda_home:
+        env_vars["CUDA_HOME"] = server.cuda_home
+    if server.ld_library_path_prepend:
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        env_vars["LD_LIBRARY_PATH"] = (
+            f"{server.ld_library_path_prepend}:{existing}" if existing else server.ld_library_path_prepend
+        )
+    if server.library_path_prepend:
+        existing = os.environ.get("LIBRARY_PATH", "")
+        env_vars["LIBRARY_PATH"] = (
+            f"{server.library_path_prepend}:{existing}" if existing else server.library_path_prepend
+        )
+    env_vars.update(server.extra_env)
+
+    cmd = build_cmd(server, model, runtime_quant=runtime_quant, param_overrides=param_overrides)
+    command = format_cmd([*env_cmd, *(f"{key}={value}" for key, value in env_vars.items()), *cmd])
+    if server.launch_cwd:
+        command = f"cd {shlex.quote(server.launch_cwd)} && \\\n  {command}"
+    return command
+
+
 def _spawn_with_pty(
-    cmd: list[str],
+    command: str,
     env: dict[str, str],
-    cwd: "str | None" = None,
 ) -> "tuple[subprocess.Popen[bytes], int]":
-    """Wrap cmd in bash, open a PTY sized to the current terminal, and spawn.
+    """Run a shell command in a PTY sized to the current terminal.
 
     Returns (proc, master_fd).  The caller is responsible for closing master_fd
     after the tee thread finishes reading from it.
@@ -653,11 +717,10 @@ def _spawn_with_pty(
         pass  # non-fatal — falls back to whatever tqdm/server defaults to
     # Wrap in bash so 'Segmentation fault (core dumped)' and other shell-level
     # signal diagnostics appear in the log.  Bash exits with 128+signum.
-    bash_cmd = ["bash", "-c", shlex.join(cmd)]
+    bash_cmd = ["bash", "-c", command]
     proc = subprocess.Popen(
         bash_cmd,
         env=env,
-        cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=slave_fd,
         stderr=slave_fd,
@@ -666,33 +729,14 @@ def _spawn_with_pty(
     return proc, master_fd
 
 
-def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, cuda_devices: str | None = None, param_overrides: dict[str, Any] | None = None) -> tuple[subprocess.Popen[bytes], Path, int]:
+def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, cuda_devices: str | None = None, param_overrides: dict[str, Any] | None = None, command: str | None = None) -> tuple[subprocess.Popen[bytes], Path, int]:
     """Build the command and spawn the server process.
 
     cuda_devices: overrides CONFIG.resolved_cuda_devices when set (from GpuSelectScreen).
     param_overrides: merged on top of server/model params (e.g. pipeline_parallel → GPU count).
+    command: complete shell command override from ConfirmLaunch; executed verbatim when set.
     """
     env = os.environ.copy()
-
-    if server.strip_pythonpath:
-        env.pop("PYTHONPATH", None)
-
-    # Launcher-injected environment variables are passed as a leading `env KEY=VALUE …`
-    # prefix on the command line (not mutated into the child's environment) so that the
-    # exact command written to the session log is fully reproducible by copy/paste.
-    # os.environ is still inherited as the base; these assignments override it.
-    env_prefix: dict[str, str] = {
-        "CUDA_VISIBLE_DEVICES": cuda_devices if cuda_devices is not None else CONFIG.resolved_cuda_devices,
-    }
-
-    if server.cuda_home:
-        env_prefix["CUDA_HOME"] = server.cuda_home
-
-    if server.ld_library_path_prepend:
-        existing = os.environ.get("LD_LIBRARY_PATH", "")
-        env_prefix["LD_LIBRARY_PATH"] = (
-            f"{server.ld_library_path_prepend}:{existing}" if existing else server.ld_library_path_prepend
-        )
 
     if server.library_path_prepend:
         # Ensure any missing linker-name symlinks exist (self-heals split-wheel CUDA
@@ -704,13 +748,6 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
                 if link.is_symlink():
                     link.unlink()  # replace a broken symlink
                 link.symlink_to(target)
-        existing = os.environ.get("LIBRARY_PATH", "")
-        env_prefix["LIBRARY_PATH"] = (
-            f"{server.library_path_prepend}:{existing}" if existing else server.library_path_prepend
-        )
-
-    if server.extra_env:
-        env_prefix.update(server.extra_env)
 
     if server.uses_staging_dir:
         p = _merged(server, model)
@@ -741,15 +778,17 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
                 link.unlink()
             link.symlink_to(m.resolve_path())
 
-    cwd = server.launch_cwd
     _LOGS_DIR.mkdir(exist_ok=True)
     model_slug = model.id if model is not None else "no-model"
     log_path = _LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{server.id}_{model_slug}.log"
-    cmd = build_cmd(server, model, runtime_quant=runtime_quant, param_overrides=param_overrides)
-    # Prepend the env-var assignments via the `env` utility so they appear in the logged
-    # command and reproduce exactly on copy/paste.  `env` parses each NAME=VALUE argv
-    # token robustly (values may contain spaces or colons).
-    cmd = ["env", *(f"{k}={v}" for k, v in env_prefix.items()), *cmd]
+    if command is None:
+        command = build_launch_command(
+            server,
+            model,
+            runtime_quant=runtime_quant,
+            cuda_devices=cuda_devices,
+            param_overrides=param_overrides,
+        )
     quant_str = f" + {runtime_quant.value}" if runtime_quant else ""
     if model is not None:
         model_line = f"# model:  {model.id}  ({model.format.value}{quant_str}, {model.size_gb} GB)\n"
@@ -765,11 +804,11 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
         f"{path_line}"
         f"#\n"
         f"# command:\n"
-        f"{format_cmd(cmd)}\n"
+        f"{command}\n"
         f"# {'─' * 72}\n"
     )
     log_path.write_text(header, encoding="utf-8")
-    proc, master_fd = _spawn_with_pty(cmd, env, cwd)
+    proc, master_fd = _spawn_with_pty(command, env)
     return proc, log_path, master_fd
 
 
@@ -816,8 +855,39 @@ def quantize(
         f"# {'─' * 72}\n"
     )
     log_path.write_text(header, encoding="utf-8")
-    proc, master_fd = _spawn_with_pty(cmd, env)
+    proc, master_fd = _spawn_with_pty(format_cmd(cmd), env)
     return proc, log_path, master_fd
+
+
+def finalize_quantization(job: QuantizeJob) -> AIModel:
+    """Copy model metadata, catalog a successful output, and return its model."""
+    from launcher.ingest import copy_model_metadata, ingest_model
+
+    if job.tool.output_format == ModelFormat.EXL2:
+        copy_model_metadata(Path(job.model.resolve_path()), job.output_path)
+        _remove_exl2_work_artifacts(job.output_path)
+
+    entry_overrides = {
+        "id": job.output_path.name.lower().replace(".", "-"),
+        "name": job.model.name,
+        "quant": (
+            f"{job.quant_option} bpw"
+            if job.tool.output_format == ModelFormat.EXL2
+            else job.quant_option
+        ),
+    }
+    entry = ingest_model(
+        job.output_path,
+        fmt=job.tool.output_format.value,
+        entry_overrides=entry_overrides,
+    )
+    for model in AI_MODELS:
+        if model.path == entry["path"] and model.format.value == entry["format"]:
+            return model
+
+    model = AIModel.from_dict(entry)
+    AI_MODELS.append(model)
+    return model
 
 
 # ---------------------------------------------------------------------------

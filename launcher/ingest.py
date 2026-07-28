@@ -733,6 +733,11 @@ def _copy_missing_configs(src_dir: Path, dst_dir: Path, dry_run: bool) -> list[s
     return copied
 
 
+def copy_model_metadata(src_dir: Path, dst_dir: Path) -> list[str]:
+    """Copy standard model config/tokenizer files that are missing from *dst_dir*."""
+    return _copy_missing_configs(src_dir, dst_dir, dry_run=False)
+
+
 def do_copy_configs(scan_root: Path, dry_run: bool) -> None:
     """Copy config files from original model dirs into their GGUF bundle directories.
 
@@ -1272,6 +1277,44 @@ def _ingest_one(
     _save_catalog(_CATALOG_PATH, catalog)
     print(f"[ingest] Appended '{entry['id']}' to {_CATALOG_PATH}", file=sys.stderr)
     return True
+
+
+def ingest_model(
+    path: Path,
+    *,
+    fmt: str | None = None,
+    ai_type: str = "text_gen",
+    catalog_path: Path = _CATALOG_PATH,
+    entry_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Detect and append one explicit model path, returning its catalog entry.
+
+    If the same path and format are already catalogued, returns that entry
+    without writing a duplicate.
+    """
+    catalog = _load_catalog(catalog_path)
+    if fmt is not None:
+        for entry in catalog.get("models", []):
+            if entry.get("path") == str(path) and entry.get("format") == fmt:
+                return entry
+
+    if ai_type == "image_gen":
+        entry = detect_image_gen(path, catalog)
+    else:
+        entry = detect_text_gen(path, catalog, fmt=fmt)
+    if entry_overrides:
+        entry.update(entry_overrides)
+
+    for existing in catalog.get("models", []):
+        if (
+            existing.get("path") == entry["path"]
+            and existing.get("format") == entry["format"]
+        ):
+            return existing
+
+    catalog.setdefault("models", []).append(entry)
+    _save_catalog(catalog_path, catalog)
+    return entry
 
 
 def main() -> None:
