@@ -15,7 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+import re
+from typing import Any, Iterable, Literal
 
 from launcher.config import CONFIG
 
@@ -186,6 +187,16 @@ def _quant_key(quant: "RuntimeQuant | None") -> str:
 
 Status = Literal["good", "bad", "unknown"]
 
+
+def _best_status(statuses: "Iterable[Status]") -> Status:
+    """Collapse several results into one.  Priority: good > bad > unknown."""
+    seen = set(statuses)
+    if "good" in seen:
+        return "good"
+    if "bad" in seen:
+        return "bad"
+    return "unknown"
+
 # Human-readable short name for each format (non-GGUF; GGUF uses quant string)
 FORMAT_SHORT: dict[ModelFormat, str] = {
     ModelFormat.SAFETENSORS_BF16: "BF16",
@@ -275,11 +286,11 @@ class AIModel:
     # 'checkpoints' for standard SD/SDXL files; 'diffusion_models' for FLUX UNets.
     comfyui_subdir: str = "checkpoints"
 
-    # Per-server test results: outer key is ServerSoftware.id; inner key is a
-    # quant key string ("none" for full/stored precision, or a RuntimeQuant.value
-    # such as "bnb_int8"). Missing outer key = server untested; missing inner key
-    # = that (server, quant) combo untested.
-    server_status: dict[str, dict[str, Status]] = field(default_factory=dict)
+    # Per-server test results: server_status[server_id][env_name][quant_key].
+    # env_name is a registered Environment.name for that server; quant_key is
+    # "none" (full/stored precision) or a RuntimeQuant.value such as "bnb_int8".
+    # Missing keys = that (server, env, quant) combo is untested.
+    server_status: dict[str, dict[str, dict[str, Status]]] = field(default_factory=dict)
 
     # Per-server parameter overrides, keyed by ServerSoftware.id.
     # Merged on top of ServerSoftware.default_params at launch time.
@@ -316,10 +327,7 @@ class AIModel:
             hw_note=d.get("hw_note", ""),
             tool_call_parser=d.get("tool_call_parser", ""),
             comfyui_subdir=d.get("comfyui_subdir", "checkpoints"),
-            server_status={  # type: ignore[arg-type]
-                sid: ({"none": v} if isinstance(v, str) else v)
-                for sid, v in d.get("server_status", {}).items()
-            },
+            server_status=d.get("server_status", {}),
             server_params=d.get("server_params", {}),
         )
 
@@ -439,23 +447,20 @@ class AIModel:
             and bool(self.ai_types & server.supported_ai_types)
         )
 
-    def status_for(self, server_id: str, quant: "RuntimeQuant | None" = None) -> Status:
-        """Status for a specific (server, quant) combo, defaulting to 'unknown'."""
-        server_data = self.server_status.get(server_id, {})
-        return server_data.get(_quant_key(quant), "unknown")  # type: ignore[return-value]
+    def status_for(self, server_id: str, env_name: str, quant: "RuntimeQuant | None" = None) -> Status:
+        """Status for a specific (server, environment, quant) combo, defaulting to 'unknown'."""
+        env_data = self.server_status.get(server_id, {}).get(env_name, {})
+        return env_data.get(_quant_key(quant), "unknown")
+
+    def env_best_status(self, server_id: str, env_name: str) -> Status:
+        """Best status across all quant combos for one environment of a server."""
+        return _best_status(self.server_status.get(server_id, {}).get(env_name, {}).values())
 
     def best_status_for(self, server_id: str) -> Status:
-        """Best status across all quant combos for this server.
-
-        Priority: good > bad > unknown.
-        Returns 'unknown' if no results have been recorded for this server.
-        """
-        statuses = list(self.server_status.get(server_id, {}).values())
-        if "good" in statuses:
-            return "good"
-        if "bad" in statuses:
-            return "bad"
-        return "unknown"
+        """Best status across all environments and quant combos for this server."""
+        return _best_status(
+            s for env_data in self.server_status.get(server_id, {}).values() for s in env_data.values()
+        )
 
     def composite_status(self, servers: "list[ServerSoftware]") -> tuple[str, str]:
         """Return (color, symbol) summarising status across all applicable servers.
@@ -487,6 +492,27 @@ class AIModel:
 # Server Software
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class VersionProbe:
+    """Reads a server's version by running a command inside an environment.
+
+    For builds without Python package metadata (e.g. llama.cpp).  `patterns` are
+    regexes with named groups, tried in order (output formats change across
+    releases); `template` formats the first match, e.g. "b{build} ({commit})".
+    """
+    executable: str
+    args: tuple[str, ...]
+    patterns: tuple[str, ...]
+    template: str
+
+    def label(self, env: Any) -> str:
+        """Formatted version for *env* (an environments.Environment), or ''."""
+        output = env.command_output(self.executable, self.args)
+        for pattern in self.patterns:
+            if match := re.search(pattern, output):
+                return self.template.format(**match.groupdict())
+        return ""
+
 @dataclass
 class ServerSoftware:
     """Describes a server process — supported formats/types and default launch params.
@@ -505,11 +531,23 @@ class ServerSoftware:
     # Ordered tuple of runtime quant options available for quantizable formats.
     supported_runtime_quants: tuple[RuntimeQuant, ...] = field(default_factory=tuple)
     # Launch-time environment / process setup — set in data.py, consumed by launch.py.
+    # The interpreter / binaries come from the Environment chosen at launch
+    # (see environments.py); these fields describe what the server needs on top.
+    env_kind: str = "conda"              # Environment.kind registered for this server
+    # Python distributions whose installed versions identify an environment in the
+    # UI (e.g. ("vllm",) → "vllm 0.26.0").  Empty = no version shown.
+    version_packages: tuple[str, ...] = ()
+    # Command-based version detection for environments without package metadata
+    # (native builds).  None = no probe.
+    version_probe: VersionProbe | None = None
     strip_pythonpath: bool = False       # pop PYTHONPATH from env (prevents src-tree shadowing)
     cuda_home: str = ""                  # override CUDA_HOME in env when non-empty
-    ld_library_path_prepend: str = ""    # path prepended to LD_LIBRARY_PATH (runtime .so loading)
-    library_path_prepend: str = ""       # path prepended to LIBRARY_PATH (link-time -l resolution for JIT)
-    # Symlinks ensured inside library_path_prepend before launch: {link_name: target_basename}.
+    # Glob (relative to the environment's site-packages) locating a pip-bundled CUDA
+    # toolkit, e.g. "nvidia/cu1[0-9]*" for split-wheel cu13 installs.  When it matches,
+    # that root becomes CUDA_HOME and its lib/ is prepended to LD_LIBRARY_PATH (runtime
+    # .so loading) and LIBRARY_PATH (link-time -l resolution for JIT compilers).
+    bundled_cuda_glob: str = ""
+    # Symlinks ensured inside the bundled CUDA lib/ dir before launch: {link_name: target_glob}.
     # Self-heals split-wheel CUDA toolkits that ship libfoo.so.NN but omit the libfoo.so linker name.
     lib_symlinks: dict[str, str] = field(default_factory=dict)
     extra_env: dict[str, str] = field(default_factory=dict)  # additional env vars merged at launch
@@ -551,6 +589,13 @@ class ServerSoftware:
         if fmt not in self.quantizable_formats:
             return ()
         return self.supported_runtime_quants
+
+    def env_version_label(self, env: Any) -> str:
+        """Installed version(s) of this server in *env*, e.g. 'vllm 0.26.0' ('' if unknown)."""
+        parts = [env.version_label(self.version_packages)]
+        if self.version_probe is not None:
+            parts.append(self.version_probe.label(env))
+        return "  ·  ".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
@@ -599,12 +644,13 @@ class QuantizationTool:
     Instance data (the actual registered tools) lives in data.py alongside
     SERVERS.  Only tool-agnostic logic belongs here.
 
-    Dependency management fields (populated in data.py using CONFIG):
-      avail_binary      — path to a binary that must exist for this tool to be usable.
-                          Checked with Path.is_file().  Use for compiled tools (llama-quantize).
-      avail_module      — (python_executable, module_name) pair; tool is available when the
-                          module is importable in that Python environment.  Empty tuple = skip.
-      auto_install_cmd  — argv list for auto-install (e.g. pip install); empty = not auto-installable.
+    Dependency management fields (populated in data.py):
+      env_server_id     — ServerSoftware.id whose *default* Environment the tool runs from
+                          (e.g. "llamacpp" for llama-quantize, "tabby" for exllamav2).
+      avail_executable  — executable name that must exist in that environment's bin dir.
+      avail_module      — Python module that must be importable in that environment.
+      pip_package       — pip package installed into that environment for auto-install;
+                          "" = not auto-installable.
       install_note      — shown to the user when the tool is unavailable and cannot be auto-installed.
     """
     id: str                                  # unique slug, e.g. "llama-quantize", "exl2-convert"
@@ -613,10 +659,11 @@ class QuantizationTool:
     output_format: ModelFormat               # the format it produces
     quant_options: tuple[str, ...]           # ordered list of option identifiers
     quant_option_labels: dict[str, str]      # human-readable label per option identifier
+    env_server_id: str = ""                  # server whose default environment provides the tool
     cuda_home: str = ""                      # CUDA_HOME override injected at run time (if non-empty)
-    avail_binary: str = ""                   # absolute path to binary; must exist for tool to be ready
-    avail_module: tuple[str, ...] = ()       # (python_exe, module_name); importable = available
-    auto_install_cmd: tuple[str, ...] = ()   # argv to auto-install the dep; () = not auto-installable
+    avail_executable: str = ""               # executable in the env's bin dir; must exist
+    avail_module: str = ""                   # module importable in the env's python
+    pip_package: str = ""                    # auto-install package; "" = not auto-installable
     install_note: str = ""                   # shown when unavailable and not auto-installable
 
 

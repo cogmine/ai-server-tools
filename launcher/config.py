@@ -19,7 +19,7 @@ _CONFIG_PATH  = Path(__file__).parent / "user_data" / "config.toml"
 _EXAMPLE_PATH = Path(__file__).parent / "config.toml.example"
 
 
-def _expand(p: str) -> Path:
+def expand_path(p: str) -> Path:
     """Expand ~ and $VAR in a path string, return an absolute Path."""
     return Path(os.path.expandvars(os.path.expanduser(p)))
 
@@ -46,77 +46,20 @@ class CacheMountConfig:
 class SiteConfig:
     """Fully-resolved site configuration derived from config.toml."""
 
-    conda_base:           Path   # path to miniconda/anaconda installation
-    vllm_env:             str    # conda env name for vLLM
-    tabby_env:            str    # conda env name for tabbyAPI
-    llama_server:         Path   # path to llama-server binary
+    conda_base:           Path   # miniconda/anaconda installation (conda envs live in envs/)
     tabby_main:           Path   # path to tabbyAPI main.py
     tabby_model_dir:      Path   # staging dir where tabby symlinks are created
-    ooba_env:             str    # conda env name for text-generation-webui
     ooba_main:            Path   # path to text-generation-webui/server.py
     ooba_model_dir:       Path   # staging dir where ooba model symlinks are created
-    sglang_env:           str    # conda env name for SGLang
     cuda_home_tabby:      str    # CUDA_HOME set when launching tabbyAPI
     cuda_home_sglang:     str    # CUDA_HOME set when launching SGLang (for flashinfer JIT)
     cuda_visible_devices: str    # explicit GPU list, or "" to derive from pipeline_parallel
     pipeline_parallel:    int    # GPU count for vLLM PP (never 0 after load)
     exl2_convert_script:  Path   # path to ExLlamaV2 convert.py; falls back to -m exllamav2.conversion.convert_exl2 if absent
-    comfyui_env:          str    # conda env name for ComfyUI
     comfyui_main:         Path   # path to ComfyUI main.py
     comfyui_models_dir:   Path   # base staging dir for ComfyUI symlinks (~/ComfyUI/models/)
     server_ports:         dict[str, int] = field(default_factory=dict)  # per-server port overrides from [ports]
     cache_mounts:         list[CacheMountConfig] = field(default_factory=list)
-
-    # ------------------------------------------------------------------
-    # Derived paths
-    # ------------------------------------------------------------------
-
-    @property
-    def llama_quantize(self) -> Path:
-        """Path to the llama-quantize binary, co-located with llama-server."""
-        return self.llama_server.parent / "llama-quantize"
-
-    @property
-    def vllm_python(self) -> Path:
-        return self.conda_base / f"envs/{self.vllm_env}/bin/python"
-
-    @property
-    def vllm_cuda_libs(self) -> str:
-        """Path to the CUDA split-wheel shared libraries bundled with the vLLM env.
-
-        vLLM 0.25+ installs cu13 split wheels whose .so files land inside the
-        Python package tree (nvidia/cu13/lib/) and are not automatically on
-        LD_LIBRARY_PATH.  Returns "" if the directory is not found.
-        """
-        from glob import glob as _glob
-        # Use [0-9][0-9] to match 2-digit minor versions (3.10, 3.11, …) and avoid
-        # spurious matches against python3.1 which conda also creates in lib/.
-        env_lib = self.conda_base / f"envs/{self.vllm_env}/lib"
-        pattern = str(env_lib / "python3.[0-9][0-9]" / "site-packages/nvidia/cu13/lib")
-        matches = sorted(_glob(pattern))
-        return matches[-1] if matches else ""
-
-    @property
-    def vllm_cuda_home(self) -> str:
-        """CUDA_HOME for the vLLM env — parent of vllm_cuda_libs (the cu13 toolkit root)."""
-        libs = self.vllm_cuda_libs
-        return str(Path(libs).parent) if libs else ""
-
-    @property
-    def tabby_python(self) -> Path:
-        return self.conda_base / f"envs/{self.tabby_env}/bin/python"
-
-    @property
-    def ooba_python(self) -> Path:
-        return self.conda_base / f"envs/{self.ooba_env}/bin/python"
-
-    @property
-    def sglang_python(self) -> Path:
-        return self.conda_base / f"envs/{self.sglang_env}/bin/python"
-
-    @property
-    def comfyui_python(self) -> Path:
-        return self.conda_base / f"envs/{self.comfyui_env}/bin/python"
 
     @property
     def resolved_cuda_devices(self) -> str:
@@ -157,38 +100,31 @@ def _load() -> SiteConfig:
     for m in raw.get("cache_mounts", []):
         mounts.append(CacheMountConfig(
             label=m["label"],
-            root=_expand(m["root"]),
+            root=expand_path(m["root"]),
             priority=int(m["priority"]),
         ))
     mounts.sort(key=lambda m: m.priority)
 
     return SiteConfig(
-        conda_base=_expand(
+        conda_base=expand_path(
             paths.get("conda_base", "~/miniconda3")),
-        vllm_env=paths.get("vllm_env", "vllm"),
-        tabby_env=paths.get("tabby_env", "tabby"),
-        llama_server=_expand(
-            paths.get("llama_server", "~/llama.cpp/build/bin/llama-server")),
-        tabby_main=_expand(
+        tabby_main=expand_path(
             paths.get("tabby_main", "~/tabbyAPI/main.py")),
-        tabby_model_dir=_expand(
+        tabby_model_dir=expand_path(
             paths.get("tabby_model_dir", "~/tabbyAPI/models")),
-        ooba_env=paths.get("ooba_env", "textgen"),
-        ooba_main=_expand(
+        ooba_main=expand_path(
             paths.get("ooba_main", "~/text-generation-webui/server.py")),
-        ooba_model_dir=_expand(
+        ooba_model_dir=expand_path(
             paths.get("ooba_model_dir", "~/text-generation-webui/user_data/models")),
-        sglang_env=paths.get("sglang_env", "sglang"),
         cuda_home_tabby=paths.get("cuda_home_tabby", ""),
         cuda_home_sglang=paths.get("cuda_home_sglang", ""),
         cuda_visible_devices=paths.get("cuda_visible_devices", ""),
         pipeline_parallel=pp,
-        exl2_convert_script=_expand(
+        exl2_convert_script=expand_path(
             paths.get("exl2_convert_script", "~/exllamav2/convert.py")),
-        comfyui_env=paths.get("comfyui_env", "comfyui"),
-        comfyui_main=_expand(
+        comfyui_main=expand_path(
             paths.get("comfyui_main", "~/ComfyUI/main.py")),
-        comfyui_models_dir=_expand(
+        comfyui_models_dir=expand_path(
             paths.get("comfyui_models_dir", "~/ComfyUI/models")),
         server_ports=ports,
         cache_mounts=mounts,

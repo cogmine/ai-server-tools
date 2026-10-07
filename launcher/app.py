@@ -2,7 +2,7 @@
 app.py — Top-level Textual App.
 
 Navigation entry point is AITypeScreen (screens.py), which drives the
-3-level flow: AI Type → Model → Server → ConfirmLaunch.
+flow: AI Type → Model → Server → [Environment] → [Quant] → GPUs → ConfirmLaunch.
 """
 from __future__ import annotations
 
@@ -11,20 +11,22 @@ import os
 import shutil
 import signal
 import struct
-import subprocess
 import sys
 import termios
 import threading
 from pathlib import Path
-from typing import Callable, ClassVar, cast
+from typing import ClassVar
 
 from textual.app import App
 from textual.binding import Binding
 
 from launcher.data import AI_MODELS, SERVERS
-from launcher.launch import QuantizeJob, finalize_quantization
-from launcher.models import AIModel, ServerSoftware, available_ai_types, uses_hub_flow
-from launcher.screens import AITypeScreen, ImageGenHubScreen, ModelSelectScreen, ServerSelectScreen
+from launcher.environments import ENVIRONMENTS
+from launcher.launch import LaunchJob, QuantizeJob, finalize_quantization
+from launcher.models import AIModel, available_ai_types, uses_hub_flow
+from launcher.screens import (
+    AITypeScreen, EnvSelectScreen, ImageGenHubScreen, ModelSelectScreen, ServerSelectScreen,
+)
 
 
 class ModelLauncherApp(App):
@@ -38,7 +40,7 @@ class ModelLauncherApp(App):
 
     def __init__(
         self,
-        preselect: "tuple[AIModel, ServerSoftware] | None" = None,
+        preselect: "LaunchJob | None" = None,
         preselect_model: "AIModel | None" = None,
     ) -> None:
         super().__init__()
@@ -47,15 +49,18 @@ class ModelLauncherApp(App):
 
     def on_mount(self) -> None:
         if self._preselect is not None:
-            model, server = self._preselect
-            # Navigate straight to the server list with the correct model and
-            # server pre-selected so the user can immediately mark the result.
+            job = self._preselect
+            model, server = job.model, job.server
+            # Navigate straight to the server (and environment) list with the
+            # launched selection focused so the user can immediately mark the result.
             # Only applicable for text-gen (model is always set); image-gen hub
             # flow passes model=None so we fall through to normal startup.
             if model is not None:
                 ai_type = next(iter(model.ai_types))
                 self.push_screen(ModelSelectScreen(ai_type, preselect_model=model))
                 self.push_screen(ServerSelectScreen(model, preselect_server_id=server.id))
+                if len(ENVIRONMENTS.for_server(server.id)) > 1:
+                    self.push_screen(EnvSelectScreen(model, server, preselect_env=job.env.name))
                 return
         if self._preselect_model is not None:
             ai_type = next(iter(self._preselect_model.ai_types))
@@ -108,7 +113,7 @@ def _tee_output(master_fd: int, log_path: Path) -> None:
 
 def run(no_menu: bool = False, default: int | None = None) -> None:
     """Entry point called from __main__.py."""
-    preselect: "tuple[AIModel, ServerSoftware] | None" = None
+    preselect: "LaunchJob | None" = None
     preselect_model: "AIModel | None" = None
     while True:
         app = ModelLauncherApp(preselect=preselect, preselect_model=preselect_model)
@@ -117,15 +122,11 @@ def run(no_menu: bool = False, default: int | None = None) -> None:
         preselect_model = None
 
         quantize_job = result if isinstance(result, QuantizeJob) else None
+        launch_job = result if isinstance(result, LaunchJob) else None
         if quantize_job is not None:
             factory = quantize_job.factory
-            model = quantize_job.model
-            server = None
-        elif isinstance(result, tuple) and len(result) == 3:
-            factory, model, server = cast(
-                "tuple[Callable[[], tuple[subprocess.Popen, Path, int]], AIModel, ServerSoftware | None]",
-                result,
-            )
+        elif launch_job is not None:
+            factory = launch_job.factory
         else:
             # User quit the menu without launching — exit to bash.
             sys.exit(0)
@@ -166,12 +167,12 @@ def run(no_menu: bool = False, default: int | None = None) -> None:
                 log_f.write(f"# exit: code {rc}\n".encode())
 
         if user_interrupted:
-            # Ctrl-C on a server launch: reopen the menu with model+server still selected
-            # so the user can immediately mark the test result.
+            # Ctrl-C on a server launch: reopen the menu with model+server+env still
+            # selected so the user can immediately mark the test result.
             # Ctrl-C on a quantize job, or a stage_all_models server (model=None):
             # just reopen the top-level menu (no preselect).
-            if server is not None and model is not None:
-                preselect = (model, server)
+            if launch_job is not None and launch_job.model is not None:
+                preselect = launch_job
             continue
 
         if quantize_job is not None:

@@ -1,16 +1,17 @@
 """
 launch.py — Unified command builder and process launcher.
 
-build_cmd(server, model) → list[str]
+build_cmd(server, env, model) → list[str]
     Merges server.default_params with model.server_params[server.id],
-    then dispatches to the server-specific builder.
+    then dispatches to the server-specific builder, which takes its
+    interpreter / binaries from the chosen Environment.
 
 compute_parallelism(gpu_count, model) → ParallelismPlan
     Reads the model's HF config.json to determine valid TP×PP splits for the
     given GPU count.  Prefers smallest TP (largest PP) for PCIe topology.
     Reduces GPU count when model dimensions are incompatible.
 
-launch(server, model) → tuple[subprocess.Popen[bytes], Path, int]
+launch(server, env, model) → tuple[subprocess.Popen[bytes], Path, int]
     Builds the command, sets up the environment, spawns the process, and
     returns the Popen handle, the session log path, and the PTY master fd.
     stdout/stderr are connected to a PTY slave so the child process sees a
@@ -18,9 +19,9 @@ launch(server, model) → tuple[subprocess.Popen[bytes], Path, int]
     must close it after the tee thread finishes.
 
 Adding a new server type:
-  1. Write a _build_<name>(server, model, params) → list[str] function.
+  1. Write a _build_<name>(server, env, model, params) → list[str] function.
   2. Register it in _BUILDERS.
-  3. Set any launch-time fields (strip_pythonpath, cuda_home, uses_staging_dir,
+  3. Set any launch-time fields (env_kind, strip_pythonpath, cuda_home, uses_staging_dir,
      staging_format_suffixes, launch_cwd) on the ServerSoftware entry in data.py.
 """
 from __future__ import annotations
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from launcher.data import AI_MODELS, CACHE_MOUNTS
+from launcher.environments import ENVIRONMENTS, Environment
 from launcher.models import (
     AIModel, CacheMount, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
     QuantizationTool, RuntimeQuant, ServerSoftware, _quant_key,
@@ -52,7 +54,8 @@ from launcher.config import CONFIG
 _LOGS_DIR = Path(__file__).parent.parent / "logs"
 _CATALOG_PATH = Path(__file__).parent / "user_data" / "models_local.json"
 
-# Binary paths are resolved from CONFIG (launcher/user_data/config.toml) at import time.
+# Install/app paths are resolved from CONFIG (launcher/user_data/config.toml) at import
+# time; interpreters and binaries come from the Environment chosen at launch.
 
 # Translation from canonical (vLLM) tool-call parser names to SGLang names.
 # Only entries where the names differ need to appear here; matching names
@@ -69,6 +72,16 @@ _SGLANG_TOOL_PARSER_MAP: dict[str, str] = {
     "qwen3_xml":    "qwen3_coder",
     "minimax_m2":   "minimax-m2",
 }
+
+
+@dataclass(frozen=True)
+class LaunchJob:
+    """A confirmed server launch: process factory plus what was selected to produce it."""
+
+    factory: Callable[[], tuple[subprocess.Popen[bytes], Path, int]]
+    model: "AIModel | None"
+    server: ServerSoftware
+    env: Environment
 
 
 @dataclass(frozen=True)
@@ -186,11 +199,22 @@ _TP_SCOPED_ARCHS: frozenset[str] = frozenset({
     "XGLMForCausalLM",
 })
 
+# Architectures that cannot use pipeline parallelism at all; the planner uses
+# pure TP (PP=1) for them, even if that leaves some selected GPUs unused.
+#   Qwen4Exp — its N-gram PLE embedding needs the raw input_ids, which
+#              non-first pipeline ranks never receive (vLLM rejects PP > 1).
+_NO_PP_ARCHS: frozenset[str] = frozenset({
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+})
+
 
 @functools.lru_cache(maxsize=64)
 def _read_hf_parallelism_fields(model_path: str) -> dict[str, Any] | None:
     """Read parallelism-relevant fields from a model's HF config.json.
 
+    Multimodal checkpoints nest the language model's fields under
+    ``text_config``; those take precedence over the top level.
     Returns None if config.json is absent or lacks num_attention_heads.
     """
     cfg_path = Path(model_path) / "config.json"
@@ -201,16 +225,23 @@ def _read_hf_parallelism_fields(model_path: str) -> dict[str, Any] | None:
             raw = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
-    n_heads = raw.get("num_attention_heads", 0)
+    text = raw.get("text_config") or {}
+    def field(key: str, default: int = 0) -> int:
+        return int(text.get(key, raw.get(key, default)) or 0)
+    n_heads = field("num_attention_heads")
     if not n_heads:
         return None
     architectures = raw.get("architectures", [])
     return {
-        "num_attention_heads": n_heads,
-        "num_key_value_heads": raw.get("num_key_value_heads", n_heads),
-        "intermediate_size":   raw.get("intermediate_size", 0),
-        "num_hidden_layers":   raw.get("num_hidden_layers", 0),
-        "architecture":        architectures[0] if architectures else "",
+        "num_attention_heads":    n_heads,
+        "num_key_value_heads":    field("num_key_value_heads", n_heads),
+        "intermediate_size":      field("intermediate_size"),
+        "num_hidden_layers":      field("num_hidden_layers"),
+        # Linear-attention (Gated DeltaNet) heads in hybrid models such as
+        # Qwen3-Next / Qwen3.5 / Qwen4Exp — also sharded across TP ranks.
+        "linear_num_key_heads":   field("linear_num_key_heads"),
+        "linear_num_value_heads": field("linear_num_value_heads"),
+        "architecture":           architectures[0] if architectures else "",
     }
 
 
@@ -231,14 +262,16 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
 
     Strategy for PCIe topology (no NVLink):
       - Prefer smallest TP to minimise cross-GPU tensor traffic.
-      - TP must divide num_attention_heads, num_key_value_heads, and
-        intermediate_size.
+      - TP must divide num_attention_heads, the linear-attention head counts
+        (hybrid models) and intermediate_size.  num_key_value_heads must be
+        divisible by TP, or TP a multiple of it (servers replicate KV heads).
       - For architectures not in ``_TP_SCOPED_ARCHS``, intermediate_size must
         also be divisible by the *total* GPU count.  Some model
         implementations assert ``intermediate_size % world_size == 0`` using
         the global process count rather than the TP group size; this check
         prevents those assertion failures by reducing the GPU count to the
         largest compatible value.
+      - Architectures in ``_NO_PP_ARCHS`` get the largest valid TP with PP=1.
     """
     if model is None or gpu_count <= 1:
         return ParallelismPlan(tp=1, pp=max(gpu_count, 1), gpu_count=max(gpu_count, 1))
@@ -247,19 +280,31 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
     if cfg is None:
         return ParallelismPlan(tp=1, pp=gpu_count, gpu_count=gpu_count)
 
-    n_heads      = cfg["num_attention_heads"]
     n_kv_heads   = cfg["num_key_value_heads"]
     intermediate = cfg["intermediate_size"]
     n_layers     = cfg["num_hidden_layers"]
 
     # Dimensions that TP must evenly divide.
-    tp_dims = [d for d in (n_heads, n_kv_heads, intermediate) if d > 0]
-    if not tp_dims:
-        return ParallelismPlan(tp=1, pp=gpu_count, gpu_count=gpu_count)
+    tp_dims = [
+        d for d in (
+            cfg["num_attention_heads"], intermediate,
+            cfg["linear_num_key_heads"], cfg["linear_num_value_heads"],
+        ) if d > 0
+    ]
+
+    def _tp_ok(tp: int) -> bool:
+        kv_ok = n_kv_heads <= 0 or n_kv_heads % tp == 0 or tp % n_kv_heads == 0
+        return kv_ok and all(d % tp == 0 for d in tp_dims)
+
+    arch = model.arch or cfg.get("architecture", "")
+
+    if arch in _NO_PP_ARCHS:
+        tp = max(t for t in range(1, gpu_count + 1) if _tp_ok(t))
+        note = "" if tp == gpu_count else f"{arch} does not support pipeline parallelism — TP only"
+        return ParallelismPlan(tp=tp, pp=1, gpu_count=tp, note=note)
 
     # For architectures not in _TP_SCOPED_ARCHS, check intermediate_size %
     # total_gpus.  Fetch the arch from the catalog model or from config.json.
-    arch = model.arch or cfg.get("architecture", "")
     check_global = (arch not in _TP_SCOPED_ARCHS) and intermediate > 0
 
     def _find_plan(n: int) -> ParallelismPlan | None:
@@ -271,7 +316,7 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
             return None
         for tp in _sorted_divisors(n):
             pp = n // tp
-            if all(d % tp == 0 for d in tp_dims) and (n_layers == 0 or n_layers >= pp):
+            if _tp_ok(tp) and (n_layers == 0 or n_layers >= pp):
                 return ParallelismPlan(tp=tp, pp=pp, gpu_count=n)
         return None
 
@@ -284,9 +329,7 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
     for n in range(gpu_count - 1, 0, -1):
         plan = _find_plan(n)
         if plan is not None:
-            plan.note = (
-                f"intermediate_size ({intermediate}) not divisible by {gpu_count}"
-            )
+            plan.note = f"no valid TP×PP split for {gpu_count} GPUs with this model's dimensions"
             return plan
 
     return ParallelismPlan(tp=1, pp=1, gpu_count=1)
@@ -296,15 +339,15 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
 # Per-server command builders
 # ---------------------------------------------------------------------------
 
-def _build_vllm(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
+def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     cmd = [
-        str(CONFIG.vllm_python), "-m", "vllm.entrypoints.openai.api_server",
+        str(env.python), "-m", "vllm.entrypoints.openai.api_server",
         "--model",                        p["_model_path"],
         "--served-model-name",            model.id,
         "--tensor-parallel-size",         str(p["tensor_parallel"]),
         "--pipeline-parallel-size",       str(p["pipeline_parallel"]),
         "--gpu-memory-utilization",       str(p["gpu_mem_util"]),
-        "--max-model-len",                str(model.effective_ctx),
+        "--max-model-len",                "-1" if p.get("auto_fit_ctx") else str(model.effective_ctx),
         "--host",                         "0.0.0.0",
         "--port",                         str(p["port"]),
     ]
@@ -321,6 +364,8 @@ def _build_vllm(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
         cmd += ["--max-num-seqs", str(p["max_num_seqs"])]
     if p.get("chunked_prefill"):
         cmd += ["--enable-chunked-prefill"]
+    if p.get("expert_parallel"):
+        cmd += ["--enable-expert-parallel"]
     if p.get("enforce_eager"):
         cmd += ["--enforce-eager"]
     # Only pass --trust-remote-code for models that actually require custom code.
@@ -337,9 +382,9 @@ def _build_vllm(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
     return cmd
 
 
-def _build_llamacpp(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
+def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     cmd = [
-        str(CONFIG.llama_server),
+        str(env.executable("llama-server")),
         "--model",        p["_model_path"],
         "--alias",        model.id,
         "--n-gpu-layers", str(p["n_gpu_layers"]),
@@ -358,11 +403,11 @@ def _build_llamacpp(server: ServerSoftware, model: AIModel, p: dict) -> list[str
     return cmd
 
 
-def _build_tabby(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
+def _build_tabby(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     # model_dir is a staging directory; launch() creates a symlink named model.id
     # there pointing to the resolved (cached or source) path before this builder runs.
     cmd = [
-        str(CONFIG.tabby_python), str(CONFIG.tabby_main),
+        str(env.python), str(CONFIG.tabby_main),
         "--model-dir",    p["model_dir"],
         "--model-name",   model.id,
         "--cache-mode",   p["cache_mode"],
@@ -375,7 +420,7 @@ def _build_tabby(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
     return cmd
 
 
-def _build_ooba(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
+def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     # For GGUF files, ooba's scanner identifies them by the .gguf suffix; the symlink
     # created in launch() is named accordingly (model.id + ".gguf").
     model_name = model.id + ".gguf" if model.format == ModelFormat.GGUF else model.id
@@ -383,7 +428,7 @@ def _build_ooba(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
     # launcher runs from ~/ai-server-tools, we must pass the absolute path explicitly.
     user_data_dir = str(CONFIG.ooba_main.parent / "user_data")
     cmd = [
-        str(CONFIG.ooba_python), str(CONFIG.ooba_main),
+        str(env.python), str(CONFIG.ooba_main),
         "--model",          model_name,
         "--model-dir",      p["model_dir"],
         "--user-data-dir",  user_data_dir,
@@ -415,9 +460,9 @@ def _build_ooba(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
     return cmd
 
 
-def _build_sglang(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
+def _build_sglang(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     cmd = [
-        str(CONFIG.sglang_python), "-m", "sglang.launch_server",
+        str(env.python), "-m", "sglang.launch_server",
         "--model-path",            p["_model_path"],
         "--served-model-name",     model.id,
         "--dtype",                 "bfloat16",
@@ -444,11 +489,11 @@ def _build_sglang(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
     return cmd
 
 
-def _build_comfyui(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
+def _build_comfyui(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     # ComfyUI discovers models via ~/ComfyUI/extra_model_paths.yaml at startup;
     # no model path is passed at launch time.
     cmd = [
-        str(CONFIG.comfyui_python), str(CONFIG.comfyui_main),
+        str(env.python), str(CONFIG.comfyui_main),
         "--listen", "0.0.0.0",
         "--port",   str(p["port"]),
     ]
@@ -470,9 +515,21 @@ _BUILDERS = {
 # Quantization tool availability
 # ---------------------------------------------------------------------------
 
-# Availability is checked once per tool and cached; exl2-convert requires a
-# subprocess call (to check importability without triggering JIT compilation).
-_tool_avail_cache: dict[str, bool] = {}
+# Availability is checked once per (tool, environment) and cached; exl2-convert
+# requires a subprocess call (to check importability without triggering JIT compilation).
+_tool_avail_cache: dict[tuple[str, str], bool] = {}
+
+
+def quant_tool_env(tool: QuantizationTool) -> Environment | None:
+    """The environment a quantization tool runs from: its server's default environment."""
+    return ENVIRONMENTS.default_for(tool.env_server_id)
+
+
+def _tool_env(tool: QuantizationTool) -> Environment:
+    env = quant_tool_env(tool)
+    if env is None:
+        raise ValueError(f"No environment registered for server {tool.env_server_id!r} (needed by {tool.label})")
+    return env
 
 
 def quant_tool_available(tool: QuantizationTool) -> bool:
@@ -480,46 +537,51 @@ def quant_tool_available(tool: QuantizationTool) -> bool:
 
     Result is cached after the first call — safe to call in hot paths.
     """
-    if tool.id not in _tool_avail_cache:
-        _tool_avail_cache[tool.id] = _check_tool_available(tool)
-    return _tool_avail_cache[tool.id]
+    env = quant_tool_env(tool)
+    if env is None or not env.exists():
+        return False
+    key = (tool.id, str(env.location))
+    if key not in _tool_avail_cache:
+        _tool_avail_cache[key] = _check_tool_available(tool, env)
+    return _tool_avail_cache[key]
 
 
-def _check_tool_available(tool: QuantizationTool) -> bool:
-    if tool.avail_binary:
-        return Path(tool.avail_binary).is_file()
+def _check_tool_available(tool: QuantizationTool, env: Environment) -> bool:
+    if tool.avail_executable and not env.executable(tool.avail_executable).is_file():
+        return False
     if tool.avail_module:
-        python, module = tool.avail_module[0], tool.avail_module[1]
+        module = tool.avail_module
         try:
             r = subprocess.run(
-                [python, "-c",
+                [str(env.python), "-c",
                  f"import importlib.util; raise SystemExit(0 if importlib.util.find_spec({module!r}) else 1)"],
                 capture_output=True, timeout=5,
             )
             return r.returncode == 0
         except Exception:
             return False
-    return True  # no check configured — assume available
+    return True
 
 
 def install_quant_tool(tool: QuantizationTool) -> tuple[bool, str]:
-    """Run the tool's auto_install_cmd and return (success, log_path).
+    """pip-install the tool's package into its environment and return (success, log_path).
 
     Logs stdout/stderr to /tmp/launcher_install_<id>.log.
     Updates the availability cache on success.
-    Returns (False, "") when the tool has no auto_install_cmd.
+    Returns (False, "") when the tool has no pip_package.
     """
-    if not tool.auto_install_cmd:
+    if not tool.pip_package:
         return False, ""
+    env = _tool_env(tool)
     log_path = f"/tmp/launcher_install_{tool.id}.log"
     with open(log_path, "w") as f:
         result = subprocess.run(
-            list(tool.auto_install_cmd),
+            [str(env.python), "-m", "pip", "install", tool.pip_package],
             stdout=f, stderr=subprocess.STDOUT,
             timeout=300,
         )
     success = result.returncode == 0
-    _tool_avail_cache[tool.id] = success
+    _tool_avail_cache[(tool.id, str(env.location))] = success
     return success, log_path
 
 
@@ -574,6 +636,7 @@ def compute_quant_output_path(
 
 def _build_llama_quantize(
     tool: QuantizationTool,
+    env: Environment,
     model: AIModel,
     quant_option: str,
     output_dir: Path,
@@ -583,7 +646,7 @@ def _build_llama_quantize(
     stem = _strip_gguf_quant(src.stem)
     output_file = output_dir / f"{stem}.{quant_option}.gguf"
     return [
-        str(CONFIG.llama_quantize),
+        str(env.executable("llama-quantize")),
         model.resolve_path(),
         str(output_file),
         quant_option,
@@ -592,15 +655,16 @@ def _build_llama_quantize(
 
 def _build_exl2_convert(
     tool: QuantizationTool,
+    env: Environment,
     model: AIModel,
     quant_option: str,
     output_path: Path,
 ) -> list[str]:
     script = CONFIG.exl2_convert_script
     if script.exists():
-        cmd_prefix = [str(CONFIG.tabby_python), str(script)]
+        cmd_prefix = [str(env.python), str(script)]
     else:
-        cmd_prefix = [str(CONFIG.tabby_python), "-m", "exllamav2.conversion.convert_exl2"]
+        cmd_prefix = [str(env.python), "-m", "exllamav2.conversion.convert_exl2"]
     return [
         *cmd_prefix,
         "-i", model.resolve_path(),
@@ -626,14 +690,14 @@ def build_quantize_cmd(
     builder = _QUANT_BUILDERS.get(tool.id)
     if builder is None:
         raise ValueError(f"No command builder registered for quantization tool: {tool.id!r}")
-    return builder(tool, model, quant_option, output_path), output_path
+    return builder(tool, _tool_env(tool), model, quant_option, output_path), output_path
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def build_cmd(server: ServerSoftware, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, param_overrides: dict[str, Any] | None = None) -> list[str]:
+def build_cmd(server: ServerSoftware, env: Environment, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, param_overrides: dict[str, Any] | None = None) -> list[str]:
     """Return the full argv list for launching model on server.
 
     model may be None for servers that use stage_all_models (e.g. ComfyUI),
@@ -650,9 +714,9 @@ def build_cmd(server: ServerSoftware, model: "AIModel | None", runtime_quant: "R
     if builder is None:
         raise ValueError(f"No command builder registered for server: {server.id!r}")
     if server.stage_all_models:
-        return builder(server, model, p)  # type: ignore[arg-type]  # builder ignores model
+        return builder(server, env, model, p)  # type: ignore[arg-type]  # builder ignores model
     assert model is not None, f"model is required for server {server.id!r}"
-    return builder(server, model, p)
+    return builder(server, env, model, p)
 
 
 def format_cmd(cmd: list[str]) -> str:
@@ -660,8 +724,38 @@ def format_cmd(cmd: list[str]) -> str:
     return " \\\n  ".join(shlex.quote(c) for c in cmd)
 
 
+def _bundled_cuda_root(server: ServerSoftware, env: Environment) -> Path | None:
+    """The pip-bundled CUDA toolkit root inside *env*, when the server declares one."""
+    if not server.bundled_cuda_glob:
+        return None
+    return env.find_package_path(server.bundled_cuda_glob)
+
+
+def _ensure_lib_symlinks(lib_dir: Path, links: dict[str, str]) -> None:
+    """Create missing linker-name symlinks, e.g. libcudart.so → libcudart.so.13.
+
+    Self-heals split-wheel CUDA toolkits that ship libfoo.so.NN but omit the
+    libfoo.so name the linker needs.  The shortest match (the soname) is the target.
+    """
+    for link_name, target_glob in links.items():
+        link = lib_dir / link_name
+        targets = sorted((t for t in lib_dir.glob(target_glob) if t != link), key=lambda t: len(t.name))
+        if not targets or link.exists():
+            continue
+        if link.is_symlink():
+            link.unlink()  # replace a broken symlink
+        link.symlink_to(targets[0].name)
+
+
+def _prepend_path(entry: str, var: str) -> str:
+    """Prepend *entry* to the current value of a PATH-style environment variable."""
+    existing = os.environ.get(var, "")
+    return f"{entry}:{existing}" if existing else entry
+
+
 def build_launch_command(
     server: ServerSoftware,
+    env: Environment,
     model: "AIModel | None",
     runtime_quant: "RuntimeQuant | None" = None,
     cuda_devices: str | None = None,
@@ -674,21 +768,18 @@ def build_launch_command(
     env_vars: dict[str, str] = {
         "CUDA_VISIBLE_DEVICES": cuda_devices if cuda_devices is not None else CONFIG.resolved_cuda_devices,
     }
-    if server.cuda_home:
-        env_vars["CUDA_HOME"] = server.cuda_home
-    if server.ld_library_path_prepend:
-        existing = os.environ.get("LD_LIBRARY_PATH", "")
-        env_vars["LD_LIBRARY_PATH"] = (
-            f"{server.ld_library_path_prepend}:{existing}" if existing else server.ld_library_path_prepend
-        )
-    if server.library_path_prepend:
-        existing = os.environ.get("LIBRARY_PATH", "")
-        env_vars["LIBRARY_PATH"] = (
-            f"{server.library_path_prepend}:{existing}" if existing else server.library_path_prepend
-        )
+    cuda_root = _bundled_cuda_root(server, env)
+    cuda_home = str(cuda_root) if cuda_root is not None else server.cuda_home
+    if cuda_home:
+        env_vars["CUDA_HOME"] = cuda_home
+    if cuda_root is not None:
+        # Existing values are captured inline so the logged command reproduces exactly.
+        lib_dir = str(cuda_root / "lib")
+        env_vars["LD_LIBRARY_PATH"] = _prepend_path(lib_dir, "LD_LIBRARY_PATH")
+        env_vars["LIBRARY_PATH"]    = _prepend_path(lib_dir, "LIBRARY_PATH")
     env_vars.update(server.extra_env)
 
-    cmd = build_cmd(server, model, runtime_quant=runtime_quant, param_overrides=param_overrides)
+    cmd = build_cmd(server, env, model, runtime_quant=runtime_quant, param_overrides=param_overrides)
     command = format_cmd([*env_cmd, *(f"{key}={value}" for key, value in env_vars.items()), *cmd])
     if server.launch_cwd:
         command = f"cd {shlex.quote(server.launch_cwd)} && \\\n  {command}"
@@ -729,25 +820,19 @@ def _spawn_with_pty(
     return proc, master_fd
 
 
-def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, cuda_devices: str | None = None, param_overrides: dict[str, Any] | None = None, command: str | None = None) -> tuple[subprocess.Popen[bytes], Path, int]:
+def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, cuda_devices: str | None = None, param_overrides: dict[str, Any] | None = None, command: str | None = None) -> tuple[subprocess.Popen[bytes], Path, int]:
     """Build the command and spawn the server process.
 
+    env: the Environment (conda env / native build) providing the server's interpreter or binaries.
     cuda_devices: overrides CONFIG.resolved_cuda_devices when set (from GpuSelectScreen).
     param_overrides: merged on top of server/model params (e.g. pipeline_parallel → GPU count).
     command: complete shell command override from ConfirmLaunch; executed verbatim when set.
     """
-    env = os.environ.copy()
+    proc_env = os.environ.copy()
 
-    if server.library_path_prepend:
-        # Ensure any missing linker-name symlinks exist (self-heals split-wheel CUDA
-        # toolkits that ship libfoo.so.NN but omit the libfoo.so name the linker needs).
-        lib_dir = Path(server.library_path_prepend)
-        for link_name, target in server.lib_symlinks.items():
-            link = lib_dir / link_name
-            if (lib_dir / target).exists() and not link.exists():
-                if link.is_symlink():
-                    link.unlink()  # replace a broken symlink
-                link.symlink_to(target)
+    cuda_root = _bundled_cuda_root(server, env)
+    if cuda_root is not None and server.lib_symlinks:
+        _ensure_lib_symlinks(cuda_root / "lib", server.lib_symlinks)
 
     if server.uses_staging_dir:
         p = _merged(server, model)
@@ -784,6 +869,7 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
     if command is None:
         command = build_launch_command(
             server,
+            env,
             model,
             runtime_quant=runtime_quant,
             cuda_devices=cuda_devices,
@@ -796,11 +882,14 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
     else:
         model_line = "# model:  (all catalog models staged)\n"
         path_line  = ""
+    versions = server.env_version_label(env)
+    env_detail = f"{env.kind_label}, {versions}" if versions else env.kind_label
     header = (
         f"# launcher session log\n"
         f"# date:   {datetime.now().isoformat(timespec='seconds')}\n"
         f"{model_line}"
         f"# server: {server.id}\n"
+        f"# env:    {env.name}  ({env_detail})\n"
         f"{path_line}"
         f"#\n"
         f"# command:\n"
@@ -808,7 +897,7 @@ def launch(server: ServerSoftware, model: "AIModel | None", runtime_quant: "Runt
         f"# {'─' * 72}\n"
     )
     log_path.write_text(header, encoding="utf-8")
-    proc, master_fd = _spawn_with_pty(command, env)
+    proc, master_fd = _spawn_with_pty(command, proc_env)
     return proc, log_path, master_fd
 
 
@@ -972,10 +1061,11 @@ def uncache_model(model: AIModel, mount: CacheMount) -> None:
 def save_server_status(
     model: AIModel,
     server_id: str,
+    env_name: str,
     status: str,
     quant: "RuntimeQuant | None" = None,
 ) -> None:
-    """Persist a model/server/quant status result back into models_local.json.
+    """Persist a model/server/environment/quant status result back into models_local.json.
 
     Mutates the in-memory model immediately, then rewrites the server_status
     entry for that model in the JSON catalog so it survives the next launch.
@@ -983,14 +1073,63 @@ def save_server_status(
     qk = _quant_key(quant)
 
     # 1. Update in-memory object immediately.
-    model.server_status.setdefault(server_id, {})[qk] = status  # type: ignore[assignment]
+    model.server_status.setdefault(server_id, {}).setdefault(env_name, {})[qk] = status  # type: ignore[assignment]
 
     # 2. Persist to JSON catalog.
     def _apply(entry: dict) -> None:
-        quant_dict = entry.setdefault("server_status", {}).setdefault(server_id, {})
-        quant_dict[qk] = status
+        env_dict = entry.setdefault("server_status", {}).setdefault(server_id, {}).setdefault(env_name, {})
+        env_dict[qk] = status
 
     _patch_catalog(model.id, _apply)
+
+
+def _rewrite_env_status(server_id: str, old_name: str, new_name: str | None) -> int:
+    """Move (new_name set) or drop (None) every model's results for one environment.
+
+    Applies to in-memory models and the JSON catalog in a single write.
+    Returns the number of models whose results were affected.
+    """
+    def _move(status: dict) -> bool:
+        per_env = status.get(server_id, {})
+        if old_name not in per_env:
+            return False
+        results = per_env.pop(old_name)
+        if new_name is not None:
+            per_env[new_name] = results
+        if not per_env:
+            status.pop(server_id, None)
+        return True
+
+    for m in AI_MODELS:
+        _move(m.server_status)
+    with open(_CATALOG_PATH, encoding="utf-8") as f:
+        catalog = json.load(f)
+    affected = sum(_move(entry.get("server_status", {})) for entry in catalog["models"])
+    with open(_CATALOG_PATH, "w", encoding="utf-8") as f:
+        json.dump(catalog, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    return affected
+
+
+def count_env_status(server_id: str, env_name: str) -> int:
+    """Number of models with recorded results for one environment of a server."""
+    return sum(1 for m in AI_MODELS if env_name in m.server_status.get(server_id, {}))
+
+
+def apply_env_rename(env: Environment, new_name: str) -> None:
+    """Rename *env* (and registry entries sharing it) and migrate their recorded results.
+
+    Call after the underlying environment has been renamed (env.rename_cmd()).
+    """
+    old_name = env.name
+    for renamed in ENVIRONMENTS.rename(env, new_name):
+        _rewrite_env_status(renamed.server_id, old_name, new_name)
+
+
+def apply_env_removal(env: Environment) -> None:
+    """Unregister *env* and drop the test results recorded against it."""
+    ENVIRONMENTS.remove(env)
+    _rewrite_env_status(env.server_id, env.name, None)
 
 
 def save_ctx_override(model: AIModel, value: int) -> None:

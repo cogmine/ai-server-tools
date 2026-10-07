@@ -22,7 +22,7 @@
     "note":          "(optional) Free-text note shown in the TUI",
     "cached_path":   "(optional) Absolute path to a faster local copy. Set automatically by the TUI cache action.",
     "trust_remote_code": "(optional) true if servers must pass --trust-remote-code for this model.",
-    "server_status": "(optional) Per-server test results: {server_id: {quant_key: good|bad|unknown}}. Updated by the TUI g/x/? keys.",
+    "server_status": "(optional) Test results: {server_id: {environment_name: {quant_key: good|bad|unknown}}}. environment_name is a registered environment (environments.json). Updated by the TUI g/x/? keys.",
     "server_params": "(optional) Per-server parameter overrides merged on top of server defaults at launch time.",
     "comfyui_subdir": "(optional, image_gen only) ComfyUI models/ subdirectory to stage into. Default: 'checkpoints'. Use 'diffusion_models' for FLUX UNets.",
     "tool_call_parser": "(optional) vLLM tool-call parser name (e.g. 'openai', 'hermes', 'llama3_json'). When set, servers emit tool-calling flags automatically. Translated for SGLang."
@@ -56,7 +56,7 @@
       "ai_types": ["text_gen"],
       "ctx": 131072,
       "size_gb": 14,
-      "server_status": {"vllm": {"none": "good"}},
+      "server_status": {"vllm": {"vllm": {"none": "good"}}},
       "server_params": {
         "vllm": {
           "gpu_mem_util": 0.5,

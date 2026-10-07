@@ -6,7 +6,8 @@ A keyboard-driven Textual TUI that selects and launches large-model inference se
 
 - Navigate a large model catalogue without touching config files each time
 - Prefer the fastest cached copy of a model over the original source automatically
-- Persist test-result annotations (good / bad / unknown) per model per server
+- Persist test-result annotations (good / bad / unknown) per model per server environment
+- Run each server from one of several registered environments (e.g. a stable and an experimental vLLM install)
 - Keep all system-specific paths out of version control
 - Quantize existing models to new formats / quant levels from within the TUI
 
@@ -19,6 +20,8 @@ config.py                   Site-specific loader — reads user_data/config.toml
 config.toml.example         Tracked template — copy to user_data/config.toml and edit
 models.py                   Schema — enums, dataclasses, pure logic (no instances, no I/O)
 data.py                     Generic instances — SERVERS list + CACHE_MOUNTS (config-driven, committable)
+environments.py             Server runtime environments — Environment kinds (conda / native) + ENVIRONMENTS registry
+environments.json.example   Tracked template — environment registry (copy to user_data/environments.json)
 models_local.json.example   Tracked template — schema reference + 3 sample entries
 launch.py                   Command builders + process spawner + cache manager
 screens.py                  All Textual screens
@@ -27,6 +30,7 @@ gpu.py                      NVML polling via pynvml (shared with gpu_monitor)
 ingest.py                   CLI tool — scans a directory for new models and appends entries to models_local.json
 user_data/                  Gitignored — all machine-specific and personal data
     config.toml               Machine-specific paths and GPU counts
+    environments.json         Registered environments per server (written by the TUI)
     models_local.json         AI_MODELS catalog (model paths, quant details, test results)
 ```
 
@@ -41,8 +45,15 @@ user_data/config.toml (gitignored)
     └── config.py → SiteConfig dataclass (singleton CONFIG)
             ├── models.py  (cache mounts)
             ├── data.py    (SERVERS.default_params, CACHE_MOUNTS)
-            └── launch.py  (binary paths, CUDA_VISIBLE_DEVICES, CUDA_HOME)
+            ├── environments.py (conda_base → conda env locations)
+            └── launch.py  (app paths, CUDA_VISIBLE_DEVICES, CUDA_HOME)
+
+user_data/environments.json (gitignored, written by the TUI)
+    └── environments.py → EnvironmentRegistry (singleton ENVIRONMENTS)
+            └── launch.py / screens.py (interpreter + binaries for each launch)
 ```
+
+`config.toml` holds hand-edited, machine-specific settings; `environments.json` holds the environment registry, which the TUI rewrites (add / rename / remove / default / note) — keeping it out of the TOML avoids clobbering hand-written comments.
 
 `pipeline_parallel = 0` in `config.toml` triggers NVML auto-detection at import time. The result is stored as `CONFIG.pipeline_parallel` (never zero afterwards). `resolved_cuda_devices` builds `"0,1,...,N-1"` if no explicit device string was given.
 
@@ -88,7 +99,8 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `comfyui_subdir` | `image_gen` models only — ComfyUI `models/` subdirectory to stage into. Default: `"checkpoints"` (omit from JSON). Use `"diffusion_models"` for FLUX UNets. Extensible: any valid subdirectory name accepted by ComfyUI. |
 | `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time. Omitted from JSON when empty. |
 | `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. |
-| `cached_path` | Optional absolute path to a faster local copy. Set by the TUI cache action; cleared on uncache. `resolve_path()` returns this when non-empty and present on disk, otherwise returns `path`. Multiple entries may share the same `cached_path` when they point to the same source directory — `save_cached_path()` fans out to all of them. || `server_status` | `{server_id: {quant_key: status}}` — outer key is server id; inner key is `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`); value is `"good"` / `"bad"` / `"unknown"`. Only one quant key may be `"good"` per server (exclusive). |
+| `cached_path` | Optional absolute path to a faster local copy. Set by the TUI cache action; cleared on uncache. `resolve_path()` returns this when non-empty and present on disk, otherwise returns `path`. Multiple entries may share the same `cached_path` when they point to the same source directory — `save_cached_path()` fans out to all of them. |
+| `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
 | `server_params` | Per-server overrides merged on top of server defaults at launch time |
 
 Multiple `AIModel` entries for the same model family (BF16 / INT8 / Q8_0) are intentional — each format has different servers, VRAM footprint, and launch flags.
@@ -106,6 +118,11 @@ Describes an offline conversion/requantization tool.  Instance data lives in `da
 | `quant_options` | `tuple[str, ...]` — ordered option identifiers shown in the quant picker |
 | `quant_option_labels` | `dict[str, str]` — human-readable label per option |
 | `cuda_home` | `CUDA_HOME` override injected at run time (non-empty to set) |
+| `env_server_id` | Server whose **default environment** provides the tool (`"llamacpp"` → llama-quantize binary; `"tabby"` → exllamav2 Python) |
+| `avail_executable` | Executable that must exist in that environment's bin dir |
+| `avail_module` | Python module that must be importable in that environment |
+| `pip_package` | Package `pip install`ed into that environment by the auto-install prompt; `""` = not auto-installable |
+| `install_note` | Shown when the tool is unavailable and not auto-installable |
 
 `tools_for_model(tools, model)` mirrors `servers_for_model` — returns tools whose `input_formats` contains `model.format`.
 
@@ -115,8 +132,14 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 
 | Field | Type | Purpose |
 |---|---|---|
+| `env_kind` | `str` | `Environment.kind` registered for this server — `"conda"` (default) or `"native"` (llama.cpp) |
+| `version_packages` | `tuple[str, ...]` | Python distributions whose installed versions label an environment in the UI and log header (e.g. `("vllm",)` → `vllm 0.26.0`) |
+| `version_probe` | `VersionProbe \| None` | Command-based version detection for environments without package metadata — runs `executable args` in the env and formats the first matching regex (`patterns`, tried in order) with `template`. llama.cpp: `llama-server --version` → `llama.cpp b11461 (4d756bc72)`. Output is cached per executable mtime (`Environment.command_output`). `ServerSoftware.env_version_label(env)` combines both sources and is the single entry point for UI and log headers |
 | `strip_pythonpath` | `bool` | Pop `PYTHONPATH` from env before spawning |
-| `cuda_home` | `str` | Set `CUDA_HOME` in env when non-empty |
+| `cuda_home` | `str` | Set `CUDA_HOME` in env when non-empty (overridden by a bundled toolkit, below) |
+| `bundled_cuda_glob` | `str` | Glob, relative to the environment's site-packages, locating a pip-bundled CUDA toolkit (vLLM: `"nvidia/cu1[0-9]*"`). When it matches, that root becomes `CUDA_HOME` and its `lib/` is prepended to `LD_LIBRARY_PATH` / `LIBRARY_PATH` |
+| `lib_symlinks` | `dict[str, str]` | `{link_name: target_glob}` linker-name symlinks self-healed inside the bundled toolkit's `lib/` before spawn (e.g. `libcudart.so` → `libcudart.so.13`) |
+| `extra_env` | `dict[str, str]` | Extra `KEY=VALUE` pairs merged into the command's `env` prefix |
 | `uses_staging_dir` | `bool` | Create symlinks under `model_dir` before launch |
 | `stage_all_models` | `bool` | When `True`, stage every compatible catalog model (ComfyUI — model is chosen per API request, not at launch) |
 | `staging_format_suffixes` | `dict[ModelFormat, str]` | Maps format → file extension suffix for the staging symlink (e.g. `{GGUF: ".gguf"}`; empty = no suffix) |
@@ -128,7 +151,38 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 
 Defined once per server type in `data.py`. The `default_params` dict establishes baseline launch parameters; per-model `server_params` only specify deltas.
 
-### ModelFormat vs Server Compatibility
+---
+
+## Server Environments
+
+Each server runs from one of several registered **environments** — the conda env or native build that provides its interpreter / binaries. Several can be registered per server (e.g. a stable `vllm` and an experimental `vllm-next` for testing a new architecture) so upgrading one never breaks a known-good setup.
+
+**Kinds** (`environments.py`) — `Environment` is an `abc.ABC`; each kind encodes its own location, resolution and lifecycle so callers never branch on kind:
+
+| Kind | Class | Location | Lifecycle supported by the launcher |
+|---|---|---|---|
+| `conda` | `CondaEnvironment` | `<conda_base>/envs/<name>` | create (empty with a Python version, or `--clone` of another env), rename (`conda rename`), delete (`conda env remove`) |
+| `native` | `NativeEnvironment` | `bin_dir` (e.g. `~/llama.cpp/build/bin`) | registry-only (register / rename label / unregister) |
+
+Common interface: `exists()`, `bin_dir`, `executable(name)`, `python`, `find_package_path(glob)` (site-packages-relative; conda only), `package_version(dist)` / `version_label(dists)` (read from `*.dist-info` names — no subprocess), `command_output(exe, args)` (cached per executable mtime; used by `VersionProbe`), `shares_underlying(other)`, and lifecycle hooks `create_cmd()` / `remove_cmd()` / `rename_cmd()` returning an argv (or `None` = registry-only). `extra_fields` declares kind-specific attributes the "add" dialog must prompt for (native: `bin_dir`), so the UI stays generic.
+
+**Registry** — `EnvironmentRegistry` (singleton `ENVIRONMENTS`) loads `user_data/environments.json`:
+
+```json
+{"environments": {"vllm": [{"kind": "conda", "name": "vllm", "default": true, "note": "stable"},
+                           {"kind": "conda", "name": "vllm-next"}],
+                  "llamacpp": [{"kind": "native", "name": "llama.cpp", "bin_dir": "~/llama.cpp/build/bin", "default": true}]}}
+```
+
+Keyed by `ServerSoftware.id`. Names follow conda's rule (`[A-Za-z0-9_.-]+`) and are unique per server. `default_for(server_id)` returns the entry flagged `default` (else the first) — used to pre-focus the picker and to run quantization tools. Every mutation (`add`, `remove`, `rename`, `set_default`, `set_note`) persists immediately. One conda env may be registered for several servers; `sharing(env)` finds those entries so a rename updates them all and a delete is refused while others still use it.
+
+**Launch resolution** — builders take the chosen environment: `str(env.python)` for Python servers, `env.executable("llama-server")` for llama.cpp. Environment-dependent setup (bundled CUDA toolkit, `lib_symlinks`) is resolved per environment at launch, so a second vLLM env with a different cu13 toolkit works without configuration.
+
+**Lifecycle orchestration** (`EnvManageScreen` → `launch.py`) — the external command runs first in `CommandRunScreen` (live output; the screen cannot be left mid-operation); only on success is the registry updated. `apply_env_rename()` renames registry entries and migrates recorded results; `apply_env_removal()` unregisters and drops the env's results (the dialog states how many models are affected). A rename is validated up front (`rename_conflict()`) so the registry can never diverge from a conda rename that already happened.
+
+---
+
+## ModelFormat vs Server Compatibility
 |---|---|---|
 | `GGUF` | `"gguf"` | llamacpp, ooba, sglang |
 | `SAFETENSORS_BF16` | `"safetensors_bf16"` | vllm, tabby, ooba, sglang, comfyui |
@@ -157,10 +211,13 @@ App.on_mount
        multiple types      → AITypeScreen
                                 └─ !hub_flow → ModelSelectScreen(chosen_type)
                                                     └─ ServerSelectScreen(model)
-                                                            └─ [QuantSelectScreen]
-                                                                    └─ GpuSelectScreen(server, model, quant)
-                                                                            └─ ConfirmLaunch(description, factory)
-                                                                                    └─ App.exit(factory)
+                                                            └─ [EnvSelectScreen]       (server has >1 environment)
+                                                                    └─ [QuantSelectScreen]
+                                                                            └─ GpuSelectScreen(server, env, model, quant)
+                                                                                    └─ ConfirmLaunch(command, factory, model, server, env)
+                                                                                            └─ App.exit(LaunchJob)
+
+    ServerSelectScreen / EnvSelectScreen ── e ──→ EnvManageScreen(server)
 ```
 
 **Image-gen (hub) flow** (`stage_all_models=True` for all servers of that type):
@@ -172,9 +229,10 @@ App.on_mount
 
     ImageGenHubScreen
         ├─ Launch Server → ServerSelectScreen(model=None, ai_type=type)
-        │                       └─ GpuSelectScreen(server, model=None)
-        │                               └─ ConfirmLaunch(description, factory)
-        │                                       └─ App.exit(factory, model=None, server)
+        │                       └─ [EnvSelectScreen]
+        │                               └─ GpuSelectScreen(server, env, model=None)
+        │                                       └─ ConfirmLaunch(command, factory, None, server, env)
+        │                                               └─ App.exit(LaunchJob(model=None))
         └─ Manage Models → ModelManageScreen(type)
                                └─ → / Enter → CacheActionScreen(model)
                                                    ├─ [Cache]   → CacheProgressScreen(model, mount)
@@ -183,9 +241,13 @@ App.on_mount
 
 `uses_hub_flow(servers, ai_type)` returns `True` when every server for a given AI type has `stage_all_models=True`. The check lives in `models.py` (domain logic) so neither `screens.py` nor `app.py` need to know about `stage_all_models` directly.
 
-`App.exit(result)` returns either a `(factory, model, server)` server-launch tuple or a `QuantizeJob`. The TUI tears down, then `app.py::run()` calls the process factory and blocks on `proc.wait()`. This means the TUI process *is* the parent process, so `Ctrl-C` propagates naturally.
+`App.exit(result)` returns either a `LaunchJob(factory, model, server, env)` or a `QuantizeJob` (both frozen dataclasses in `launch.py`). The TUI tears down, then `app.py::run()` calls the process factory and blocks on `proc.wait()`. This means the TUI process *is* the parent process, so `Ctrl-C` propagates naturally.
 
-For server launches, `run()` uses `server is not None and model is not None` to decide whether to re-open the menu with a preselect after Ctrl-C (useful for marking the test result immediately). Image-gen launches (`model=None`) and interrupted quantization jobs reopen from the top. Successful quantization jobs finalize and focus the generated model.
+For server launches with a model, `run()` re-opens the menu after Ctrl-C with the `LaunchJob` as preselect: `ServerSelectScreen` focuses the server and, when it has more than one environment, `EnvSelectScreen` is pushed with the launched environment focused — so the result can be marked immediately. Image-gen launches (`model=None`) and interrupted quantization jobs reopen from the top. Successful quantization jobs finalize and focus the generated model.
+
+**Environment step**: `ServerSelectScreen` shows an environment column (the single env with its versions, `N environments`, or `no environment`). A server with one environment skips `EnvSelectScreen`; with none, selection is refused with a hint to press `e`. `_continue_launch()` is the shared hand-off (used by both screens): it refuses a missing environment, then pushes `QuantSelectScreen` or `GpuSelectScreen`.
+
+**`EnvManageScreen`** (`e`): table of the server's environments (★ default, name / missing flag, versions, note) with a detail bar (location, "also used by"). Bindings: `a` add, `c` create missing, `r` rename, `d` remove, `s` set default, `n` note. Multi-step flows are `@work` async methods using `push_screen_wait()` with three reusable dialogs: `TextPromptScreen` (validated single-line input), `ChoiceScreen` (message + button list) and `CommandRunScreen` (streams an external command's output; dismisses with success). Adding a conda env that does not exist offers: create empty (prompts for a Python version, default 3.11), clone any existing registered conda env (same-server first), register without creating, or cancel.
 
 **`ImageGenHubScreen`**: Two-button menu. "Launch Server" pushes `ServerSelectScreen(model=None, ai_type=...)` which filters servers by type (via `servers_for_type()`), skips path validation, and suppresses g/x/? status marking. "Manage Models" pushes `ModelManageScreen` — all catalog management bindings work identically to `ModelSelectScreen`; `→`/`Enter` open `CacheActionScreen` for the focused model (cache/uncache) rather than advancing toward a server launch. Both buttons use `variant="primary"`.
 
@@ -274,12 +336,12 @@ The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived vi
 
 **`gpu_count_param` auto-adjustment**: vLLM and SGLang require their parallelism flags to match the GPU count. When `server.gpu_count_param == "pipeline_parallel"`, `GpuSelectScreen` calls `compute_parallelism(n, model)` to determine the optimal TP×PP split and builds `param_overrides = {"tensor_parallel": tp, "pipeline_parallel": pp}`. The status bar shows the computed split (e.g. `PP=12` or `TP=2 × PP=7`). No auto-adjustment for tabbyAPI (`--gpu-split-auto`) or llama.cpp (distributes layers to visible GPUs automatically).
 
-**Parallelism computation** (`compute_parallelism` in `launch.py`): reads the model's HF `config.json` for `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, and `num_hidden_layers`. For PCIe topology (no NVLink), prefers the smallest valid TP (largest PP) to minimise cross-GPU tensor traffic. TP must evenly divide all three dimension fields. Additionally, for architectures *not* in `_TP_SCOPED_ARCHS`, `intermediate_size` must also be divisible by the total GPU count — this guards against model implementations that assert `intermediate_size % world_size == 0` using the global process count rather than the TP group size. When no valid plan exists for the selected GPU count, the count is automatically reduced to the largest compatible value and a note is shown in the status bar. Architecture is read from `model.arch` (catalog) with a fallback to `architectures[0]` in `config.json`. Results of `_read_hf_parallelism_fields` are LRU-cached per model path.
+**Parallelism computation** (`compute_parallelism` in `launch.py`): reads the model's HF `config.json` for `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `num_hidden_layers`, and the linear-attention head counts `linear_num_key_heads` / `linear_num_value_heads` (hybrid Gated-DeltaNet models). Multimodal checkpoints nest these under `text_config`, which takes precedence over the top level. For PCIe topology (no NVLink), prefers the smallest valid TP (largest PP) to minimise cross-GPU tensor traffic. TP must evenly divide the attention, linear-attention and intermediate dimensions; `num_key_value_heads` must be divisible by TP *or* TP a multiple of it (vLLM/SGLang replicate KV heads when TP exceeds them). Architectures in `_NO_PP_ARCHS` (Qwen4Exp — its N-gram PLE embedding needs raw `input_ids`, which non-first PP ranks never receive) get the largest valid TP with PP=1, even if some selected GPUs go unused; the status bar notes why. Additionally, for architectures *not* in `_TP_SCOPED_ARCHS`, `intermediate_size` must also be divisible by the total GPU count — this guards against model implementations that assert `intermediate_size % world_size == 0` using the global process count rather than the TP group size. When no valid plan exists for the selected GPU count, the count is automatically reduced to the largest compatible value and a note is shown in the status bar. Architecture is read from `model.arch` (catalog) with a fallback to `architectures[0]` in `config.json`. Results of `_read_hf_parallelism_fields` are LRU-cached per model path.
 
 **`build_cmd` / `launch` signatures**:
-- `build_cmd(server, model, runtime_quant, param_overrides)` — `param_overrides` is merged last in `_merged()`.
-- `build_launch_command(server, model, runtime_quant, cuda_devices, param_overrides)` — wraps `build_cmd()` in the explicit environment and working-directory shell syntax shown in `ConfirmLaunch`.
-- `launch(server, model, runtime_quant, cuda_devices, param_overrides, command)` — `command` is the shell text edited in `ConfirmLaunch`; it is logged and executed verbatim. Callers that omit it get the default from `build_launch_command()`.
+- `build_cmd(server, env, model, runtime_quant, param_overrides)` — `param_overrides` is merged last in `_merged()`.
+- `build_launch_command(server, env, model, runtime_quant, cuda_devices, param_overrides)` — wraps `build_cmd()` in the explicit environment and working-directory shell syntax shown in `ConfirmLaunch`.
+- `launch(server, env, model, runtime_quant, cuda_devices, param_overrides, command)` — `command` is the shell text edited in `ConfirmLaunch`; it is logged and executed verbatim. Callers that omit it get the default from `build_launch_command()`.
 
 **Editable confirmation**: `ConfirmLaunch` displays the complete shell command in a focused `TextArea`. The user may change arguments, environment assignments, or shell syntax before launching with `Ctrl+Enter` or the Launch button. The edited text becomes the zero-argument process factory returned through `App.exit()`, so the preview, session log, and command passed to Bash cannot diverge. `Ctrl+Q` quits from this screen because plain `q` must remain available for editing.
 
@@ -292,21 +354,23 @@ ServerSoftware.default_params
     + AIModel.server_params[server.id]   (merged at build time; skipped when model=None)
     + param_overrides                    (from GpuSelectScreen — e.g. pipeline_parallel = N)
     + AIModel.resolve_path() → injected as _model_path  (skipped when model=None)
-    → _build_<server_id>(server, model, merged_params) → list[str]
+    → _build_<server_id>(server, env, model, merged_params) → list[str]
 ```
 
 All builders receive `model.effective_ctx` (not `model.ctx` directly) so that `ctx_override` values are respected without each builder needing to know about the field. Builders for `stage_all_models` servers (e.g. `_build_comfyui`) accept `model=None` and must not access model attributes.
 
 `resolve_path()` returns `model.cached_path` if it is set and the path exists on disk (`Path.exists()` — handles both files and directories uniformly); otherwise returns `model.path`. The `mounts` list in `CacheMount` is used only to determine *where* to place new cached copies and to display disk-space info in the UI.
 
-**Why inject `_model_path` into params rather than pass it separately?** To keep all builder functions with the same signature `(server, model, params) → list[str]`. New builders registered in `_BUILDERS` follow the same pattern without touching `build_cmd()`.
+Builders take the interpreter / binaries from `env` (`env.python`, `env.executable(...)`) — never from config.
 
-**Per-server environment injection**: `build_launch_command()` reads per-server launch fields from the `ServerSoftware` instance (set in `data.py`) rather than branching on `server.id`. Rather than mutating the child process's environment, launcher-controlled values are assembled into a leading `env KEY=VALUE …` **command prefix** (using the `env` utility). This keeps the confirmation editor and session log fully reproducible by copy/paste. `os.environ` is still inherited as the base; the explicit command assignments override it. Injected behavior:
+**Why inject `_model_path` into params rather than pass it separately?** To keep all builder functions with the same signature `(server, env, model, params) → list[str]`. New builders registered in `_BUILDERS` follow the same pattern without touching `build_cmd()`.
+
+**Per-server environment injection**: `build_launch_command()` reads per-server launch fields from the `ServerSoftware` instance (set in `data.py`) and the chosen `Environment` rather than branching on `server.id`. Rather than mutating the child process's environment, launcher-controlled values are assembled into a leading `env KEY=VALUE …` **command prefix** (using the `env` utility). This keeps the confirmation editor and session log fully reproducible by copy/paste. `os.environ` is still inherited as the base; the explicit command assignments override it. Injected behavior:
 - `CUDA_VISIBLE_DEVICES` — set for all servers from `CONFIG.resolved_cuda_devices`
 - `strip_pythonpath=True` (vLLM): emits `env -u PYTHONPATH` to prevent source-tree shadowing of the installed package
-- `cuda_home` (tabbyAPI, SGLang, vLLM): sets `CUDA_HOME`; enforces the correct nvcc for flash-attn / flashinfer JIT compilation
-- `ld_library_path_prepend` / `library_path_prepend` (vLLM): prepend the split-wheel CUDA lib dir to `LD_LIBRARY_PATH` (runtime `.so` load) / `LIBRARY_PATH` (link-time `-l` resolution); the existing value is captured inline so the logged command reproduces exactly. `lib_symlinks` self-heals missing linker-name symlinks (e.g. `libcudart.so` → `libcudart.so.13`) on disk before spawn
-- `extra_env` (vLLM): arbitrary extra `KEY=VALUE` pairs merged into the prefix
+- `cuda_home` (tabbyAPI, SGLang): sets `CUDA_HOME`; enforces the correct nvcc for flash-attn / flashinfer JIT compilation
+- `bundled_cuda_glob` (vLLM): when the chosen environment contains a pip-bundled toolkit (`nvidia/cu13/`), it becomes `CUDA_HOME` and its `lib/` is prepended to `LD_LIBRARY_PATH` (runtime `.so` load) / `LIBRARY_PATH` (link-time `-l` resolution); the existing values are captured inline so the logged command reproduces exactly. `lib_symlinks` self-heals missing linker-name symlinks (e.g. `libcudart.so` → `libcudart.so.13`, the shortest glob match) in that `lib/` before spawn
+- `extra_env`: arbitrary extra `KEY=VALUE` pairs merged into the prefix (no server currently sets any)
 - `uses_staging_dir=True` (tabbyAPI, ooba, ComfyUI): creates symlinks under `model_dir`; `staging_format_suffixes` maps `ModelFormat` → file extension suffix; `stage_all_models=True` (ComfyUI) stages every compatible catalog model rather than only the selected one; `staging_subdir_attr="comfyui_subdir"` (ComfyUI) routes each model to `model_dir/<model.comfyui_subdir>/` — `launch.py` reads `getattr(model, staging_subdir_attr)` generically with no branching on `server.id`
 - `launch_cwd` (vLLM → `/tmp`, ooba → install dir): emits a leading `cd <dir> &&` in the command; vLLM avoids any `vllm/` directory on `sys.path`; ooba needs CWD at its install root because Gradio resolves `allowed_paths` relative to CWD
 
@@ -322,8 +386,10 @@ Initial tools:
 
 | id | Input | Output | Binary |
 |---|---|---|---|
-| `llama-quantize` | `GGUF` | `GGUF` | `CONFIG.llama_quantize` (derived from `llama_server` sibling) |
-| `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | `CONFIG.exl2_convert_script` or `-m exllamav2.conversion.convert_exl2` |
+| `llama-quantize` | `GGUF` | `GGUF` | `llama-quantize` in the default `llamacpp` environment (built alongside `llama-server`) |
+| `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | default `tabby` environment's Python: `CONFIG.exl2_convert_script` or `-m exllamav2.conversion.convert_exl2` |
+
+Tools run from their `env_server_id`'s default environment (`quant_tool_env(tool)`); builders take `(tool, env, model, quant_option, output_path)`. Availability is cached per `(tool, environment location)`, so switching the default environment re-checks it.
 
 Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matching `_build_<id>` builder in `launch.py` registered in `_QUANT_BUILDERS`.
 
@@ -354,10 +420,8 @@ Follows the same PTY + log structure as `launch()`:
 ### `exl2_convert_script` config field
 
 `CONFIG.exl2_convert_script` (path, from `config.toml` key `exl2_convert_script`; default `~/exllamav2/convert.py`).  The `_build_exl2_convert` builder checks whether the script file exists on disk:
-- If yes → `<tabby_python> <script> -i ... -o ... -b ...`
-- If no → `<tabby_python> -m exllamav2.conversion.convert_exl2 -i ... -o ... -b ...`
-
-`CONFIG.llama_quantize` is a derived property: `llama_server.parent / "llama-quantize"`. No extra config key needed.
+- If yes → `<tabby env python> <script> -i ... -o ... -b ...`
+- If no → `<tabby env python> -m exllamav2.conversion.convert_exl2 -i ... -o ... -b ...`
 
 ---
 
@@ -371,6 +435,7 @@ After the TUI exits, `launch()` in `launch.py` creates a log file and spawns the
    # date:   <ISO timestamp>
    # model:  <id>  (<format>, <size_gb> GB)
    # server: <server_id>
+   # env:    <env name>  (<kind>, <version_label>)
    # path:   <resolved_path>
    #
    # command:
@@ -428,18 +493,19 @@ This is fully driven by catalog entries. Adding a model to the catalog (via `ing
 
 ## Server Status Persistence
 
-Statuses are stored as a nested dict: `server_status[server_id][quant_key] = status`.
+Statuses are stored as a nested dict: `server_status[server_id][env_name][quant_key] = status`.
 
-`quant_key` is `"none"` (full/stored precision — no additional quantization) or a `RuntimeQuant.value` string (e.g. `"bnb_int8"`). The helper `_quant_key(quant)` in `models.py` handles the conversion.
+`env_name` is a registered `Environment.name` for that server — results are per environment because a model may work on one install (e.g. `vllm-next`) and fail on another. `quant_key` is `"none"` (full/stored precision — no additional quantization) or a `RuntimeQuant.value` string (e.g. `"bnb_int8"`). The helper `_quant_key(quant)` in `models.py` handles the conversion. Several quant keys may be `"good"` at once.
 
-**Exclusivity rule**: only one quant key per `(model, server)` pair may be `"good"` at a time. `save_server_status()` clears any other `"good"` entries for the same server before writing the new one.
+**Lookups** (`AIModel`): `status_for(server_id, env_name, quant)` for one combo; `env_best_status(server_id, env_name)` across quants (EnvSelectScreen dots); `best_status_for(server_id)` across environments and quants (ServerSelectScreen dots, composite model-list status). All collapse with priority good > bad > unknown.
 
-**`best_status_for(server_id)`** scans all quant keys for a server and returns `"good"` if any is good, `"bad"` if any is bad (and none good), otherwise `"unknown"`. Used for composite display and `ServerSelectScreen` dots.
+**Where marks are set** — always on the deepest selection screen for that launch, so a mark is never ambiguous:
+- `ServerSelectScreen` (`g` / `x` / `?`) — only when the server has exactly one environment and `available_runtime_quants(model.format)` is empty. Calls `save_server_status(model, server_id, env_name, status, quant=None)`.
+- `EnvSelectScreen` (`g` / `x` / `?`) — servers with several environments and no runtime quants for this model; marks the focused environment.
+- `QuantSelectScreen` (`g` / `x` / `?`) — quant-capable servers; marks the focused quant/precision option for the chosen environment.
+  Shallower screens disable `g`/`x`/`?` in those cases (the bindings return `False` from `check_action`).
 
-**Where marks are set**:
-- `ServerSelectScreen` (`g` / `x` / `?`) — only for servers where `available_runtime_quants(model.format)` returns empty (i.e. the model format is not quantizable or the server has no quant support). Calls `save_server_status(..., quant=None)`.
-- `QuantSelectScreen` (`g` / `x` / `?`) — for quant-capable servers; marks the currently focused quant/precision option. Calls `save_server_status(..., quant=<focused_option>)`.
-  `ServerSelectScreen` disables `g`/`x`/`?` for quant-capable servers (the bindings return `False` from `check_action`).
+**Environment renames / removals** migrate results catalog-wide in one write: `apply_env_rename()` moves `server_status[server][old]` → `[new]`; `apply_env_removal()` drops `server_status[server][name]` (`count_env_status()` feeds the confirmation dialog).
 
 `save_ctx_override(model, value)` follows the same pattern: mutates `model.ctx_override` in-memory, then updates or removes the `ctx_override` key in the matching JSON entry (`value=0` → key removed).
 
@@ -451,7 +517,9 @@ Statuses are stored as a nested dict: `server_status[server_id][quant_key] = sta
 
 | Constraint | Root cause | Mitigations in this codebase |
 |---|---|---|
-| TP size must divide model dimensions | `num_attention_heads`, `num_key_value_heads`, and `intermediate_size` must be divisible by `--tensor-parallel-size` | `compute_parallelism()` picks the smallest valid TP for the selected GPU count |
+| TP size must divide model dimensions | `num_attention_heads`, linear-attention heads and `intermediate_size` must be divisible by `--tensor-parallel-size`; `num_key_value_heads` divisible by it or a divisor of it | `compute_parallelism()` picks the smallest valid TP for the selected GPU count |
+| No pipeline parallelism for some architectures | Qwen4Exp's N-gram PLE embedding needs raw `input_ids` on every rank; vLLM rejects PP > 1 | `_NO_PP_ARCHS` → pure TP plan (PP=1) |
+| FP8 block alignment of MoE experts under TP | Block-FP8 (128×128) experts cannot be TP-sharded when `moe_intermediate_size / TP` is not a multiple of 128 (Qwen3.8-Flash-Next: 640 / 8 = 80) | Per-model `expert_parallel: true` → `--enable-expert-parallel` (whole experts per rank; vLLM replicates the misaligned shared expert) |
 | Global world_size assertions | Some model implementations assert `intermediate_size % world_size == 0` using total GPU count, not TP size | `compute_parallelism()` checks this for architectures not in `_TP_SCOPED_ARCHS` and auto-reduces GPU count |
 | PCIe topology, no NVLink | Tensor parallel cross-GPU communication is expensive on PCIe | `compute_parallelism()` prefers smallest TP (largest PP) — only activations cross GPU boundaries |
 | Ray compiled DAG limit | Default `_max_inflight_executions=10`; pp=11 submits 11 steps at once | Only relevant when `executor_backend="ray"` is set explicitly (no longer the default). Patch `ray_executor.py`: set `max(pp+1, 16)` |
@@ -473,12 +541,14 @@ utilization, dtype mismatches). They are now optional and driven by `default_par
 | `gpu_mem_util` | `0.90` | `--gpu-memory-utilization` always (vLLM default, leaves headroom) |
 | `max_num_seqs` | `0` | `--max-num-seqs <v>` only when non-zero (else vLLM default 256) |
 | `chunked_prefill` | `False` | `--enable-chunked-prefill` only when True |
+| `expert_parallel` | `False` | `--enable-expert-parallel` only when True (set per-model for MoE checkpoints) |
+| `auto_fit_ctx` | `False` | `--max-model-len -1` instead of `model.effective_ctx` — vLLM starts at the native context and lowers it only as far as needed to fit the KV cache (logged as "Auto-fit max_model_len"); set per-model for memory-tight models |
 | `enforce_eager` | `False` | `--enforce-eager` only when True (default allows faster CUDA graphs) |
 | `log_requests` | `False` | `--no-enable-log-requests` when False; nothing when True |
 
 Always-on flags: `--model`, `--served-model-name`, `--tensor-parallel-size`,
 `--pipeline-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`
-(`model.effective_ctx`), `--host`, `--port`. `--trust-remote-code` is emitted only when
+(`model.effective_ctx`, or `-1` when `auto_fit_ctx`), `--host`, `--port`. `--trust-remote-code` is emitted only when
 the model's `trust_remote_code` field is True. `--enable-auto-tool-choice
 --tool-call-parser <name>` is emitted when the model's `tool_call_parser` is set.
 
@@ -509,10 +579,15 @@ Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
 **Add a model**: create an `AIModel` entry in `models_local.json`. No code changes needed.
 
 **Add a server type**:
-1. `ServerSoftware(...)` entry in `data.py` → `SERVERS`.
-2. `_build_<id>(server, model, params) → list[str]` in `launch.py`.
+1. `ServerSoftware(...)` entry in `data.py` → `SERVERS` (set `env_kind` / `version_packages` or `version_probe`).
+2. `_build_<id>(server, env, model, params) → list[str]` in `launch.py`.
 3. Register in `_BUILDERS`.
 4. If the server needs a staging model directory, add a block in `launch()`.
+5. Register an environment for it — `e` on the server list, or `user_data/environments.json`.
+
+**Add an environment**: `e` on the server or environment list → `a`. No code changes needed.
+
+**Add an environment kind** (e.g. a venv or container image): subclass `Environment` in `environments.py`, implement `location` / `bin_dir` / `exists()` and whichever lifecycle hooks apply, declare `extra_fields`, and register it in `_ENV_KINDS`.
 
 **Add a cache tier**: add a `[[cache_mounts]]` entry in `config.toml`. Priority determines probe order. No code changes needed.
 
@@ -547,18 +622,20 @@ Entries are sorted alphabetically. For each item in `scan_root`:
 
 - **Top-level `.gguf` file** → yielded as a standalone candidate.
 - **GGUF bundle directory** → each `.gguf` file inside yielded individually (one entry per quant variant). Scans flat bundles (`entry/*.gguf`) and per-quant-subdir bundles (`entry/<quant>/*.gguf`). Files named `mmproj-*` are excluded.
+- **llama.cpp split sets** (`<base>-00001-of-000NN.gguf`) → collapsed to the first shard only, which is the file passed to the server; it carries the metadata and pulls in the remaining shards on load. Without this a 7-shard model would become 7 bogus entries each sized as a single shard.
 - **HF model directory** (has `config.json` or weight files) → yielded as a whole directory. Directories with both safetensors and pytorch_bin weights yield one entry per format so each becomes a separate catalog entry.
 
 Directories with no `config.json` and no weight files are skipped.
 
 ### Detection — GGUF files
 
-- **`quant`**: matched against `GGUFQuant` values by regex on the filename (longest match first to avoid partial matches).
+- **`quant`**: matched against `GGUFQuant` values by regex on the filename. A filename may contain more than one recognised label (e.g. a Q8_0 quant of a BF16 upcast named `<model>-bf16.Q8_0.gguf`), so the **rightmost** match wins — the trailing tag is the actual quantisation. Ties at the same position are broken by the longer label, so `Q4_K_M` still beats a shorter prefix.
 - **`ctx`**: from `config.json` if present in the bundle dir (placed by `copy-configs`); falls back to borrowing from a sibling entry already in the catalog; `0` if neither available.
-- **`size_gb`**: from `stat().st_size` of the individual GGUF file.
+- **`size_gb`**: from `stat().st_size` of the individual GGUF file; for a split set, the sum of every shard. Missing shards are reported as a warning.
 - **`params_m`**: from `config.json` `num_parameters` if present; falls back to regex extraction from filename (e.g. `70B` → 70000).
 - **`arch`**, **MoE**, **`vision`**, **`trust_remote_code`**: from `config.json` when present.
 - **`mmproj_path`**: auto-detected from `mmproj-*.gguf` in bundle root when `vision=True`.
+- **`name`**: derived from the parent dir name when it contains "gguf", else the file stem. The split-shard suffix and the quant label are stripped first, so `Model-GGUF-Q5_K_S/…` yields `Model` rather than carrying tags that the quant slug would then duplicate.
 - **`id`**: `<name-slug>-<quant-slug>` where quant slug drops underscores and trailing `0` (e.g. `Q8_0` → `q8`, `Q4_K_M` → `q4km`). Collision guard appends `-gguf` if the ID already belongs to a different path.
 
 ### Detection — HF model directories
@@ -573,7 +650,7 @@ Reads `config.json`:
 - **`vision`**: `True` when `vision_config` is present.
 - **`trust_remote_code`**: `True` when `auto_map` is present (custom architecture code).
 - **`min_sm`**: set to `89` for static FP8 quantisation (non-dequantise, non-block-wise); `0` for block-wise FP8 (dequantises to BF16 at runtime, works on sm_86).
-- **`size_gb`**: recursive `stat()` sum of weight files matching the format's glob patterns (format-aware — e.g. pytorch_bin counts only HF shard files, not unrelated `.bin` artefacts).
+- **`size_gb`**: recursive `stat()` sum of weight files matching the format's glob patterns (format-aware — e.g. pytorch_bin counts only HF shard files, not unrelated `.bin` artefacts). Mistral repos that ship the same weights twice (HF `model-*.safetensors` alongside native `consolidated-*.safetensors`) count only the HF shards, so the size is not doubled. The two sets are recognised by their index files declaring the same total within 1% — the layouts pack tensors differently, so the totals agree to parts-per-million rather than exactly. Deduplication is skipped (with a warning) when any HF shard is missing from disk, so a partially-downloaded set is never used as the basis for the size.
 - **`id`**: `<name-slug>-<fmt-short>` (e.g. `…-bf16`, `…-fp16`, `…-int8`). Collision guard falls back to the raw directory name.
 
 ### Detection — image_gen models
@@ -597,6 +674,10 @@ With `--ai-type image_gen`, each `.safetensors` file in the scan directory becom
 Preparation steps for GGUF bundles — run before `ingest` or `refresh` so that metadata detection has access to `config.json` and mmproj files.
 
 Both commands search `scan_root` plus cache mount subdirs mirroring the same leaf directory (e.g. if `scan_root` is `/mnt/nas/ai_models/text-generation`, also checks `~/fast_models/text-generation` from configured cache mounts). For each GGUF bundle directory that lacks the target files, the original (non-GGUF) model is located via normalised name matching and the files are copied across.
+
+The copied set (`_CONFIG_FILES`) covers `config.json`, the tokenizer files, `generation_config.json`, and `chat_template.jinja` / `chat_template.json` — transformers ≥ 4.55 ships the chat template as a standalone file instead of embedding it in `tokenizer_config.json`.
+
+`copy-configs` skips any bundle that already has a `config.json`, so bundles processed before a new filename was added to `_CONFIG_FILES` are not backfilled automatically; call `copy_model_metadata(src, dst)` directly for those.
 
 Fields left for manual review: `ctx` for new GGUF bundles without config.json, `server_params`.
 

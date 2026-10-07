@@ -1,0 +1,59 @@
+{
+  "environments": {
+    "vllm": [
+      {
+        "kind": "conda",
+        "name": "vllm",
+        "note": "stable",
+        "default": true
+      },
+      {
+        "kind": "conda",
+        "name": "vllm-next",
+        "note": "newer release for testing new architectures"
+      }
+    ],
+    "llamacpp": [
+      {
+        "kind": "native",
+        "name": "llama.cpp",
+        "bin_dir": "~/llama.cpp/build/bin",
+        "default": true
+      },
+      {
+        "kind": "native",
+        "name": "llama.cpp-next",
+        "bin_dir": "~/llama.cpp-next/build/bin",
+        "note": "git worktree tracking master"
+      }
+    ],
+    "tabby": [
+      {
+        "kind": "conda",
+        "name": "tabby",
+        "default": true
+      }
+    ],
+    "ooba": [
+      {
+        "kind": "conda",
+        "name": "textgen",
+        "default": true
+      }
+    ],
+    "comfyui": [
+      {
+        "kind": "conda",
+        "name": "comfyui",
+        "default": true
+      }
+    ],
+    "sglang": [
+      {
+        "kind": "conda",
+        "name": "sglang",
+        "default": true
+      }
+    ]
+  }
+}

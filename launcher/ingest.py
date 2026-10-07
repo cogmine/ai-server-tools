@@ -66,6 +66,10 @@ _CONFIG_FILES = [
     "generation_config.json",
     "vocab.json",
     "merges.txt",
+    # transformers >= 4.55 ships the chat template as a standalone file rather
+    # than embedding it in tokenizer_config.json; .json is the older multimodal form.
+    "chat_template.jinja",
+    "chat_template.json",
 ]
 
 
@@ -125,7 +129,9 @@ def _iter_candidates(scan_dir: Path):
             continue
         if entry.is_file():
             if entry.suffix.lower() == ".gguf" and not entry.stem.lower().startswith("mmproj"):
-                yield entry, "gguf"
+                info = _gguf_split_info(entry)
+                if info is None or info[1] == 1:
+                    yield entry, "gguf"
         elif entry.is_dir():
             # Check for GGUF files one level deep (flat bundle: entry/*.gguf,
             # or per-quant subdirs: entry/<quant>/*.gguf).  Avoids rglob, which
@@ -137,7 +143,7 @@ def _iter_candidates(scan_dir: Path):
                         gguf_files.extend(sorted(subdir.glob("*.gguf")))
             if gguf_files:
                 # Skip mmproj-* files (multimodal projectors — not standalone models).
-                for gguf_file in gguf_files:
+                for gguf_file in _primary_gguf_files(gguf_files):
                     if not gguf_file.stem.lower().startswith("mmproj"):
                         yield gguf_file, "gguf"
             elif _looks_like_model_dir(entry):
@@ -212,6 +218,70 @@ _FORMAT_WEIGHT_GLOBS: dict[str, list[str]] = {
     "pytorch_bin":      ["pytorch_model*.bin", "model*.bin", "*.pt", "*.pth"],
 }
 
+# Fractional slack allowed between two index files claiming to describe the same
+# weights.  Real duplicates differ only by tensor-packing overhead (parts per
+# million); anything larger is two genuinely different sets.
+_DUPLICATE_TOTAL_TOLERANCE = 0.01
+
+
+def _duplicate_weight_sets(model_dir: Path) -> bool:
+    """True if the dir ships one set of weights twice, as HF and consolidated shards.
+
+    Mistral repos publish `model-*.safetensors` alongside a native
+    `consolidated-*.safetensors` set; both index files then declare the same
+    weights.  The declared totals are the reliable signal — file counts differ
+    between the two layouts — but they rarely agree to the byte, since the two
+    layouts pack tensors differently, so they are compared within a tolerance
+    that stays far below the 2x being guarded against.  The HF set must also be
+    complete on disk, since sizing from a partially-downloaded set would
+    understate the model.
+    """
+    hf_index = model_dir / "model.safetensors.index.json"
+    consolidated_index = model_dir / "consolidated.safetensors.index.json"
+    if not (hf_index.exists() and consolidated_index.exists()):
+        return False
+    try:
+        with open(hf_index) as f:
+            hf = json.load(f)
+        with open(consolidated_index) as f:
+            consolidated = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    hf_total = (hf.get("metadata") or {}).get("total_size")
+    consolidated_total = (consolidated.get("metadata") or {}).get("total_size")
+    if not (isinstance(hf_total, int) and isinstance(consolidated_total, int)):
+        return False
+    if hf_total <= 0 or consolidated_total <= 0:
+        return False
+    largest = max(hf_total, consolidated_total)
+    if abs(hf_total - consolidated_total) / largest > _DUPLICATE_TOTAL_TOLERANCE:
+        return False
+
+    shards = set((hf.get("weight_map") or {}).values())
+    missing = [s for s in shards if not (model_dir / s).exists()]
+    if missing:
+        print(
+            f"[ingest] Warning: {model_dir.name} carries duplicate weight sets but "
+            f"{len(missing)} of {len(shards)} HF shards are missing — sizing from all "
+            "weight files instead.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _weight_globs_for(model_dir: Path, fmt: str) -> list[str] | None:
+    """Weight-file globs for *fmt*, narrowed to avoid double-counting duplicates.
+
+    When a directory holds the same weights as both HF and consolidated shard
+    sets, only the HF shards are counted so size_gb is not doubled.
+    """
+    globs = _FORMAT_WEIGHT_GLOBS.get(fmt)
+    if globs == ["*.safetensors"] and _duplicate_weight_sets(model_dir):
+        return ["model-*.safetensors", "model.safetensors"]
+    return globs
+
 
 def _dir_size_gb(path: Path, include_globs: list[str] | None = None) -> float:
     """Sum model weight file sizes under path; return GB rounded to 1 d.p.
@@ -254,12 +324,24 @@ def _dir_size_gb(path: Path, include_globs: list[str] | None = None) -> float:
 # ---------------------------------------------------------------------------
 
 def _extract_gguf_quant(filename: str) -> str:
-    """Extract the GGUF quantisation label from a filename, or '' if not found."""
+    """Extract the GGUF quantisation label from a filename, or '' if not found.
+
+    A filename may carry more than one recognised label — a Q8_0 quant of a BF16
+    upcast is conventionally named '<model>-bf16.Q8_0.gguf'.  The trailing label
+    is the real quantisation, so the rightmost match wins; ties at the same
+    position (Q4_K matching inside Q4_K_M) are broken by the longer label.
+    """
     upper = filename.upper()
+    best_key = (-1, -1)
+    best_value = ""
     for q in GGUF_QUANTS_LONGEST_FIRST:
-        if re.search(r"[.\-_]" + re.escape(q.value) + r"(?:[.\-_]|$)", upper):
-            return q.value
-    return ""
+        for match in re.finditer(
+            r"[.\-_]" + re.escape(q.value) + r"(?:[.\-_]|$)", upper
+        ):
+            key = (match.start(), len(q.value))
+            if key > best_key:
+                best_key, best_value = key, q.value
+    return best_value
 
 
 def _quant_slug(quant: str) -> str:
@@ -270,6 +352,46 @@ def _quant_slug(quant: str) -> str:
     if re.match(r"^q\d+0$", s):
         s = s[:-1]
     return s
+
+
+# llama.cpp splits large models into '<base>-00001-of-000NN.gguf' shards.  The
+# first shard carries the metadata and pulls in the rest when loaded, so a split
+# set is one model — not NN of them.
+_GGUF_SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})$")
+
+
+def _gguf_split_info(gguf_path: Path) -> tuple[str, int, int] | None:
+    """Return (base_stem, index, total) for a llama.cpp split shard, else None."""
+    match = _GGUF_SPLIT_RE.match(gguf_path.stem)
+    if match is None:
+        return None
+    return match["base"], int(match["index"]), int(match["total"])
+
+
+def _primary_gguf_files(gguf_files: list[Path]) -> list[Path]:
+    """Drop non-first shards so each split set contributes a single candidate."""
+    return [
+        f for f in gguf_files
+        if (info := _gguf_split_info(f)) is None or info[1] == 1
+    ]
+
+
+def _gguf_size_gb(gguf_path: Path) -> float:
+    """Size in GB of a GGUF model, summing every shard when it is a split set."""
+    info = _gguf_split_info(gguf_path)
+    if info is None:
+        return _file_size_gb(gguf_path)
+    base, _, total = info
+    total_bytes = 0
+    for index in range(1, total + 1):
+        shard = gguf_path.parent / f"{base}-{index:05d}-of-{total:05d}.gguf"
+        try:
+            total_bytes += shard.stat().st_size
+        except OSError:
+            print(
+                f"[ingest] Warning: missing GGUF shard {shard.name}", file=sys.stderr
+            )
+    return round(total_bytes / 1_000_000_000, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -885,17 +1007,21 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     """
     quant = _extract_gguf_quant(gguf_path.name)
 
-    # Display name: prefer parent dir name (minus -GGUF suffix) over file stem
+    # Display name: prefer parent dir name (minus -GGUF suffix) over file stem.
+    # Strip the split-shard suffix and quant label first so that names like
+    # "Model-GGUF-Q5_K_S" reduce to "Model" rather than keeping the tags, which
+    # would then be duplicated by the quant_suffix appended below.
     parent = gguf_path.parent
-    if "gguf" in parent.name.lower():
-        display_name = _dir_to_display_name(parent.name)
-    else:
-        stem = gguf_path.stem
-        if quant:
-            stem = re.sub(
-                r"[.\-_]" + re.escape(quant) + r"$", "", stem, flags=re.IGNORECASE
-            )
-        display_name = _dir_to_display_name(stem)
+    split_info = _gguf_split_info(gguf_path)
+    base_name = (
+        parent.name if "gguf" in parent.name.lower()
+        else (split_info[0] if split_info else gguf_path.stem)
+    )
+    if quant:
+        base_name = re.sub(
+            r"[.\-_]" + re.escape(quant) + r"$", "", base_name, flags=re.IGNORECASE
+        )
+    display_name = _dir_to_display_name(base_name)
 
     quant_suffix = f"-{_quant_slug(quant)}" if quant else ""
     entry_id = f"{_slugify(display_name)}{quant_suffix}"
@@ -940,7 +1066,7 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
         "format": "gguf",
         "ai_types": ["text_gen"],
         "ctx": ctx,
-        "size_gb": _file_size_gb(gguf_path),
+        "size_gb": _gguf_size_gb(gguf_path),
         "server_status": {},
     }
     if quant:         entry["quant"]        = quant
@@ -988,7 +1114,7 @@ def detect_hf_dir(
         "[ingest] Computing directory size (may take a moment on slow storage) …",
         file=sys.stderr,
     )
-    size_globs = _FORMAT_WEIGHT_GLOBS.get(fmt)
+    size_globs = _weight_globs_for(model_dir, fmt)
     size_gb = _dir_size_gb(model_dir, include_globs=size_globs)
 
     entry: dict[str, Any] = {
@@ -1145,7 +1271,7 @@ def _refresh_one(
     # should reflect the corrected format's weight files, not the auto-detected ones.
     if ai_type != "image_gen" and path.is_dir():
         stored_fmt = entry.get("format", "")
-        size_globs = _FORMAT_WEIGHT_GLOBS.get(stored_fmt)
+        size_globs = _weight_globs_for(path, stored_fmt)
         fresh["size_gb"] = _dir_size_gb(path, include_globs=size_globs)
 
     # Normalise to canonical Python types for comparison

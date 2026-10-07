@@ -10,15 +10,9 @@
 
 [paths]
 
-# Miniconda / Anaconda base directory
+# Miniconda / Anaconda base directory.  Conda environments registered in
+# user_data/environments.json are resolved under <conda_base>/envs/.
 conda_base = "~/miniconda3"
-
-# Names of the conda environments used by each server type
-vllm_env  = "vllm"
-tabby_env = "tabby"
-
-# Path to the compiled llama-server binary (from llama.cpp)
-llama_server = "~/llama.cpp/build/bin/llama-server"
 
 # tabbyAPI entry point and the staging directory where model symlinks are created
 tabby_main      = "~/tabbyAPI/main.py"
@@ -27,18 +21,13 @@ tabby_model_dir = "~/tabbyAPI/models"
 # text-generation-webui (oobabooga) entry point and model staging directory
 # ooba_model_dir is where the launcher creates per-launch model symlinks.
 # It should match (or be inside) ooba's models directory so the UI can also browse them.
-ooba_env        = "textgen"
 ooba_main       = "~/text-generation-webui/server.py"
 ooba_model_dir  = "~/text-generation-webui/user_data/models"
 
-# SGLang server — conda environment name
-sglang_env      = "sglang"
-
-# ComfyUI — conda environment name, path to main.py, and base models directory.
+# ComfyUI — path to main.py and base models directory.
 # The launcher stages symlinks for every catalog image_gen model under comfyui_models_dir,
 # organized by subdirectory (e.g. models/checkpoints/, models/diffusion_models/).
 # resolve_path() is used for each link target, so cached local copies are preferred.
-comfyui_env       = "comfyui"
 comfyui_main      = "~/ComfyUI/main.py"
 comfyui_models_dir = "~/ComfyUI/models"
 

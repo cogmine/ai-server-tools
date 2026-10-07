@@ -19,7 +19,7 @@ A minimal shared conda environment is defined in `environment.yml` at the repo r
 conda env create -f ~/ai-server-tools/environment.yml
 ```
 
-This installs Python 3.11 and `textual` — the only runtime dependency of the launcher and gpu_monitor.  The model servers (vLLM, tabbyAPI, etc.) each have their own separate conda environments configured in `user_data/config.toml`.
+This installs Python 3.11 and `textual` — the only runtime dependency of the launcher and gpu_monitor.  The model servers (vLLM, tabbyAPI, etc.) each run from their own conda environments (or, for llama.cpp, a build directory), registered in `user_data/environments.json` — see [Server environments](#server-environments).
 
 To update the environment after pulling changes (e.g. if `textual` is upgraded):
 
@@ -34,14 +34,23 @@ cp launcher/config.toml.example launcher/user_data/config.toml
 $EDITOR launcher/user_data/config.toml
 ```
 
-### 3. Add your models
+### 3. Register server environments
+
+```bash
+cp launcher/environments.json.example launcher/user_data/environments.json
+$EDITOR launcher/user_data/environments.json
+```
+
+Keep one entry per server you use (more can be added later from the TUI with `e`).
+
+### 4. Add your models
 
 ```bash
 cp launcher/models_local.json.example launcher/user_data/models_local.json
 $EDITOR launcher/user_data/models_local.json
 ```
 
-### 4. Run
+### 5. Run
 
 ```bash
 cd ~/ai-server-tools
@@ -65,11 +74,11 @@ All system-specific paths live in **`user_data/config.toml`** (gitignored). The 
 
 | Section | Key | Description |
 |---|---|---|
-| `[paths]` | `conda_base` | Miniconda / Anaconda base directory |
-| `[paths]` | `vllm_env` / `tabby_env` / `ooba_env` / `sglang_env` | Conda environment names |
-| `[paths]` | `llama_server` | Path to compiled `llama-server` binary |
+| `[paths]` | `conda_base` | Miniconda / Anaconda base directory (conda environments resolve to `<conda_base>/envs/<name>`) |
 | `[paths]` | `tabby_main` / `tabby_model_dir` | tabbyAPI entry point and model staging directory |
 | `[paths]` | `ooba_main` / `ooba_model_dir` | text-generation-webui entry point and model staging directory |
+| `[paths]` | `comfyui_main` / `comfyui_models_dir` | ComfyUI entry point and model staging directory |
+| `[paths]` | `exl2_convert_script` | ExLlamaV2 `convert.py` (falls back to the module entry point when absent) |
 | `[paths]` | `cuda_home_tabby` | `CUDA_HOME` injected for tabbyAPI (flash-attn); leave `""` to skip |
 | `[paths]` | `cuda_home_sglang` | `CUDA_HOME` injected for SGLang (flashinfer JIT); leave `""` to skip |
 | `[paths]` | `cuda_visible_devices` | Explicit GPU list; `""` = auto-derive from `pipeline_parallel` |
@@ -77,6 +86,27 @@ All system-specific paths live in **`user_data/config.toml`** (gitignored). The 
 | `[[cache_mounts]]` | `label` / `root` / `priority` | Local storage tiers for caching models locally from remote sources |
 
 `~` and environment variables are expanded in all path values.
+
+Which conda environment (or llama.cpp build) each server runs from is not set here — see [Server environments](#server-environments).
+
+## Server environments
+
+Each server launches from a registered **environment**: a conda env (vLLM, SGLang, tabbyAPI, text-generation-webui, ComfyUI) or a native build directory (llama.cpp). You can register several per server — for example keep a known-good `vllm` and try a newer release in `vllm-next` — and pick one at launch. The registry lives in `user_data/environments.json` (gitignored); the TUI maintains it.
+
+When a server has more than one environment, choosing it opens an **environment picker** (the default ★ is pre-focused; installed versions such as `vllm 0.26.0` are shown). Servers with a single environment skip the picker.
+
+Press `e` on the server list or the environment picker to **manage environments** for that server:
+
+| Key | Action |
+|---|---|
+| `a` | Register an environment. If the conda env doesn't exist yet, you're offered to create it — empty (choose a Python version) or as a clone of an existing env — or register it anyway |
+| `c` | Create the focused environment when it is missing on disk |
+| `r` | Rename — renames the conda env itself (`conda rename`) and carries its test results over |
+| `d` | Unregister — optionally also deletes the conda env (`conda env remove`); its test results are removed |
+| `s` | Make the focused environment the default (pre-selected at launch; used by quantization tools) |
+| `n` | Edit the note shown beside the environment |
+
+Conda operations run in the TUI with live output. Upgrading packages inside an environment is done by hand (e.g. `conda activate vllm-next && pip install -U vllm`); the launcher picks up the new version automatically. For vLLM, a pip-bundled CUDA toolkit (`nvidia/cu13/`) is detected per environment and wired into `CUDA_HOME` / library paths at launch.
 
 ## Adding models
 
@@ -171,16 +201,17 @@ Override server defaults per model with a `server_params` key:
 ## Adding server types
 
 1. Create a `ServerSoftware(...)` entry in `data.py → SERVERS`.
-2. Write `_build_<id>(server, model, params) → list[str]` in `launch.py`.
+2. Write `_build_<id>(server, env, model, params) → list[str]` in `launch.py` (take the interpreter / binaries from `env`).
 3. Register it in `_BUILDERS`.
 4. If the server needs a staging model directory, add a symlink-creation block in `launch()`.
+5. Register an environment for it (`e` on the server list).
 
 ## Navigation
 
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move cursor |
-| `→` / `Enter` | Select / confirm (model list: advance to server or cache screen; server list: advance to GPU screen) |
+| `→` / `Enter` | Select / confirm (model list: advance to server or cache screen; server list: advance to environment or GPU screen) |
 | `←` / `Esc` / `b` | Go back |
 | `q` | Quit from any screen |
 | `Space` | Toggle GPU selection (GPU screen) |
@@ -190,7 +221,8 @@ Override server defaults per model with a `server_params` key:
 | `l` | Set or clear context-length cap for focused model (model list) |
 | `f` | Toggle favorite pin for focused model (model list) |
 | `z` | Quantize focused model — opens tool/quant/destination picker (model list) |
-| `g` / `x` / `?` | Mark focused server as good / bad / unknown (server list) |
+| `g` / `x` / `?` | Mark the launch as good / bad / unknown — on the deepest screen for that server (server list, environment picker, or quantization picker) |
+| `e` | Manage environments for the focused server (server list, environment picker) |
 | `Ctrl+Enter` | Execute the edited command (final Ready to launch screen) |
 | `Ctrl+Q` | Quit from the final command editor (`q` inserts text there) |
 
@@ -205,19 +237,22 @@ launcher/
   screens.py           All TUI screens
   models.py            Schema: AIModel, ServerSoftware, AIType, ModelFormat
   data.py              SERVERS list + CACHE_MOUNTS (config-driven, safe to commit)
+  environments.py      Server environments (conda envs / native builds) + registry
+  environments.json.example  Template for user_data/environments.json
   launch.py            Command builders and subprocess launcher
   gpu.py               NVML polling (pynvml) + GpuRow helpers (shared with gpu_monitor)
   config.py            Config loader — reads user_data/config.toml at import time
   config.toml.example  Documented template (copy to user_data/config.toml)
   user_data/           ← gitignored; machine-specific and personal data
     config.toml          machine paths, GPU counts
+    environments.json    registered environments per server
     models_local.json    model catalog
   model_launcher.tcss    Textual CSS layout
 ```
 
 ## Status tracking
 
-Test results are stored per model/server pair in `models_local.json` (`server_status` field) and updated in-place when you press `g` / `x` / `?` on the server selection screen. The model list shows a composite symbol:
+Test results are stored per model, server **and environment** in `models_local.json` (`server_status` field) and updated in-place when you press `g` / `x` / `?`. Marking happens on the deepest screen of the launch: the server list when the server has a single environment and no runtime quantization options, otherwise the environment picker or the quantization picker. The server list shows the best result across a server's environments; the model list shows a composite symbol:
 
 | Symbol | Meaning |
 |---|---|
@@ -244,12 +279,12 @@ The TUI temporarily exits while the conversion runs in your terminal with live o
 
 | Tool | Converts | Prerequisite | Auto-install? |
 |---|---|---|---|
-| `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level) | llama.cpp built binary — co-located with `llama-server`. No extra install if the `llamacpp` server is configured. | No (requires building llama.cpp with CUDA) |
-| `exl2-convert` | BF16 / FP16 / BIN safetensors → EXL2 | `exllamav2` Python package in the `tabby` conda env. Already present if tabbyAPI is set up. If missing, the launcher offers to `pip install exllamav2` automatically (uses JIT CUDA compilation — no CUDA toolkit needed at install time). | **Yes** — press Enter in the install prompt |
+| `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level) | llama.cpp built binary — co-located with `llama-server` in the default llama.cpp environment. No extra install if llama.cpp is set up. | No (requires building llama.cpp with CUDA) |
+| `exl2-convert` | BF16 / FP16 / BIN safetensors → EXL2 | `exllamav2` Python package in the default tabbyAPI environment. Already present if tabbyAPI is set up. If missing, the launcher offers to `pip install exllamav2` automatically (uses JIT CUDA compilation — no CUDA toolkit needed at install time). | **Yes** — press Enter in the install prompt |
 
 ### Adding a quantization tool
 
 1. Add a `QuantizationTool(...)` entry to `QUANTIZATION_TOOLS` in `data.py`.
-2. Write `_build_<id>(tool, model, quant_option, output_path) → list[str]` in `launch.py`.
+2. Write `_build_<id>(tool, env, model, quant_option, output_path) → list[str]` in `launch.py` (`env` is the default environment of the tool's `env_server_id`).
 3. Register it in `_QUANT_BUILDERS`.
 

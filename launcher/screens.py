@@ -1,17 +1,25 @@
 
-"""screens.py — Four-level navigation: AI Type → Model → Server → Quant → Confirm launch.
+"""screens.py — Navigation: AI Type → Model → Server → [Environment] → [Quant] → GPUs → Confirm.
 
 Navigation stack:
   AITypeScreen        — Level 1: choose what kind of AI (text-gen, image-gen, …)
   ModelSelectScreen   — Level 2: choose a model (filtered by AIType)
   ServerSelectScreen  — Level 3: choose a server (filtered by model format + type)
-  QuantSelectScreen   — Level 4 (optional): choose runtime quantization, when the
+  EnvSelectScreen     — Level 3a (optional): choose the environment, when the
+                          server has more than one registered
+  QuantSelectScreen   — Level 3b (optional): choose runtime quantization, when the
                           server supports on-load quantization for the model’s format
+  GpuSelectScreen     — Level 3c: choose GPUs (CUDA_VISIBLE_DEVICES)
   ConfirmLaunch       — Show the command and confirm before spawning
+
+EnvManageScreen (`e` on the server / environment lists) registers, creates,
+renames and removes environments using the reusable TextPromptScreen,
+ChoiceScreen and CommandRunScreen dialogs.
 """
 from __future__ import annotations
 
 import functools
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable, ClassVar
@@ -27,6 +35,7 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    Log,
     ProgressBar,
     SelectionList,
     Static,
@@ -57,7 +66,7 @@ from launcher.models import (
     uses_hub_flow,
 )
 from launcher.data import AI_MODELS, CACHE_MOUNTS, QUANTIZATION_TOOLS, SERVERS
-from launcher.config import CONFIG
+from launcher.environments import ENVIRONMENTS, Environment, env_kind
 import launcher.launch as launcher
 
 
@@ -193,12 +202,13 @@ class ConfirmLaunch(ButtonMenuScreen):
         Binding("ctrl+enter",    "confirm",  "Launch", key_display="Ctrl+Enter"),
     ]
 
-    def __init__(self, command: str, proc_factory, model: "AIModel | None", server: ServerSoftware) -> None:
+    def __init__(self, command: str, proc_factory, model: "AIModel | None", server: ServerSoftware, env: Environment) -> None:
         super().__init__()
         self._command = command
         self._proc_factory = proc_factory
         self._model  = model
         self._server = server
+        self._env    = env
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -223,7 +233,7 @@ class ConfirmLaunch(ButtonMenuScreen):
             self.notify("Command cannot be empty", severity="warning", timeout=3)
             return
         factory = functools.partial(self._proc_factory, command)
-        self.app.exit((factory, self._model, self._server))
+        self.app.exit(launcher.LaunchJob(factory, self._model, self._server, self._env))
 
     @on(Button.Pressed, "#btn-launch")
     def on_launch_pressed(self) -> None:
@@ -238,15 +248,43 @@ class ConfirmLaunch(ButtonMenuScreen):
 # Level 3 — Server selection (shown after a model is chosen)
 # ---------------------------------------------------------------------------
 
+def _env_brief(server: ServerSoftware, env: Environment) -> str:
+    """One-line environment description: name, installed versions, missing flag."""
+    if not env.exists():
+        return f"{env.name}  [red](missing)[/]"
+    versions = server.env_version_label(env)
+    return f"{env.name}  [dim]{versions}[/]" if versions else env.name
+
+
+def _continue_launch(screen: Screen, model: "AIModel | None", server: ServerSoftware, env: Environment) -> None:
+    """Advance the launch flow once server + environment are chosen: [Quant] → GPUs."""
+    if not env.exists():
+        screen.notify(
+            f"Environment {env.name!r} not found at {env.location} — press e to manage environments",
+            severity="error", timeout=5,
+        )
+        return
+    if model is not None and server.available_runtime_quants(model.format):
+        # Let the user optionally choose a runtime quantization mode first.
+        screen.app.push_screen(QuantSelectScreen(model, server, env))
+        return
+    screen.app.push_screen(GpuSelectScreen(server, env, model))
+
+
 class ServerSelectScreen(DataTableScreen):
     """Choose which server software to use.
 
     When model is provided (text-gen flow): filters servers by model compatibility,
-    shows per-server status dots, and supports g/x/? status marking.
+    shows per-server status dots (best across environments), and supports g/x/?
+    status marking for servers with a single environment and no runtime quants
+    (otherwise marking happens on the deeper EnvSelectScreen / QuantSelectScreen).
 
     When model is None (hub flow for stage_all_models types): filters servers by
     ai_type, suppresses status marking (no model to mark against), and skips
     path validation before launching.
+
+    Servers with more than one registered environment continue to EnvSelectScreen;
+    `e` opens EnvManageScreen for the focused server.
     """
 
     BINDINGS: ClassVar = [
@@ -255,6 +293,7 @@ class ServerSelectScreen(DataTableScreen):
         Binding("?",             "mark_unknown",    "Clear"),
         Binding("g",             "mark_good",       "Mark good"),
         Binding("x",             "mark_bad",        "Mark bad"),
+        Binding("e",             "manage_envs",     "Environments"),
         Binding("f5",            "dt_select",       "Select", key_display="↵/→/dbl-click"),
     ]
 
@@ -281,6 +320,11 @@ class ServerSelectScreen(DataTableScreen):
             return self._servers[idx]
         return None
 
+    def _single_env(self, server: ServerSoftware) -> Environment | None:
+        """The server's only environment, or None when it has zero or several."""
+        envs = ENVIRONMENTS.for_server(server.id)
+        return envs[0] if len(envs) == 1 else None
+
     def on_mount(self) -> None:
         self._populate()
         if self._preselect_server_id is not None:
@@ -290,6 +334,11 @@ class ServerSelectScreen(DataTableScreen):
             except StopIteration:
                 pass
 
+    def on_screen_resume(self) -> None:
+        # Environments or results may have changed on a deeper screen.
+        self._populate()
+        self._refresh_title()
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action in ("mark_good", "mark_bad", "mark_unknown"):
             if self._model is None:
@@ -297,46 +346,55 @@ class ServerSelectScreen(DataTableScreen):
             server = self._focused_server()
             if server is None:
                 return False
-            # For quant-capable servers, status marking is done in QuantSelectScreen.
-            if server.available_runtime_quants(self._model.format):
+            env = self._single_env(server)
+            # Multi-env or quant-capable servers are marked on the deeper screens.
+            if env is None or server.available_runtime_quants(self._model.format):
                 return False
-            current = self._model.best_status_for(server.id)
+            current = self._model.status_for(server.id, env.name)
             if action == "mark_good":    return current != "good"
             if action == "mark_bad":     return current != "bad"
             if action == "mark_unknown": return current != "unknown"
+        if action == "manage_envs":
+            return self._focused_server() is not None
         return True
 
     def _set_status(self, status: str) -> None:
         if self._model is None:
             return
         server = self._focused_server()
-        if server is None:
+        env = self._single_env(server) if server is not None else None
+        if server is None or env is None:
             return
         try:
-            launcher.save_server_status(self._model, server.id, status, quant=None)
+            launcher.save_server_status(self._model, server.id, env.name, status, quant=None)
         except Exception as e:
             self.notify(str(e), severity="error", timeout=5)
             return
         self._populate()
         self._refresh_title()
         self.notify(
-            f"{self._model.name} / {server.label} → {status}",
+            f"{self._model.name} / {server.label} / {env.name} → {status}",
             timeout=2,
         )
 
-    def _server_row(self, s: ServerSoftware) -> tuple[str, str]:
-        """Return (status_dot, label) cells for the server table row."""
-        if self._model is not None:
-            return SERVER_STATUS_DOT[self._model.best_status_for(s.id)], s.label
-        return "", s.label
+    def _server_row(self, s: ServerSoftware) -> tuple[str, str, str]:
+        """Return (status_dot, label, environment) cells for the server table row."""
+        envs = ENVIRONMENTS.for_server(s.id)
+        if not envs:
+            env_cell = "[red]no environment — press e[/]"
+        elif len(envs) == 1:
+            env_cell = _env_brief(s, envs[0])
+        else:
+            env_cell = f"[dim]{len(envs)} environments[/]"
+        dot = SERVER_STATUS_DOT[self._model.best_status_for(s.id)] if self._model is not None else ""
+        return dot, s.label, env_cell
 
     def _populate(self) -> None:
         table = self.query_one("#server-list", DataTable)
         saved_row = table.cursor_row
         table.clear()
         for s in self._servers:
-            dot, label = self._server_row(s)
-            table.add_row(dot, label, key=s.id)
+            table.add_row(*self._server_row(s), key=s.id)
         table.move_cursor(row=min(saved_row, max(0, len(self._servers) - 1)))
         self.refresh_bindings()
 
@@ -357,12 +415,18 @@ class ServerSelectScreen(DataTableScreen):
     def action_mark_bad(self)     -> None: self._set_status("bad")
     def action_mark_unknown(self) -> None: self._set_status("unknown")
 
+    def action_manage_envs(self) -> None:
+        server = self._focused_server()
+        if server is not None:
+            self.app.push_screen(EnvManageScreen(server))
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Label(self._title_markup(), id="screen-title")
         table = DataTable(id="server-list", cursor_type="row", show_header=False)
         table.add_column("", key="status")
         table.add_column("Server", key="label")
+        table.add_column("Environment", key="env")
         yield table
         yield Footer()
 
@@ -381,16 +445,600 @@ class ServerSelectScreen(DataTableScreen):
                 self.notify(f"Path not found:\n{eff_path}", severity="error", timeout=4)
                 return
 
-            if server.available_runtime_quants(model.format):
-                # Let the user optionally choose a runtime quantization mode first.
-                self.app.push_screen(QuantSelectScreen(model, server))
-                return
-
-        self.app.push_screen(GpuSelectScreen(server, model))
+        envs = ENVIRONMENTS.for_server(server.id)
+        if not envs:
+            self.notify(f"No environment registered for {server.label} — press e to add one", severity="warning", timeout=4)
+            return
+        if len(envs) > 1:
+            self.app.push_screen(EnvSelectScreen(model, server))
+            return
+        _continue_launch(self, model, server, envs[0])
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
         self.action_dt_select()
+
+
+# ---------------------------------------------------------------------------
+# Level 3a — Environment selection (servers with more than one environment)
+# ---------------------------------------------------------------------------
+
+class EnvSelectScreen(DataTableScreen):
+    """Choose which registered environment (conda env / native build) to launch from.
+
+    Only pushed when the server has more than one environment.  The cursor starts
+    on the default environment (or preselect_env).  g/x/? mark the focused
+    environment for servers without runtime quants for this model; quant-capable
+    servers are marked per quant on QuantSelectScreen.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("q",             "quit_app",        "Quit"),
+        Binding("escape,b",      "app.pop_screen",  "Back",   key_display="esc/←"),
+        Binding("?",             "mark_unknown",    "Clear"),
+        Binding("g",             "mark_good",       "Mark good"),
+        Binding("x",             "mark_bad",        "Mark bad"),
+        Binding("e",             "manage_envs",     "Environments"),
+        Binding("f5",            "dt_select",       "Select", key_display="↵/→/dbl-click"),
+    ]
+
+    def __init__(self, model: "AIModel | None", server: ServerSoftware, preselect_env: str | None = None) -> None:
+        super().__init__()
+        self._model  = model
+        self._server = server
+        self._envs: list[Environment] = []
+        self._preselect_env = preselect_env
+
+    def compose(self) -> ComposeResult:
+        model_part = f"  ·  {self._model.name}  ·  {self._model.format_tag}" if self._model else ""
+        yield Header()
+        yield Label(f"[bold]Select environment for:[/]  {self._server.label}{model_part}", id="screen-title")
+        table = DataTable(id="env-list", cursor_type="row", show_header=False)
+        table.add_column("", key="status")
+        table.add_column("", key="default")
+        table.add_column("Environment", key="env")
+        table.add_column("Note", key="note")
+        yield table
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._populate()
+        target = self._preselect_env or getattr(ENVIRONMENTS.default_for(self._server.id), "name", None)
+        idx = next((i for i, e in enumerate(self._envs) if e.name == target), 0)
+        self.query_one("#env-list", DataTable).move_cursor(row=idx)
+
+    def on_screen_resume(self) -> None:
+        self._populate()
+
+    def _populate(self) -> None:
+        table = self.query_one("#env-list", DataTable)
+        saved_row = table.cursor_row
+        table.clear()
+        self._envs = ENVIRONMENTS.for_server(self._server.id)
+        for env in self._envs:
+            dot = (
+                SERVER_STATUS_DOT[self._model.env_best_status(self._server.id, env.name)]
+                if self._model is not None else ""
+            )
+            table.add_row(
+                dot,
+                "[yellow]★[/]" if env.default else "",
+                _env_brief(self._server, env),
+                f"[dim]{env.note}[/]",
+                key=env.name,
+            )
+        table.move_cursor(row=min(saved_row, max(0, len(self._envs) - 1)))
+        self.refresh_bindings()
+
+    def _focused_env(self) -> Environment | None:
+        idx = self.query_one("#env-list", DataTable).cursor_row
+        return self._envs[idx] if 0 <= idx < len(self._envs) else None
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in ("mark_good", "mark_bad", "mark_unknown"):
+            env = self._focused_env()
+            if self._model is None or env is None:
+                return False
+            if self._server.available_runtime_quants(self._model.format):
+                return False
+            current = self._model.status_for(self._server.id, env.name)
+            if action == "mark_good":    return current != "good"
+            if action == "mark_bad":     return current != "bad"
+            if action == "mark_unknown": return current != "unknown"
+        return True
+
+    def _set_status(self, status: str) -> None:
+        env = self._focused_env()
+        if self._model is None or env is None:
+            return
+        try:
+            launcher.save_server_status(self._model, self._server.id, env.name, status, quant=None)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=5)
+            return
+        self._populate()
+        self.notify(f"{self._model.name} / {self._server.label} / {env.name} → {status}", timeout=2)
+
+    def action_mark_good(self)    -> None: self._set_status("good")
+    def action_mark_bad(self)     -> None: self._set_status("bad")
+    def action_mark_unknown(self) -> None: self._set_status("unknown")
+
+    def action_manage_envs(self) -> None:
+        self.app.push_screen(EnvManageScreen(self._server))
+
+    def action_dt_select(self) -> None:
+        env = self._focused_env()
+        if env is not None:
+            _continue_launch(self, self._model, self._server, env)
+
+    @on(DataTable.RowSelected)
+    def on_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.action_dt_select()
+
+# ---------------------------------------------------------------------------
+# Reusable dialogs — text prompt, button choice, streamed external command
+# ---------------------------------------------------------------------------
+
+class TextPromptScreen(Screen["str | None"]):
+    """Ask for one line of text.  Dismisses with the stripped value, or None on cancel.
+
+    validate(value) returns an error message to reject the value, or None to accept it.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("escape", "cancel", "Cancel", key_display="esc"),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        prompt: str = "",
+        initial: str = "",
+        placeholder: str = "",
+        validate: "Callable[[str], str | None] | None" = None,
+    ) -> None:
+        super().__init__()
+        self._title       = title
+        self._prompt      = prompt
+        self._initial     = initial
+        self._placeholder = placeholder
+        self._validate    = validate
+
+    def compose(self) -> ComposeResult:
+        prompt = f"\n[dim]{self._prompt}[/]" if self._prompt else ""
+        yield Header()
+        yield Vertical(
+            Label(f"[bold]{self._title}[/]{prompt}", id="screen-title"),
+            Input(value=self._initial, placeholder=self._placeholder, id="prompt-input"),
+            Horizontal(
+                Button("OK",     variant="success", id="btn-ok"),
+                Button("Cancel", variant="default", id="btn-cancel"),
+                id="confirm-buttons",
+            ),
+            id="confirm-body",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-input", Input).focus()
+
+    def _submit(self, value: str) -> None:
+        value = value.strip()
+        if self._validate is not None and (err := self._validate(value)):
+            self.notify(err, severity="error", timeout=4)
+            return
+        self.dismiss(value)
+
+    @on(Input.Submitted)
+    def on_submitted(self, event: Input.Submitted) -> None:
+        self._submit(event.value)
+
+    @on(Button.Pressed, "#btn-ok")
+    def on_ok(self) -> None:
+        self._submit(self.query_one("#prompt-input", Input).value)
+
+    @on(Button.Pressed, "#btn-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ChoiceScreen(ButtonMenuScreen):
+    """Present a message and a vertical list of buttons.
+
+    choices: (choice_id, label, button_variant) tuples.  Dismisses with the
+    chosen choice_id, or None on Esc.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("escape,left",  "cancel",        "Cancel", key_display="esc/←"),
+        Binding("enter,right",  "press_focused", "Select", key_display="↵/→/Space"),
+    ]
+
+    def __init__(self, title: str, message: str, choices: "list[tuple[str, str, str]]") -> None:
+        super().__init__()
+        self._title   = title
+        self._message = message
+        self._choices = choices
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Label(f"[bold]{self._title}[/]", id="menu-title")
+        yield Static(self._message, id="choice-message")
+        yield Vertical(
+            *(
+                Button(label, id=f"choice-{i}", variant=variant)  # type: ignore[arg-type]
+                for i, (_, label, variant) in enumerate(self._choices)
+            ),
+            id="main-menu-buttons",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query("Button").first().focus()
+
+    @on(Button.Pressed)
+    def on_button(self, event: Button.Pressed) -> None:
+        idx = int((event.button.id or "choice-0").rsplit("-", 1)[-1])
+        self.dismiss(self._choices[idx][0])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CommandRunScreen(Screen[bool]):
+    """Run an external command (e.g. conda) with live output.  Dismisses with success.
+
+    The screen cannot be left while the command runs — interrupting conda
+    mid-operation could leave a half-created or half-renamed environment.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("escape", "close", "Close", key_display="esc"),
+    ]
+
+    def __init__(self, title: str, argv: list[str]) -> None:
+        super().__init__()
+        self._title   = title
+        self._argv    = argv
+        self._busy = True
+        self._ok      = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Label(f"[bold]{self._title}[/]", id="screen-title")
+        yield Static(f"[dim]$ {launcher.format_cmd(self._argv)}[/]", id="cmd-line")
+        yield Log(id="cmd-log", highlight=False)
+        yield Label("[yellow]Running…[/]", id="cmd-status")
+        yield Horizontal(
+            Button("Close", variant="default", id="btn-close", disabled=True),
+            id="confirm-buttons",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._run()
+
+    @work(thread=True)
+    def _run(self) -> None:
+        log = self.query_one("#cmd-log", Log)
+        try:
+            # Text mode translates the \r of progress bars into line breaks.
+            proc = subprocess.Popen(
+                self._argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except OSError as e:
+            self.app.call_from_thread(log.write_line, str(e))
+            self.app.call_from_thread(self._done, -1)
+            return
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            self.app.call_from_thread(log.write_line, line.rstrip("\n"))
+        self.app.call_from_thread(self._done, proc.wait())
+
+    def _done(self, rc: int) -> None:
+        self._busy = False
+        self._ok = rc == 0
+        status = "[bright_green]Completed successfully.[/]" if self._ok else f"[bright_red]Failed (exit code {rc}).[/]"
+        self.query_one("#cmd-status", Label).update(status)
+        btn = self.query_one("#btn-close", Button)
+        btn.disabled = False
+        btn.focus()
+
+    @on(Button.Pressed, "#btn-close")
+    def action_close(self) -> None:
+        if self._busy:
+            self.notify("Still running — wait for the command to finish", severity="warning", timeout=3)
+            return
+        self.dismiss(self._ok)
+
+
+# ---------------------------------------------------------------------------
+# Environment management — register / create / rename / remove per server
+# ---------------------------------------------------------------------------
+
+class EnvManageScreen(DataTableScreen):
+    """Manage the environments registered for one server.
+
+    a  — register an environment (offers to create it when it does not exist)
+    c  — create the focused environment when it is missing (kinds that support it)
+    r  — rename (renames the underlying conda env and migrates recorded results)
+    d  — unregister, optionally deleting the underlying conda env
+    s  — make the focused environment the server's default
+    n  — edit the note shown next to the environment
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("q",        "quit_app",       "Quit"),
+        Binding("escape,b", "app.pop_screen", "Back", key_display="esc/←"),
+        Binding("a",        "add",            "Add"),
+        Binding("c",        "create",         "Create"),
+        Binding("r",        "rename",         "Rename"),
+        Binding("d",        "delete",         "Remove"),
+        Binding("s",        "set_default",    "Set default"),
+        Binding("n",        "edit_note",      "Note"),
+    ]
+
+    def __init__(self, server: ServerSoftware) -> None:
+        super().__init__()
+        self._server = server
+        self._kind   = env_kind(server.env_kind)
+        self._envs: list[Environment] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Label(
+            f"[bold]Environments for:[/]  {self._server.label}  [dim]({self._kind.kind_label})[/]",
+            id="screen-title",
+        )
+        table = DataTable(id="env-manage-list", cursor_type="row")
+        table.add_column("★",        key="default")
+        table.add_column("Name",     key="name")
+        table.add_column("Versions", key="versions")
+        table.add_column("Note",     key="note")
+        yield table
+        yield Label("", id="env-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._populate()
+
+    def _populate(self, focus_name: str | None = None) -> None:
+        table = self.query_one("#env-manage-list", DataTable)
+        saved_row = table.cursor_row
+        table.clear()
+        self._envs = ENVIRONMENTS.for_server(self._server.id)
+        for env in self._envs:
+            exists = env.exists()
+            table.add_row(
+                "[yellow]★[/]" if env.default else "",
+                env.name if exists else f"[red]{env.name}  (missing)[/]",
+                self._server.env_version_label(env) if exists else "",
+                env.note,
+                key=env.name,
+            )
+        row = next((i for i, e in enumerate(self._envs) if e.name == focus_name), saved_row)
+        table.move_cursor(row=min(row, max(0, len(self._envs) - 1)))
+        self._update_detail()
+        self.refresh_bindings()
+
+    def _focused_env(self) -> Environment | None:
+        idx = self.query_one("#env-manage-list", DataTable).cursor_row
+        return self._envs[idx] if 0 <= idx < len(self._envs) else None
+
+    def _update_detail(self) -> None:
+        env = self._focused_env()
+        label = self.query_one("#env-detail", Label)
+        if env is None:
+            label.update("[dim]No environments registered — press a to add one.[/]")
+            return
+        shared = [e.server_id for e in ENVIRONMENTS.sharing(env) if e is not env]
+        parts = [f"[dim]{env.kind_label}:[/] {env.location}"]
+        if not env.exists():
+            parts.append("[red]not found on disk[/]")
+        if shared:
+            parts.append(f"[dim]also used by:[/] {', '.join(shared)}")
+        label.update("   ·   ".join(parts))
+
+    @on(DataTable.RowHighlighted)
+    def on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._update_detail()
+        self.refresh_bindings()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        env = self._focused_env()
+        if action in ("rename", "delete", "edit_note"):
+            return env is not None
+        if action == "set_default":
+            return env is not None and not env.default
+        if action == "create":
+            return env is not None and env.supports_create and not env.exists()
+        return True
+
+    # -- helpers ---------------------------------------------------------------
+
+    def _validate_new_name(self, name: str) -> str | None:
+        if err := Environment.validate_name(name):
+            return err
+        if ENVIRONMENTS.get(self._server.id, name) is not None:
+            return f"{name!r} is already registered for {self._server.label}"
+        return None
+
+    async def _create(self, env: Environment, allow_register_only: bool) -> bool | None:
+        """Offer to create a missing environment.
+
+        Returns True when created, False when the user chose to register it
+        without creating it, None when cancelled or creation failed.
+        """
+        seen: set[Path] = set()
+        sources: list[Environment] = []
+        # Same-server environments first: cloning a sibling is the usual way to try an upgrade.
+        for src in sorted(ENVIRONMENTS.all(), key=lambda e: e.server_id != self._server.id):
+            if type(src) is type(env) and src.exists() and src.location not in seen:
+                seen.add(src.location)
+                sources.append(src)
+        choices = [("empty", "Create an empty environment", "primary")]
+        choices += [(f"clone-{i}", f"Clone {src.name}  ({src.server_id})", "primary") for i, src in enumerate(sources)]
+        if allow_register_only:
+            choices.append(("register", "Register without creating", "warning"))
+        choices.append(("cancel", "Cancel", "default"))
+        choice = await self.app.push_screen_wait(ChoiceScreen(
+            f"Create environment {env.name!r}?",
+            f"No {env.kind_label} environment exists at {env.location}.",
+            choices,
+        ))
+        if choice in (None, "cancel"):
+            return None
+        if choice == "register":
+            return False
+        if choice == "empty":
+            version = await self.app.push_screen_wait(TextPromptScreen(
+                f"Create {env.name}", "Python version:", initial="3.11",
+                validate=lambda v: None if re.fullmatch(r"\d+(\.\d+)*", v) else "Enter a version such as 3.11",
+            ))
+            if version is None:
+                return None
+            argv = env.create_cmd(python_version=version)
+        else:
+            argv = env.create_cmd(clone_from=sources[int(choice.rsplit("-", 1)[-1])].name)
+        ok = await self.app.push_screen_wait(CommandRunScreen(f"Creating {env.name}", argv))
+        return True if ok else None
+
+    # -- actions -----------------------------------------------------------------
+
+    @work(exclusive=True)
+    async def action_add(self) -> None:
+        name = await self.app.push_screen_wait(TextPromptScreen(
+            f"Add {self._kind.kind_label} environment for {self._server.label}", "Name:",
+            placeholder="e.g. vllm-next", validate=self._validate_new_name,
+        ))
+        if name is None:
+            return
+        extras: dict[str, str] = {}
+        for fld in self._kind.extra_fields:
+            value = await self.app.push_screen_wait(TextPromptScreen(
+                f"Add {name}", f"{fld.label}:", placeholder=fld.placeholder,
+                validate=lambda v: None if v else "A value is required",
+            ))
+            if value is None:
+                return
+            extras[fld.key] = value
+        env = Environment.from_dict(self._server.id, {"kind": self._kind.kind, "name": name, **extras})
+        if not env.exists():
+            if env.supports_create:
+                if await self._create(env, allow_register_only=True) is None:
+                    return
+            else:
+                choice = await self.app.push_screen_wait(ChoiceScreen(
+                    f"{env.location} not found",
+                    "The environment does not exist yet.  Register it anyway?",
+                    [("register", "Register anyway", "warning"), ("cancel", "Cancel", "default")],
+                ))
+                if choice != "register":
+                    return
+        try:
+            ENVIRONMENTS.add(env)
+        except ValueError as e:
+            self.notify(str(e), severity="error", timeout=5)
+            return
+        self._populate(focus_name=env.name)
+        self.notify(f"Registered {env.name} for {self._server.label}", timeout=3)
+
+    @work(exclusive=True)
+    async def action_create(self) -> None:
+        env = self._focused_env()
+        if env is None:
+            return
+        if await self._create(env, allow_register_only=False):
+            self.notify(f"Created {env.name}", timeout=3)
+        self._populate(focus_name=env.name)
+
+    @work(exclusive=True)
+    async def action_rename(self) -> None:
+        env = self._focused_env()
+        if env is None:
+            return
+        new_name = await self.app.push_screen_wait(TextPromptScreen(
+            f"Rename {env.name}", "New name:", initial=env.name,
+            validate=lambda v: None if v == env.name else ENVIRONMENTS.rename_conflict(env, v),
+        ))
+        if new_name is None or new_name == env.name:
+            return
+        argv = env.rename_cmd(new_name) if env.exists() else None
+        if argv is not None:
+            shared = [e.server_id for e in ENVIRONMENTS.sharing(env) if e is not env]
+            message = f"This renames the {env.kind_label} environment on disk."
+            if shared:
+                message += f"\nIts registrations for {', '.join(shared)} are renamed too."
+            choice = await self.app.push_screen_wait(ChoiceScreen(
+                f"Rename {env.name} → {new_name}?", message,
+                [("rename", "Rename", "warning"), ("cancel", "Cancel", "default")],
+            ))
+            if choice != "rename":
+                return
+            if not await self.app.push_screen_wait(CommandRunScreen(f"Renaming {env.name} → {new_name}", argv)):
+                return
+        try:
+            launcher.apply_env_rename(env, new_name)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=5)
+            return
+        self._populate(focus_name=new_name)
+        self.notify(f"Renamed to {new_name}", timeout=3)
+
+    @work(exclusive=True)
+    async def action_delete(self) -> None:
+        env = self._focused_env()
+        if env is None:
+            return
+        shared = [e.server_id for e in ENVIRONMENTS.sharing(env) if e is not env]
+        n_results = launcher.count_env_status(self._server.id, env.name)
+        lines = [f"Unregister {env.name!r} from {self._server.label}?"]
+        if n_results:
+            lines.append(f"Recorded test results for {n_results} model(s) will be removed.")
+        if shared:
+            lines.append(f"The {env.kind_label} environment is also used by {', '.join(shared)} and will be kept.")
+        argv = env.remove_cmd() if env.exists() and not shared else None
+        choices = [("unregister", "Unregister only", "warning")]
+        if argv is not None:
+            choices.append(("delete", f"Unregister and delete the {env.kind_label} environment", "error"))
+        choices.append(("cancel", "Cancel", "default"))
+        choice = await self.app.push_screen_wait(ChoiceScreen(f"Remove {env.name}", "\n".join(lines), choices))
+        if choice == "delete":
+            assert argv is not None
+            if not await self.app.push_screen_wait(CommandRunScreen(f"Deleting {env.name}", argv)):
+                return
+        elif choice != "unregister":
+            return
+        try:
+            launcher.apply_env_removal(env)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=5)
+            return
+        self._populate()
+        self.notify(f"Removed {env.name}", timeout=3)
+
+    def action_set_default(self) -> None:
+        env = self._focused_env()
+        if env is None:
+            return
+        ENVIRONMENTS.set_default(env)
+        self._populate(focus_name=env.name)
+        self.notify(f"{env.name} is now the default for {self._server.label}", timeout=3)
+
+    @work(exclusive=True)
+    async def action_edit_note(self) -> None:
+        env = self._focused_env()
+        if env is None:
+            return
+        note = await self.app.push_screen_wait(TextPromptScreen(
+            f"Note for {env.name}", "Shown next to the environment (blank to clear):", initial=env.note,
+        ))
+        if note is None:
+            return
+        ENVIRONMENTS.set_note(env, note)
+        self._populate(focus_name=env.name)
+
 
 # ---------------------------------------------------------------------------
 # Level 3b (optional) — Runtime quantization selection
@@ -413,10 +1061,11 @@ class QuantSelectScreen(DataTableScreen):
         Binding("f5",            "dt_select",       "Select", key_display="↵/→/dbl-click"),
     ]
 
-    def __init__(self, model: AIModel, server: ServerSoftware) -> None:
+    def __init__(self, model: AIModel, server: ServerSoftware, env: Environment) -> None:
         super().__init__()
         self._model  = model
         self._server = server
+        self._env    = env
         # None at index 0 = load at full precision; then the available quant modes.
         quants = server.available_runtime_quants(model.format)
         self._options: list[RuntimeQuant | None] = [None, *quants]
@@ -439,7 +1088,7 @@ class QuantSelectScreen(DataTableScreen):
         yield Label(
             f"[bold]Select runtime quantization for:[/]  "
             f"[{color}]{self._model.name}  \u00b7  {self._model.format_tag}"
-            f"  \u00b7  {self._server.label}[/]",
+            f"  \u00b7  {self._server.label}  \u00b7  {self._env.name}[/]",
             id="screen-title",
         )
         table = DataTable(id="quant-list", cursor_type="row", show_header=False)
@@ -481,14 +1130,14 @@ class QuantSelectScreen(DataTableScreen):
             return f"[bright_green]{text}[/]" if fits is True else text
 
         table.add_row(
-            SERVER_STATUS_DOT[self._model.status_for(self._server.id, None)],
+            SERVER_STATUS_DOT[self._model.status_for(self._server.id, self._env.name, None)],
             _label("None (load at full precision)", fits_full),
             key="none",
         )
         for q in self._options[1:]:
             if q is not None:
                 table.add_row(
-                    SERVER_STATUS_DOT[self._model.status_for(self._server.id, q)],
+                    SERVER_STATUS_DOT[self._model.status_for(self._server.id, self._env.name, q)],
                     _label(RUNTIME_QUANT_LABEL[q], True if q in fit_quants else (None if self._total_gb is None else False)),
                     key=q.value,
                 )
@@ -500,7 +1149,7 @@ class QuantSelectScreen(DataTableScreen):
             valid, quant = self._quant_at_cursor()
             if not valid:
                 return False
-            current = self._model.status_for(self._server.id, quant)
+            current = self._model.status_for(self._server.id, self._env.name, quant)
             if action == "mark_good":    return current != "good"
             if action == "mark_bad":     return current != "bad"
             if action == "mark_unknown": return current != "unknown"
@@ -511,14 +1160,14 @@ class QuantSelectScreen(DataTableScreen):
         if not valid:
             return
         try:
-            launcher.save_server_status(self._model, self._server.id, status, quant=quant)
+            launcher.save_server_status(self._model, self._server.id, self._env.name, status, quant=quant)
         except Exception as e:
             self.notify(str(e), severity="error", timeout=5)
             return
         self._populate()
         quant_label = RUNTIME_QUANT_LABEL[quant] if quant else "None (full precision)"
         self.notify(
-            f"{self._model.name} / {self._server.label} / {quant_label} \u2192 {status}",
+            f"{self._model.name} / {self._server.label} / {self._env.name} / {quant_label} \u2192 {status}",
             timeout=2,
         )
 
@@ -531,7 +1180,7 @@ class QuantSelectScreen(DataTableScreen):
         if not (0 <= idx < len(self._options)):
             return
         quant = self._options[idx]
-        self.app.push_screen(GpuSelectScreen(self._server, self._model, quant))
+        self.app.push_screen(GpuSelectScreen(self._server, self._env, self._model, quant))
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -563,11 +1212,13 @@ class GpuSelectScreen(DataTableScreen):
     def __init__(
         self,
         server: ServerSoftware,
+        env: Environment,
         model: "AIModel | None",
         runtime_quant: "RuntimeQuant | None" = None,
     ) -> None:
         super().__init__()
         self._server       = server
+        self._env          = env
         self._model        = model
         self._runtime_quant = runtime_quant
         # Non-error rows only — maps SelectionList index → GpuRow.
@@ -581,7 +1232,7 @@ class GpuSelectScreen(DataTableScreen):
         mode_note  = "  [dim](single GPU only)[/]" if self._server.max_gpus == 1 else ""
         yield Header()
         yield Label(
-            f"[bold]Select GPUs for:[/]  {self._server.label}{model_part}{mode_note}",
+            f"[bold]Select GPUs for:[/]  {self._server.label}  ·  {self._env.name}{model_part}{mode_note}",
             id="screen-title",
         )
         yield SelectionList(id="gpu-list")
@@ -618,11 +1269,11 @@ class GpuSelectScreen(DataTableScreen):
     def _skip_to_confirm(self) -> None:
         """Fall back to ConfirmLaunch with the default CUDA_VISIBLE_DEVICES when no GPUs found."""
         self.app.pop_screen()
-        server, model, quant = self._server, self._model, self._runtime_quant
-        command = launcher.build_launch_command(server, model, quant)
-        factory = lambda edited, s=server, m=model, q=quant: launcher.launch(s, m, q, command=edited)
+        server, env, model, quant = self._server, self._env, self._model, self._runtime_quant
+        command = launcher.build_launch_command(server, env, model, quant)
+        factory = lambda edited, s=server, e=env, m=model, q=quant: launcher.launch(s, e, m, q, command=edited)
         self.app.push_screen(
-            ConfirmLaunch(command, factory, model, server)
+            ConfirmLaunch(command, factory, model, server, env)
         )
 
     @on(SelectionList.SelectionToggled)
@@ -709,6 +1360,7 @@ class GpuSelectScreen(DataTableScreen):
         try:
             command = launcher.build_launch_command(
                 self._server,
+                self._env,
                 self._model,
                 self._runtime_quant,
                 cuda_devices=cuda_devices,
@@ -717,11 +1369,11 @@ class GpuSelectScreen(DataTableScreen):
         except Exception as e:
             self.notify(str(e), severity="error", timeout=5)
             return
-        server, model, quant, d, po = self._server, self._model, self._runtime_quant, cuda_devices, param_overrides
-        factory = lambda edited, s=server, m=model, q=quant, d=d, po=po: launcher.launch(
-            s, m, q, cuda_devices=d, param_overrides=po, command=edited
+        server, env, model, quant, d, po = self._server, self._env, self._model, self._runtime_quant, cuda_devices, param_overrides
+        factory = lambda edited, s=server, e=env, m=model, q=quant, d=d, po=po: launcher.launch(
+            s, e, m, q, cuda_devices=d, param_overrides=po, command=edited
         )
-        self.app.push_screen(ConfirmLaunch(command, factory, model, server))
+        self.app.push_screen(ConfirmLaunch(command, factory, model, server, env))
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +1419,7 @@ class QuantizeToolScreen(DataTableScreen):
             return
         tool = self._tools[idx]
         if not launcher.quant_tool_available(tool):
-            if tool.auto_install_cmd:
+            if tool.pip_package:
                 self.app.push_screen(QuantToolInstallScreen(self._model, tool))
             else:
                 self.notify(tool.install_note or f"{tool.label} is not available.", timeout=8)
@@ -786,7 +1438,8 @@ class QuantizeToolScreen(DataTableScreen):
 class QuantToolInstallScreen(ButtonMenuScreen):
     """Offer to auto-install a missing quantization tool dependency.
 
-    Used when a tool declares an auto_install_cmd (e.g. exllamav2 via pip).
+    Used when a tool declares a pip_package (e.g. exllamav2), installed into the
+    tool's environment (the default environment of tool.env_server_id).
     The install runs in a background thread so the TUI remains responsive.
     On success the screen pops itself and pushes QuantizeOptionScreen.
     """
@@ -804,13 +1457,14 @@ class QuantToolInstallScreen(ButtonMenuScreen):
         self._installing = False
 
     def compose(self) -> ComposeResult:
-        pkg = self._tool.auto_install_cmd[-1] if self._tool.auto_install_cmd else "(unknown)"
-        env_name = CONFIG.tabby_env  # exl2 always uses tabby env
+        pkg = self._tool.pip_package or "(unknown)"
+        env = launcher.quant_tool_env(self._tool)
+        env_name = env.name if env is not None else f"(no {self._tool.env_server_id} environment)"
         yield Header()
         yield Vertical(
             Static(
                 f"[bold]{self._tool.label}[/] requires [bold]{pkg}[/],\n"
-                f"which is not installed in the [dim]{env_name}[/] conda environment.\n\n"
+                f"which is not installed in the [dim]{env_name}[/] environment.\n\n"
                 "Press [bold]Enter[/] to install it now, or [bold]Esc[/] to cancel.",
                 id="install-text",
             ),
@@ -833,7 +1487,7 @@ class QuantToolInstallScreen(ButtonMenuScreen):
         self._installing = True
         self.query_one("#btn-install", Button).disabled = True
         self.query_one("#btn-cancel", Button).disabled = True
-        pkg = self._tool.auto_install_cmd[-1] if self._tool.auto_install_cmd else ""
+        pkg = self._tool.pip_package
         self.query_one("#install-text", Static).update(
             f"Installing [bold]{pkg}[/]…\n"
             "(This may take 1–2 minutes. Do not close this window.)"
@@ -1439,7 +2093,7 @@ class ModelSelectScreen(DataTableScreen):
         if len(applicable) == 1:
             tool = applicable[0]
             if not launcher.quant_tool_available(tool):
-                if tool.auto_install_cmd:
+                if tool.pip_package:
                     self.app.push_screen(QuantToolInstallScreen(model, tool))
                 else:
                     self.notify(tool.install_note or f"{tool.label} is not available.", timeout=8)

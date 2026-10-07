@@ -7,9 +7,10 @@ Copy models_local.py.example → models_local.py to get started.
 
 Adding a new server:
   1. Create a ServerSoftware() entry in SERVERS below, including any launch-time
-     fields (strip_pythonpath, cuda_home, uses_staging_dir, staging_format_suffixes,
-     launch_cwd) that the server requires.
+     fields (env_kind, version_packages, strip_pythonpath, cuda_home, uses_staging_dir,
+     staging_format_suffixes, launch_cwd) that the server requires.
   2. Create a matching builder function in launch.py and register it in _BUILDERS.
+  3. Register at least one environment for it in user_data/environments.json.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from pathlib import Path
 
 from launcher.models import (
     AIModel, AIType, CacheMount, GGUFQuant, ModelFormat,
-    QuantizationTool, RuntimeQuant, ServerSoftware,
+    QuantizationTool, RuntimeQuant, ServerSoftware, VersionProbe,
 )
 from launcher.config import CONFIG
 
@@ -66,6 +67,16 @@ SERVERS: list[ServerSoftware] = [
             "enforce_eager":     False,
             # False = omit the flag (vLLM enables chunked prefill itself when helpful).
             "chunked_prefill":   False,
+            # True = --enable-expert-parallel: MoE experts are distributed whole across
+            # the TP ranks instead of each expert being TP-sharded.  Set per-model for
+            # MoE checkpoints whose expert widths do not split evenly into their FP8
+            # quantization blocks at the chosen TP (e.g. Qwen3.8-Flash-Next at TP8).
+            "expert_parallel":   False,
+            # True = --max-model-len -1: vLLM starts from the model's native context and
+            # lowers it only as far as needed to fit the KV cache in memory (logged as
+            # "Auto-fit max_model_len").  The model's ctx / ctx_override is not passed.
+            # Set per-model for memory-tight models where the native context may not fit.
+            "auto_fit_ctx":      False,
             # False = pass --no-enable-log-requests (quieter logs).  True enables
             # per-request logging.
             "log_requests":      False,
@@ -80,19 +91,16 @@ SERVERS: list[ServerSoftware] = [
         supported_runtime_quants=(RuntimeQuant.BNB_INT8,),
         # Prevent the vllm source tree (if present in PYTHONPATH) from shadowing
         # the installed package.  CWD /tmp ensures no local vllm/ dir is on sys.path.
+        version_packages=("vllm",),
         strip_pythonpath=True,
         launch_cwd="/tmp",
-        # vLLM 0.25+ uses cu13 split wheels: shared libs live inside the Python package
-        # tree (nvidia/cu13/lib/) and are not automatically on LD_LIBRARY_PATH.
-        # CUDA_HOME points nvcc / JIT compilers at the bundled CUDA 13 toolkit.
-        # LIBRARY_PATH + the libcudart.so symlink let flashinfer's runtime JIT link
-        # against the bundled cudart (the wheel ships only libcudart.so.13).
-        cuda_home=CONFIG.vllm_cuda_home,
-        ld_library_path_prepend=CONFIG.vllm_cuda_libs,
-        library_path_prepend=CONFIG.vllm_cuda_libs,
-        lib_symlinks={"libcudart.so": "libcudart.so.13"},
-        # VLLM_SLEEP_WHEN_IDLE: avoid 100% CPU spin in the engine loop while idle.
-        extra_env={"VLLM_SLEEP_WHEN_IDLE": "1"},
+        # vLLM 0.25+ uses cu13 split wheels: the CUDA toolkit lives inside the env's
+        # Python package tree (nvidia/cu13/) and is not automatically on LD_LIBRARY_PATH.
+        # Resolved per environment at launch: CUDA_HOME points nvcc / JIT compilers at
+        # the bundled toolkit; LIBRARY_PATH + the libcudart.so symlink let flashinfer's
+        # runtime JIT link against the bundled cudart (the wheel ships only libcudart.so.NN).
+        bundled_cuda_glob="nvidia/cu1[0-9]*",
+        lib_symlinks={"libcudart.so": "libcudart.so.[0-9]*"},
         # pipeline_parallel must equal the number of GPUs selected; GpuSelectScreen
         # will auto-inject param_overrides["pipeline_parallel"] = selected_gpu_count.
         gpu_count_param="pipeline_parallel",
@@ -111,6 +119,19 @@ SERVERS: list[ServerSoftware] = [
             "port":         CONFIG.server_ports.get("llamacpp", 5000),
             "extra_flags":  [],
         },
+        # llama.cpp is a native build: each environment is a build's bin/ directory.
+        env_kind="native",
+        # "version: 0.6.0-dev (build 11461, commit 4d756bc72)" (current) or
+        # "version: 10109 (0cea36222)" (older builds) → "llama.cpp b11461 (4d756bc72)"
+        version_probe=VersionProbe(
+            executable="llama-server",
+            args=("--version",),
+            patterns=(
+                r"\(build (?P<build>\d+), commit (?P<commit>\w+)\)",
+                r"version: (?P<build>\d+) \((?P<commit>\w+)\)",
+            ),
+            template="llama.cpp b{build} ({commit})",
+        ),
     ),
 
     ServerSoftware(
@@ -134,6 +155,7 @@ SERVERS: list[ServerSoftware] = [
         # tabbyAPI requires a models directory; launch.py creates a symlink named
         # model.id under model_dir pointing to the resolved model path.
         uses_staging_dir=True,
+        version_packages=("exllamav2", "exllamav3"),
         # flash-attn was built against cuda-12.5; CUDA_HOME ensures nvcc resolution.
         cuda_home=CONFIG.cuda_home_tabby,
     ),
@@ -243,6 +265,7 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.PYTORCH_BIN,
         }),
         supported_runtime_quants=(RuntimeQuant.BNB_INT8,),
+        version_packages=("sglang",),
         # flashinfer JIT-compiles CUDA kernels; CUDA_HOME points to the nvcc
         # compatible with gcc-13 (cuda-12.5 vs the bundled cuda-12.1 headers).
         cuda_home=CONFIG.cuda_home_sglang,
@@ -297,13 +320,14 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             GGUFQuant.Q8_0.value:   "Q8_0   (~8.5 bpw) ← reference",
         },
         # llama-quantize is a binary co-located with llama-server (same llama.cpp build).
-        # No separate installation is needed — if the llamacpp server is configured, this
-        # binary is already present.
-        avail_binary=str(CONFIG.llama_quantize),
+        # No separate installation is needed — it runs from the default llamacpp
+        # environment, so if llama.cpp is set up this tool is available.
+        env_server_id="llamacpp",
+        avail_executable="llama-quantize",
         install_note=(
-            f"llama-quantize binary not found at {CONFIG.llama_quantize}. "
-            "Build llama.cpp with CUDA support and set llama_server in config.toml — "
-            "llama-quantize is built alongside llama-server."
+            "llama-quantize not found in the default llama.cpp environment. "
+            "Build llama.cpp with CUDA support and register its bin/ directory as a "
+            "llama.cpp environment — llama-quantize is built alongside llama-server."
         ),
     ),
 
@@ -330,10 +354,11 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
         cuda_home=CONFIG.cuda_home_tabby,
         # exllamav2 is a pip-installable Python package (uses JIT CUDA compilation at
         # runtime, so no CUDA toolkit is required at install time).  It is already
-        # installed in the tabby conda env as a dependency of tabbyAPI — if tabbyAPI is
-        # set up, this tool is available with no further action.
-        avail_module=(str(CONFIG.tabby_python), "exllamav2"),
-        auto_install_cmd=(str(CONFIG.tabby_python), "-m", "pip", "install", "exllamav2"),
+        # installed in the default tabby environment as a dependency of tabbyAPI — if
+        # tabbyAPI is set up, this tool is available with no further action.
+        env_server_id="tabby",
+        avail_module="exllamav2",
+        pip_package="exllamav2",
     ),
 
 ]

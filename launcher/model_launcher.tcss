@@ -67,11 +67,40 @@ GpuTable DataTable {
 }
 
 #server-list,
+#env-list,
+#env-manage-list,
 #quant-list,
 #tool-list,
 #option-list {
     margin: 0 1;
     height: 1fr;
+}
+
+#env-detail {
+    height: 1;
+    margin: 0 1;
+    padding: 0 1;
+    background: $panel;
+    color: $text-muted;
+}
+
+/* ── Dialogs: choice / command run ───────────────────────────────────────── */
+#choice-message {
+    margin: 0 1 1 1;
+}
+
+#cmd-line {
+    margin: 0 1;
+}
+
+#cmd-log {
+    border: round $primary-darken-1;
+    margin: 0 1;
+    height: 1fr;
+}
+
+#cmd-status {
+    margin: 0 1;
 }
 
 #status-bar {

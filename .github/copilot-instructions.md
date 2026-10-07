@@ -78,6 +78,8 @@ cd ~/ai-server-tools
         config.py                   SiteConfig loader — reads user_data/config.toml, exposes CONFIG singleton
         config.toml.example         Tracked template — copy to user_data/config.toml and edit
         data.py                     SERVERS list + CACHE_MOUNTS (config-driven, safe to commit)
+        environments.py             Server environments (conda envs / native builds) + ENVIRONMENTS registry
+        environments.json.example   Tracked template — copy to user_data/environments.json
         gpu.py                      NVML poller (pynvml) + GpuRow data + formatting helpers
         ingest.py                   CLI tool — scans a directory for new models and appends entries to models_local.json
         launch.py                   Command builders, process spawner, cache manager
@@ -88,6 +90,7 @@ cd ~/ai-server-tools
         DESIGN.md                   Architecture and design decisions
         user_data/                  Gitignored — all machine-specific and personal data
             config.toml             Machine-specific paths and GPU counts
+            environments.json       Registered environments per server (maintained by the TUI)
             models_local.json       AI_MODELS catalog (model paths, quant details, test results)
     gpu_monitor/                    Standalone GPU stats Textual app
         __main__.py                 Entry point: python -m gpu_monitor
@@ -102,6 +105,27 @@ Models are organised by AI type in subdirectories, e.g. `~/fast_models/text-gene
 
 **Principle**: Never pass a model *directory* to any server. Always pass paths explicitly.
 Server tools scan config files at startup — on a NAS or slow drive this causes severe latency.
+
+---
+
+## llama.cpp
+
+Two native environments (registered in the launcher, `kind: native`):
+- **`llama.cpp`** (default) — `~/llama.cpp`, build b10109 (2026-07-24), `~/llama.cpp/build/bin`.
+- **`llama.cpp-next`** — `~/llama.cpp-next`, a **git worktree** of the same repo at the latest
+  `origin/master` (detached), built into `~/llama.cpp-next/build/bin` (b11461, 2026-10-07; includes
+  `qwen4exp` / Qwen3.8-Flash-Next support). Binaries use RUNPATH to their own `build/bin`, so the two
+  builds never share libraries.
+- **Build config** (identical for both): `/usr/bin/cmake` (the `~/.local/bin/cmake` pip shim is broken),
+  `-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.5/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=ON
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_GRAPHS=ON -DGGML_CUDA_NCCL=ON -DGGML_CUDA_COMPRESSION_MODE=size`.
+  nvcc 12.5 compiles (12.1's nvcc rejects GCC 13); CMake links the CUDA 12.1 runtime, matching the
+  system `LD_LIBRARY_PATH`.
+- **Update `llama.cpp-next`**: `cd ~/llama.cpp-next && git fetch origin && git checkout --detach origin/master
+  && /usr/bin/cmake --build build -j 32` (~10 min). The launcher shows each build's version
+  (`llama-server --version`, via `VersionProbe`); promote it with `s` (set default) in the
+  environment manager once validated.
 
 ---
 
@@ -161,9 +185,10 @@ bundled toolkit. Two constraints must hold, both wired into `launcher/data.py` /
   `pip install "nvidia-cuda-nvcc==13.0.88" "nvidia-nvvm==13.0.88" "nvidia-cuda-crt==13.0.88"`.
 - **Link-time cudart** — the cu13 wheel ships `libcudart.so.13` but omits the `libcudart.so` linker
   name and uses `lib/` (not `lib64/`). `launch.py` self-heals the `libcudart.so` symlink and sets
-  `LIBRARY_PATH`; `-lcuda` resolves against the system driver stub. All auto-applied at launch via
-  the vLLM `ServerSoftware` fields `cuda_home` / `ld_library_path_prepend` / `library_path_prepend`
-  / `lib_symlinks` (paths derived from `CONFIG.vllm_cuda_libs` / `vllm_cuda_home`, glob-discovered).
+  `LIBRARY_PATH`; `-lcuda` resolves against the system driver stub. All auto-applied at launch, per
+  environment, via the vLLM `ServerSoftware` fields `bundled_cuda_glob` (`nvidia/cu1[0-9]*`, found
+  in the chosen env's site-packages → `CUDA_HOME` + `lib/` on `LD_LIBRARY_PATH` / `LIBRARY_PATH`)
+  and `lib_symlinks` — so any additional vLLM environment (e.g. `vllm-next`) works the same way.
 - **flashinfer-cubin version lock** — vLLM 0.26.0 pins `flashinfer-python==0.6.14` and hard-checks
   that any installed `flashinfer-cubin` matches exactly (else `RuntimeError: flashinfer-cubin
   version does not match flashinfer version`). When the cubin package lags behind (0.6.14 unpublished
@@ -171,16 +196,37 @@ bundled toolkit. Two constraints must hold, both wired into `launcher/data.py` /
   0.6.14 kernels itself (needs `CUDA_HOME` + the link-time cudart fix above). Re-add the matching
   `flashinfer-cubin` once its version catches up to skip JIT.
 
+### `vllm-next` environment
+A second vLLM conda env registered in the launcher (cloned from `vllm`) for releases that add new
+architectures — currently vLLM **0.31.0**, torch **2.13.0+cu130**, flashinfer-python **0.7.0.post1**
+(no matching `flashinfer-cubin` → JIT), needed for `Qwen4Exp` (Qwen3.8-Flash-Next). The same
+cu13 rules apply: the 13.0.88 nvcc/nvvm/crt pins survived the upgrade (re-check after any upgrade),
+and the launcher wires the env's own bundled toolkit. vLLM 0.31 itself pins `torchaudio==2.11.0`
+alongside torch 2.13 (no newer torchaudio exists). flashinfer warns that `nvidia-cuda-tileiras`
+13.2.78 mismatches nvcc and falls back to the system tileiras — harmless (no 13.0 build exists;
+cuTile is unused on sm_86; same in the `vllm` env). Smoke-tested end-to-end (serve + completion).
+**Local patch (re-apply after any vLLM reinstall/upgrade until merged upstream)**: vllm-project/vllm#56362
+— the Qwen4Exp pinned-host PLE lookup kernel passes FP8 pointers to Triton, which rejects `fp8e4nv` on
+sm_8x ("type fp8e4nv not supported in this architecture"); the patch passes uint8 views (byte-identical
+copy). Apply from `site-packages/`:
+`curl -sfH "Accept: application/vnd.github.v3.diff" https://api.github.com/repos/vllm-project/vllm/pulls/56362 | patch -p1`.
+Qwen3.8-Flash-Next-FP8 catalog params: TP8 + `expert_parallel`, `gpu_mem_util` 0.95, `max_num_seqs` 16,
+`auto_fit_ctx` (at 0.90 / 256 seqs only ~52K ctx fit). Do not use `--kv-cache-dtype fp8` on Ampere — the
+QSA kernels would hit the same Triton fp8e4nv limitation. Loading from the NAS takes ~21 min.
+
 ### Parallelism
 - Executor backend is **not** forced by default — vLLM auto-selects `mp` (multiprocessing), which is simpler/more robust for this single node. Set `executor_backend` in `server_params["vllm"]` to `"ray"` only when a model needs it.
 - PCIe topology: pipeline parallelism preferred over tensor parallelism (activations only cross between adjacent GPU pairs)
-- **Attention-head constraint**: `--tensor-parallel-size` must evenly divide the model's attention head count (`num_attention_heads` in `config.json`). Use pipeline parallelism or tabbyAPI/ExLlamaV2 when TP=11 is not viable.
+- **Attention-head constraint**: `--tensor-parallel-size` must evenly divide the model's attention head count (`num_attention_heads` in `config.json`, or under `text_config` for multimodal checkpoints) and any linear-attention head counts. Use pipeline parallelism or tabbyAPI/ExLlamaV2 when TP=11 is not viable.
+- **No-PP architectures**: Qwen4Exp (Qwen3.8-Flash-Next) rejects PP > 1 (N-gram PLE embedding); `compute_parallelism` uses pure TP for archs in `_NO_PP_ARCHS` → TP=8 on 8 GPUs. Its block-FP8 experts (640 wide) don't split at TP8, so the catalog sets `expert_parallel: true` (`--enable-expert-parallel`). vLLM 0.31 offloads the 48 GiB PLE table to pinned host RAM by default (`--engram-config`, `cpu_offload=True`).
 
 ### Launch flags
 `_build_vllm` is minimal by default and data-driven via `default_params` (see launcher `DESIGN.md` → "vLLM launch flags"). Only always-on flags are `--model`, `--served-model-name`, `--tensor-parallel-size`, `--pipeline-parallel-size`, `--gpu-memory-utilization` (default **0.90**), `--max-model-len`, `--host`, `--port`. The rest are opt-in:
 - `--dtype` — omitted by default (`dtype="auto"` honours the model's `torch_dtype`); set per-model only when a checkpoint's native dtype must be overridden.
 - `--enforce-eager` — off by default (CUDA graphs enabled = faster); enable per-model (`enforce_eager: true`) only if graph capture OOMs.
 - `--enable-chunked-prefill` — off by default (vLLM enables it itself when helpful); enable per-model (`chunked_prefill: true`) if needed.
+- `--enable-expert-parallel` — off by default; enable per-model (`expert_parallel: true`) for MoE checkpoints whose experts can't be TP-sharded (FP8 block alignment).
+- `--max-model-len -1` — emitted instead of the model's ctx when `auto_fit_ctx: true`; vLLM auto-fits the context to the available KV-cache memory (check the log for "Auto-fit max_model_len").
 - `--max-num-seqs` — omitted by default (vLLM default 256); set per-model to cap concurrency for tight-memory models.
 - `--trust-remote-code` — emitted only when the model's `trust_remote_code` field is `true` (check `auto_map` in `config.json`).
 - `--enable-auto-tool-choice --tool-call-parser <name>` — emitted when the model's `tool_call_parser` field is set.
@@ -197,9 +243,10 @@ bundled toolkit. Two constraints must hold, both wired into `launcher/data.py` /
 See `launcher/models_local.json.example` for the full field schema.
 Schema types live in `launcher/models.py` (`ModelFormat` enum, `AIModel.from_dict()` deserialiser).
 Server definitions (SERVERS list, CACHE_MOUNTS) live in `launcher/data.py` (safe to commit).
+**Environments**: each server launches from a registered `Environment` (`launcher/environments.py`): `CondaEnvironment` (`<conda_base>/envs/<name>`) or `NativeEnvironment` (`bin_dir`, llama.cpp). Registry `ENVIRONMENTS` ↔ `launcher/user_data/environments.json` (`{"environments": {server_id: [{kind, name, default?, note?, …}]}}`), maintained by `EnvManageScreen` (`e` on the server list / env picker: add — offering conda create/clone when missing — create, rename via `conda rename`, remove with optional `conda env remove`, set default, note). Builders take `env` and use `env.python` / `env.executable(...)`; quantization tools run from their `env_server_id`'s default environment. Several envs per server allow testing upgrades (e.g. `vllm-next`) without breaking the known-good one.
 `path` field: absolute path to the model — any location (NAS, local SSD, etc.). Replaces the old `nas_path` field.
 `cached_path` field: optional faster local copy; written by `save_cached_path()` in `launch.py` after a successful rsync, cleared by passing `""`. `resolve_path()` returns `cached_path` when set and present on disk, else `path`.
-Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted per `(model, server, quant)` triple via `save_server_status()` in `launch.py` (JSON roundtrip, no regex). `server_status` in JSON is a nested dict: `{server_id: {quant_key: status}}` where `quant_key` is `"none"` (full/stored precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`). Multiple quant keys per server may be `"good"`. `best_status_for(server_id)` returns the best status across all quant entries for a server. `_quant_key(quant)` maps `RuntimeQuant | None` → string key.
+Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted per `(model, server, environment, quant)` via `save_server_status()` in `launch.py` (JSON roundtrip, no regex). `server_status` in JSON is a nested dict: `{server_id: {env_name: {quant_key: status}}}` where `quant_key` is `"none"` (full/stored precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`). Multiple quant keys may be `"good"`. `status_for(server_id, env_name, quant)`; `env_best_status(server_id, env_name)` = best across quants; `best_status_for(server_id)` = best across envs and quants. Env rename/removal migrates/drops results (`apply_env_rename()` / `apply_env_removal()`). `_quant_key(quant)` maps `RuntimeQuant | None` → string key.
 `ctx_override` field: optional launch override; `0` = use native `ctx`. Can be higher or lower than `ctx` (e.g. for RoPE-extended inference). Set interactively with `l` on the model list (`SetCtxOverrideScreen`). Persisted via `save_ctx_override()` — same JSON roundtrip pattern as `save_server_status()`.
 `favorite` field: boolean; `True` pins the model to the top of the sorted list. Toggled with `f` in `ModelSelectScreen`. Persisted via `save_favorite()` — key omitted from JSON when `False`. The `★` column shows `★` for favorites.
 `min_sm` field: integer minimum CUDA compute capability (e.g. `89` for sm_89+); `0` = no constraint. Checked against `system_min_sm()` from `gpu.py` (cached). When `model.hw_compat(system_sm)` is `False`, the warn column shows `⛔` and the note bar below the model table shows `model.hw_note`.
@@ -214,12 +261,12 @@ Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. D
 **GPU widget**: `gpu.py` contains `GpuRow`, `poll_gpus()`, and formatting helpers shared by both apps.
 The launcher does **not** embed GPU stats — run `gpu_monitor` separately while a model is loaded.
 
-**Flow** (text-gen): AITypeScreen → ModelSelectScreen → ServerSelectScreen → [QuantSelectScreen] → GpuSelectScreen → ConfirmLaunch → exits TUI → `Popen` → `proc.wait()`.
+**Flow** (text-gen): AITypeScreen → ModelSelectScreen → ServerSelectScreen → [EnvSelectScreen] → [QuantSelectScreen] → GpuSelectScreen → ConfirmLaunch → exits TUI with a `LaunchJob(factory, model, server, env)` → `Popen` → `proc.wait()`. `EnvSelectScreen` only appears when the server has >1 registered environment (default pre-focused); `_continue_launch()` refuses environments missing on disk.
 `GpuSelectScreen`: shows all GPUs with VRAM utilization; multi-select (Space) for multi-GPU servers, radio-button for `max_gpus=1` servers. `→`/`Enter` to confirm. `a` selects all. Status bar shows live `CUDA_VISIBLE_DEVICES` string and auto-adjusted `gpu_count_param` (e.g. `pipeline_parallel → N` for vLLM/SGLang). If NVML unavailable, skips to ConfirmLaunch with default devices. Selected devices → `cuda_devices` arg to `launch()`; GPU count → `param_overrides[gpu_count_param]` → `build_cmd()` last-layer merge.
-`QuantSelectScreen` (`g`/`x`/`?`): marks the focused quant option good/bad/unknown; shows status dots per option. `ServerSelectScreen` disables `g`/`x`/`?` for servers where `available_runtime_quants(model.format)` is non-empty — marking must be done in `QuantSelectScreen`.
+`g`/`x`/`?` marking happens on the deepest screen of the launch: `ServerSelectScreen` only for single-env servers without runtime quants for the model; `EnvSelectScreen` for multi-env servers without quants; `QuantSelectScreen` (per env + quant option) otherwise. Shallower screens disable the bindings via `check_action`.
 Path validation before GpuSelectScreen; missing files show a toast notification.
 
-**Flow** (image-gen / hub): AITypeScreen → ImageGenHubScreen → "Launch Server" → ServerSelectScreen(model=None) → GpuSelectScreen → ConfirmLaunch → exits TUI.
+**Flow** (image-gen / hub): AITypeScreen → ImageGenHubScreen → "Launch Server" → ServerSelectScreen(model=None) → [EnvSelectScreen] → GpuSelectScreen → ConfirmLaunch → exits TUI.
 "Manage Models" → ModelManageScreen → `→`/`Enter` → CacheActionScreen → CacheProgressScreen (rsync with live ProgressBar) or uncache.
 `uses_hub_flow(servers, ai_type)` returns `True` when every server for that AI type has `stage_all_models=True`.
 `ModelManageScreen` overrides `_open_model()` (template method in `ModelSelectScreen`) to push `CacheActionScreen`. The template method pattern is necessary because Textual calls all MRO classes' message handlers regardless of override — only plain method calls respect the most-derived class.
