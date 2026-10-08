@@ -21,9 +21,11 @@ from __future__ import annotations
 import functools
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, ClassVar
 
+from rich.markup import escape
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -42,6 +44,7 @@ from textual.widgets import (
     TextArea,
 )
 from textual.containers import Horizontal, Vertical
+from textual.worker import get_current_worker
 
 from launcher.gpu import poll_gpus, system_min_sm
 from launcher.models import (
@@ -67,6 +70,7 @@ from launcher.models import (
 )
 from launcher.data import AI_MODELS, CACHE_MOUNTS, QUANTIZATION_TOOLS, SERVERS
 from launcher.environments import ENVIRONMENTS, Environment, env_kind
+from launcher.fit import FitEstimate, estimate_fit, fit_probe_for
 import launcher.launch as launcher
 
 
@@ -1200,12 +1204,22 @@ class GpuSelectScreen(DataTableScreen):
     For servers with gpu_count_param set (vLLM, SGLang), the param is auto-injected
     into the launch command so parallelism flags stay consistent with GPU count.
     For servers with max_gpus=1, selection is enforced as radio-button style.
+
+    For servers with concurrency_param set (llama.cpp slots), +/- adjusts the number of
+    concurrent request slots; the value is remembered per model on launch.  When the
+    server has a fit probe (fit.py), a memory-fit estimate for the current selection is
+    computed in the background and shown below the status bar.
     """
+
+    _MAX_SLOTS = 64
+    _FIT_DEBOUNCE_S = 0.4   # settle time before re-running the (multi-second) fit probe
 
     BINDINGS: ClassVar = [
         Binding("q",             "quit_app",        "Quit"),
         Binding("escape,b",      "app.pop_screen",  "Back",    key_display="esc/←"),
         Binding("a",             "select_all",      "All GPUs"),
+        Binding("plus,equals_sign", "slots(1)",     "Slots+",  key_display="+"),
+        Binding("minus",         "slots(-1)",       "Slots−",  key_display="-"),
         Binding("f5",            "dt_select",       "Confirm", key_display="↵/→"),
     ]
 
@@ -1226,6 +1240,14 @@ class GpuSelectScreen(DataTableScreen):
         # Parallelism plan for TP/PP servers (vLLM, SGLang); recomputed on
         # every selection change so the status bar stays current.
         self._plan: launcher.ParallelismPlan | None = None
+        # Concurrent request slots (server.concurrency_param); None = not adjustable.
+        self._slots: int | None = None
+        if server.concurrency_param and model is not None:
+            self._slots = int(launcher.launch_params(server, model)[server.concurrency_param])
+        self._fit_probe = fit_probe_for(server, env) if model is not None else None
+        # Bumped on every settings change; results from older estimates are discarded.
+        self._fit_generation = 0
+        self._fit: FitEstimate | None = None
 
     def compose(self) -> ComposeResult:
         model_part = f"  ·  {self._model.name}" if self._model else ""
@@ -1237,6 +1259,7 @@ class GpuSelectScreen(DataTableScreen):
         )
         yield SelectionList(id="gpu-list")
         yield Label("", id="gpu-status")
+        yield Label("", id="gpu-fit")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1298,6 +1321,7 @@ class GpuSelectScreen(DataTableScreen):
         if not selected:
             label.update("[red]No GPUs selected — select at least one before confirming.[/]")
             self._plan = None
+            self._refresh_fit()
             return
         devices_str = ",".join(str(i) for i in selected)
         parts = [
@@ -1327,10 +1351,76 @@ class GpuSelectScreen(DataTableScreen):
         else:
             self._plan = None
         label.update("   ·   ".join(parts))
+        self._refresh_fit()
+
+    def _launch_settings(self) -> tuple[str, dict[str, Any]] | None:
+        """(CUDA_VISIBLE_DEVICES, param_overrides) for the current selection; None when nothing is selected."""
+        selected = sorted(self.query_one(SelectionList).selected)
+        if not selected:
+            return None
+        overrides: dict[str, Any] = {}
+        if self._plan is not None:
+            selected = selected[:self._plan.gpu_count]
+            overrides = {"tensor_parallel": self._plan.tp, "pipeline_parallel": self._plan.pp}
+        elif self._server.gpu_count_param:
+            overrides = {self._server.gpu_count_param: len(selected)}
+        if self._slots is not None and self._server.concurrency_param:
+            overrides[self._server.concurrency_param] = self._slots
+        return ",".join(str(i) for i in selected), overrides
+
+    # -- Slots and memory-fit estimate ------------------------------------
+
+    def _refresh_fit(self) -> None:
+        """Invalidate the current estimate, re-render, and schedule a new estimate."""
+        self._fit_generation += 1
+        self._fit = None
+        self._render_fit()
+        settings = self._launch_settings()
+        if self._fit_probe is not None and settings is not None:
+            self._estimate_fit(self._fit_generation, *settings)
+
+    @work(thread=True, exclusive=True, group="fit")
+    def _estimate_fit(self, generation: int, cuda_devices: str, overrides: dict[str, Any]) -> None:
+        # exclusive=True cancels the previous estimate's worker, whose probe then kills its subprocess.
+        worker = get_current_worker()
+        time.sleep(self._FIT_DEBOUNCE_S)
+        if worker.is_cancelled or self._model is None:
+            return
+        estimate = estimate_fit(
+            self._server, self._env, self._model, cuda_devices, overrides,
+            cancelled=lambda: worker.is_cancelled,
+        )
+        if not worker.is_cancelled:
+            self.app.call_from_thread(self._show_fit, generation, estimate)
+
+    def _show_fit(self, generation: int, estimate: FitEstimate | None) -> None:
+        if generation == self._fit_generation:
+            self._fit = estimate
+            self._render_fit()
+
+    def _render_fit(self) -> None:
+        parts: list[str] = []
+        if self._slots is not None and self._model is not None:
+            parts.append(f"Slots [bold]{self._slots}[/] × {fmt_ctx(self._model.effective_ctx)} ctx  [dim](+/-)[/]")
+        if self._fit_probe is not None and self.query_one(SelectionList).selected:
+            parts.append(_fit_markup(self._fit, self._slots))
+        label = self.query_one("#gpu-fit", Label)
+        label.update("   ·   ".join(parts))
+        label.set_class(not parts, "-empty")
+
+    def action_slots(self, delta: int) -> None:
+        if self._slots is None:
+            return
+        slots = max(1, min(self._MAX_SLOTS, self._slots + delta))
+        if slots != self._slots:
+            self._slots = slots
+            self._refresh_fit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "select_all":
             return self._server.max_gpus != 1
+        if action == "slots":
+            return self._slots is not None
         return True
 
     def action_select_all(self) -> None:
@@ -1338,25 +1428,11 @@ class GpuSelectScreen(DataTableScreen):
         self._refresh_status()
 
     def action_dt_select(self) -> None:
-        sl = self.query_one(SelectionList)
-        selected = sorted(sl.selected)
-        if not selected:
+        settings = self._launch_settings()
+        if settings is None:
             self.notify("Select at least one GPU", severity="warning", timeout=3)
             return
-        if self._plan is not None:
-            if self._plan.gpu_count < len(selected):
-                selected = selected[:self._plan.gpu_count]
-            cuda_devices    = ",".join(str(i) for i in selected)
-            param_overrides: dict[str, Any] | None = {
-                "tensor_parallel":   self._plan.tp,
-                "pipeline_parallel": self._plan.pp,
-            }
-        elif self._server.gpu_count_param:
-            cuda_devices    = ",".join(str(i) for i in selected)
-            param_overrides = {self._server.gpu_count_param: len(selected)}
-        else:
-            cuda_devices    = ",".join(str(i) for i in selected)
-            param_overrides = None
+        cuda_devices, param_overrides = settings
         try:
             command = launcher.build_launch_command(
                 self._server,
@@ -1369,11 +1445,44 @@ class GpuSelectScreen(DataTableScreen):
         except Exception as e:
             self.notify(str(e), severity="error", timeout=5)
             return
-        server, env, model, quant, d, po = self._server, self._env, self._model, self._runtime_quant, cuda_devices, param_overrides
-        factory = lambda edited, s=server, e=env, m=model, q=quant, d=d, po=po: launcher.launch(
-            s, e, m, q, cuda_devices=d, param_overrides=po, command=edited
-        )
+        server, env, model, quant, slots = self._server, self._env, self._model, self._runtime_quant, self._slots
+
+        def factory(edited: str):
+            if slots is not None and model is not None and server.concurrency_param:
+                launcher.save_server_param(model, server, server.concurrency_param, slots)
+            return launcher.launch(
+                server, env, model, quant,
+                cuda_devices=cuda_devices, param_overrides=param_overrides, command=edited,
+            )
+
         self.app.push_screen(ConfirmLaunch(command, factory, model, server, env))
+
+
+def _gib(mib: int) -> str:
+    return f"{mib / 1024:.0f}"
+
+
+def _fit_markup(estimate: FitEstimate | None, slots: int | None) -> str:
+    """Status-bar markup for a memory-fit estimate (None = still estimating)."""
+    if estimate is None:
+        return "[dim]estimating memory fit…[/]"
+    if estimate.error:
+        return f"[dim]fit estimate unavailable: {escape(estimate.error)}[/]"
+    if estimate.fits:
+        verdict = "[bright_green]✓ fits on GPU[/]"
+    elif estimate.gpu_layers is not None:
+        verdict = f"[yellow]⚠ only {estimate.gpu_layers} layers fit on GPU — rest offloaded to CPU (slow)[/]"
+    else:
+        verdict = "[bright_red]✗ does not fit in free GPU memory[/]"
+    details: list[str] = []
+    if estimate.projected_mib is not None and estimate.free_mib is not None:
+        details.append(f"needs {_gib(estimate.projected_mib)} of {_gib(estimate.free_mib)} GiB free")
+    if estimate.model_mib is not None and estimate.context_mib is not None and estimate.compute_mib is not None:
+        kv = f"KV {_gib(estimate.context_mib)}"
+        if slots and slots > 1:
+            kv += f" ({estimate.context_mib / 1024 / slots:.1f}/slot)"
+        details.append(f"weights {_gib(estimate.model_mib)} · {kv} · compute {_gib(estimate.compute_mib)} GiB")
+    return verdict + (f"  [dim]{' · '.join(details)}[/]" if details else "")
 
 
 # ---------------------------------------------------------------------------
@@ -2396,7 +2505,7 @@ class CacheActionScreen(ButtonMenuScreen):
     @work(thread=True)
     def _fetch_source_size(self) -> None:
         """Compute the actual on-disk size of the model source path (may be slow on remote storage)."""
-        size_gb = launcher.cache_source_size_gb(Path(self._model.path))
+        size_gb = launcher.cache_source_size_gb(self._model)
         self.app.call_from_thread(self._on_source_size_ready, size_gb)
 
     def _on_source_size_ready(self, source_gb: float) -> None:

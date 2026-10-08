@@ -46,7 +46,7 @@ from launcher.data import AI_MODELS, CACHE_MOUNTS
 from launcher.environments import ENVIRONMENTS, Environment
 from launcher.models import (
     AIModel, CacheMount, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
-    QuantizationTool, RuntimeQuant, ServerSoftware, _quant_key,
+    QuantizationTool, RuntimeQuant, ServerSoftware, _quant_key, gguf_shard_paths,
 )
 from launcher.config import CONFIG
 
@@ -385,22 +385,39 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
 def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     cmd = [
         str(env.executable("llama-server")),
-        "--model",        p["_model_path"],
+        *llamacpp_model_args(model, p),
         "--alias",        model.id,
-        "--n-gpu-layers", str(p["n_gpu_layers"]),
-        "--split-mode",   p["split_mode"],
-        "--ctx-size",     str(model.effective_ctx),
-        "--parallel",     str(p["parallel"]),
-        "--threads",      str(p["threads"]),
         "--host",         "0.0.0.0",
         "--port",         str(p["port"]),
         "--log-prefix",
         "--log-timestamps",
     ]
+    if p["threads"]:
+        cmd += ["--threads", str(p["threads"])]
+    if p["cache_ram_mib"] is not None:
+        cmd += ["--cache-ram", str(p["cache_ram_mib"])]
     if model.mmproj_path:
-        cmd += ["--mmproj", model.mmproj_path]
+        cmd += ["--mmproj", model.resolve_mmproj_path()]
     cmd.extend(p.get("extra_flags", []))
     return cmd
+
+
+def llamacpp_model_args(model: AIModel, p: dict) -> list[str]:
+    """Model, placement and context arguments shared by llama-server and llama-fit-params.
+
+    With fixed slots llama.cpp divides --ctx-size evenly between them, so it is
+    emitted as effective_ctx × parallel to give every slot the full per-request context.
+    """
+    args = [
+        "--model",        p["_model_path"],
+        "--n-gpu-layers", str(p["n_gpu_layers"]),
+        "--split-mode",   p["split_mode"],
+        "--ctx-size",     str(model.effective_ctx * p["parallel"]),
+        "--parallel",     str(p["parallel"]),
+    ]
+    if p["kv_cache_type"]:
+        args += ["--cache-type-k", p["kv_cache_type"], "--cache-type-v", p["kv_cache_type"]]
+    return args
 
 
 def _build_tabby(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
@@ -421,15 +438,16 @@ def _build_tabby(server: ServerSoftware, env: Environment, model: AIModel, p: di
 
 
 def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
-    # For GGUF files, ooba's scanner identifies them by the .gguf suffix; the symlink
-    # created in launch() is named accordingly (model.id + ".gguf").
-    model_name = model.id + ".gguf" if model.format == ModelFormat.GGUF else model.id
     # ooba resolves user_data_dir relative to CWD when no flag is given; since the
     # launcher runs from ~/ai-server-tools, we must pass the absolute path explicitly.
     user_data_dir = str(CONFIG.ooba_main.parent / "user_data")
+    model_ref = _staged_name(server, model)
+    if _is_split_gguf(model):
+        # Name shard 1 explicitly: ooba's metadata reader takes an unsorted glob's first hit.
+        model_ref += "/" + Path(model.resolve_path()).name
     cmd = [
         str(env.python), str(CONFIG.ooba_main),
-        "--model",          model_name,
+        "--model",          model_ref,
         "--model-dir",      p["model_dir"],
         "--user-data-dir",  user_data_dir,
         "--ctx-size",       str(model.effective_ctx),
@@ -448,7 +466,7 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         if p.get("tensor_split"):
             cmd += ["--tensor-split", p["tensor_split"]]
         if model.mmproj_path:
-            cmd += ["--mmproj", model.mmproj_path]
+            cmd += ["--mmproj", model.resolve_mmproj_path()]
     if p.get("cache_type"):
         cmd += ["--cache-type", p["cache_type"]]
     rq = p.get("_runtime_quant")
@@ -697,6 +715,20 @@ def build_quantize_cmd(
 # Public API
 # ---------------------------------------------------------------------------
 
+def launch_params(
+    server: ServerSoftware,
+    model: "AIModel | None",
+    runtime_quant: "RuntimeQuant | None" = None,
+    param_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolved builder params: merged defaults/overrides plus the injected _model_path / _runtime_quant."""
+    p = _merged(server, model, param_overrides)
+    if model is not None:
+        p["_model_path"] = model.resolve_path()  # fastest available copy
+    p["_runtime_quant"] = runtime_quant
+    return p
+
+
 def build_cmd(server: ServerSoftware, env: Environment, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, param_overrides: dict[str, Any] | None = None) -> list[str]:
     """Return the full argv list for launching model on server.
 
@@ -704,12 +736,10 @@ def build_cmd(server: ServerSoftware, env: Environment, model: "AIModel | None",
     where no single model is selected at launch time.
 
     param_overrides is merged on top of default_params and model.server_params;
-    used by GpuSelectScreen to inject gpu_count_param (e.g. pipeline_parallel).
+    used by GpuSelectScreen to inject gpu_count_param (e.g. pipeline_parallel)
+    and the concurrency_param.
     """
-    p = _merged(server, model, param_overrides)
-    if model is not None:
-        p["_model_path"] = model.resolve_path()  # fastest available copy
-    p["_runtime_quant"] = runtime_quant
+    p = launch_params(server, model, runtime_quant, param_overrides)
     builder = _BUILDERS.get(server.id)
     if builder is None:
         raise ValueError(f"No command builder registered for server: {server.id!r}")
@@ -745,6 +775,42 @@ def _ensure_lib_symlinks(lib_dir: Path, links: dict[str, str]) -> None:
         if link.is_symlink():
             link.unlink()  # replace a broken symlink
         link.symlink_to(targets[0].name)
+
+
+def _is_split_gguf(model: AIModel) -> bool:
+    return model.format == ModelFormat.GGUF and len(gguf_shard_paths(Path(model.resolve_path()))) > 1
+
+
+def _staged_name(server: ServerSoftware, model: AIModel) -> str:
+    """Name of the entry _stage_model() creates for *model* in the staging dir."""
+    if _is_split_gguf(model):
+        return model.id
+    if server.staging_use_source_filename:
+        return Path(model.resolve_path()).name
+    return model.id + server.staging_format_suffixes.get(model.format, "")
+
+
+def _stage_model(server: ServerSoftware, model: AIModel, staging: Path) -> None:
+    """Link *model* into *staging* under _staged_name(), replacing any previous entry.
+
+    A split GGUF is staged as a directory of per-shard links that keep their
+    original names: llama.cpp locates shards 2..N from the first shard's name and
+    directory, so a single renamed link to shard 1 cannot load.
+    """
+    entry = staging / _staged_name(server, model)
+    if entry.is_symlink():
+        entry.unlink()
+    elif entry.is_dir():
+        # Only ever remove a dir we created (links only) — never real model data.
+        if not all(child.is_symlink() for child in entry.iterdir()):
+            raise FileExistsError(f"Staging path {entry} is a real directory; refusing to replace it")
+        shutil.rmtree(entry)
+    if not _is_split_gguf(model):
+        entry.symlink_to(model.resolve_path())
+        return
+    entry.mkdir()
+    for shard in gguf_shard_paths(Path(model.resolve_path())):
+        (entry / shard.name).symlink_to(shard)
 
 
 def _prepend_path(entry: str, var: str) -> str:
@@ -855,13 +921,7 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
                 staging.mkdir(parents=True, exist_ok=True)
             else:
                 staging = staging_base
-            link_name = m.id + server.staging_format_suffixes.get(m.format, "")
-            if server.staging_use_source_filename:
-                link_name = Path(m.resolve_path()).name
-            link = staging / link_name
-            if link.is_symlink():
-                link.unlink()
-            link.symlink_to(m.resolve_path())
+            _stage_model(server, m, staging)
 
     _LOGS_DIR.mkdir(exist_ok=True)
     model_slug = model.id if model is not None else "no-model"
@@ -994,16 +1054,25 @@ def cache_disk_info(mount: CacheMount) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def cache_source_size_gb(path: Path) -> float:
-    """Return the actual on-disk footprint of *path*, excluding any .git subtree.
+def _source_files(model: AIModel) -> list[Path]:
+    """Source files of a file-based model: every GGUF shard plus its mmproj."""
+    files = gguf_shard_paths(Path(model.path))
+    if model.mmproj_path:
+        files.append(Path(model.mmproj_path))
+    return files
+
+
+def cache_source_size_gb(model: AIModel) -> float:
+    """Return the actual on-disk footprint of the model's source, excluding any .git subtree.
 
     Used by the cache UI to estimate required space — independent of the size_gb
-    catalog field, which records only the logical weight files.  For a single
-    file, returns that file's size.  For a directory, recursively sums all files
-    except those under a .git/ subdirectory.
+    catalog field, which records only the logical weight files.  For a file
+    model, sums every GGUF shard plus the mmproj.  For a directory, recursively
+    sums all files except those under a .git/ subdirectory.
     """
+    path = Path(model.path)
     if path.is_file():
-        return path.stat().st_size / 1024**3
+        return sum(p.stat().st_size for p in _source_files(model) if p.is_file()) / 1024**3
     total = 0
     for p in path.rglob("*"):
         if ".git" in p.parts:
@@ -1018,22 +1087,26 @@ def cache_model(model: AIModel, mount: CacheMount) -> tuple["subprocess.Popen[by
 
     Returns a running (Popen, dest_path) pair.  dest_path is where the cached
     copy will live once rsync completes.  On success the caller should persist
-    it with save_cached_path(model, dest_path).
+    it with save_cached_path(model, dest_path).  Re-running it on an existing
+    cache copies only what is missing.
     """
     src_p = Path(model.path)
     dest_root = mount.root / model.cache_subdir
-    if src_p.is_file():                    # single file → <mount>/<subdir>/<id>/<filename>
+    if src_p.is_file():                    # file(s) → <mount>/<subdir>/<id>/<filename>
         dest_dir = dest_root / model.id
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_p = dest_dir / src_p.name
-        src, dst = str(src_p), str(dest_p)
+        # Flattened into one dir: llama.cpp finds split shards beside the first,
+        # and resolve_mmproj_path() looks for the mmproj there too.
+        srcs = [str(p) for p in _source_files(model)]
+        dst = str(dest_dir) + "/"
     else:                                   # directory → <mount>/<subdir>/<src_dirname>/
         dest_p = dest_root / src_p.name
         dest_p.mkdir(parents=True, exist_ok=True)
-        src = str(src_p) + "/"
+        srcs = [str(src_p) + "/"]
         dst = str(dest_p) + "/"
     proc = subprocess.Popen(
-        ["rsync", "-ah", "--info=progress2", "--exclude=.git", src, dst],
+        ["rsync", "-ah", "--info=progress2", "--exclude=.git", *srcs, dst],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -1053,7 +1126,11 @@ def uncache_model(model: AIModel, mount: CacheMount) -> None:
     if not cached_p.exists():
         raise FileNotFoundError(f"Cached path not found on disk: {cached_p}")
     if cached_p.is_file():
-        cached_p.unlink()
+        cached_files = gguf_shard_paths(cached_p)
+        if model.mmproj_path:
+            cached_files.append(cached_p.parent / Path(model.mmproj_path).name)
+        for f in cached_files:
+            f.unlink(missing_ok=True)
     else:
         shutil.rmtree(str(cached_p))
 
@@ -1197,3 +1274,27 @@ def save_favorite(model: AIModel, favorite: bool) -> None:
             entry.pop("favorite", None)
 
     _patch_catalog(model.id, _apply)
+
+
+def save_server_param(model: AIModel, server: ServerSoftware, key: str, value: Any) -> None:
+    """Persist one per-model server param override (e.g. the last-launched slot count).
+
+    A value equal to the server default removes the override, keeping the catalog
+    tidy.  Mutates the in-memory model immediately, then updates the JSON catalog.
+    """
+    def _apply(server_params: dict) -> None:
+        params = server_params.setdefault(server.id, {})
+        if value == server.default_params.get(key):
+            params.pop(key, None)
+        else:
+            params[key] = value
+        if not params:
+            server_params.pop(server.id)
+
+    def _apply_entry(entry: dict) -> None:
+        _apply(entry.setdefault("server_params", {}))
+        if not entry["server_params"]:
+            entry.pop("server_params")
+
+    _apply(model.server_params)
+    _patch_catalog(model.id, _apply_entry)

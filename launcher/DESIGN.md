@@ -24,6 +24,7 @@ environments.py             Server runtime environments — Environment kinds (c
 environments.json.example   Tracked template — environment registry (copy to user_data/environments.json)
 models_local.json.example   Tracked template — schema reference + 3 sample entries
 launch.py                   Command builders + process spawner + cache manager
+fit.py                      Pre-launch memory-fit estimates (FitProbe per server — llama.cpp: llama-fit-params)
 screens.py                  All Textual screens
 app.py                      Top-level App class, entry to screen stack
 gpu.py                      NVML polling via pynvml (shared with gpu_monitor)
@@ -56,6 +57,8 @@ user_data/environments.json (gitignored, written by the TUI)
 `config.toml` holds hand-edited, machine-specific settings; `environments.json` holds the environment registry, which the TUI rewrites (add / rename / remove / default / note) — keeping it out of the TOML avoids clobbering hand-written comments.
 
 `pipeline_parallel = 0` in `config.toml` triggers NVML auto-detection at import time. The result is stored as `CONFIG.pipeline_parallel` (never zero afterwards). `resolved_cuda_devices` builds `"0,1,...,N-1"` if no explicit device string was given.
+
+`[memory] host_cache_ram` (a share of physical RAM such as `"60%"`, or integer MiB) is resolved once at load into `CONFIG.host_cache_ram_mib` (`None` when unset) and becomes llama.cpp's `cache_ram_mib` default (`--cache-ram`). It is a host-level budget rather than a per-server one because it is sized against the machine's RAM; other servers' host-side KV caches (SGLang hierarchical cache, vLLM KV offload) can draw on the same setting.
 
 **Why TOML, not envvars or a Python file?** TOML is structured and typed without being executable. Envvars are awkward for multi-key sections (cache mounts) and invisible at a glance. A Python file would need `exec()` or an import that could shadow package modules.
 
@@ -97,7 +100,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `min_sm` | Minimum CUDA compute capability required to load this model (integer, e.g. `89` for sm_89+). `0` = no constraint. Checked against `system_min_sm()` at display time. |
 | `hw_note` | Optional human-readable explanation shown in the note bar when `hw_compat()` returns `False`. When omitted, `hw_compat_note` generates a default: `"Requires sm_{min_sm}+ GPU"`. |
 | `comfyui_subdir` | `image_gen` models only — ComfyUI `models/` subdirectory to stage into. Default: `"checkpoints"` (omit from JSON). Use `"diffusion_models"` for FLUX UNets. Extensible: any valid subdirectory name accepted by ComfyUI. |
-| `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time. Omitted from JSON when empty. |
+| `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time — via `resolve_mmproj_path()`, which prefers the copy cached beside the model. Omitted from JSON when empty. |
 | `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. |
 | `cached_path` | Optional absolute path to a faster local copy. Set by the TUI cache action; cleared on uncache. `resolve_path()` returns this when non-empty and present on disk, otherwise returns `path`. Multiple entries may share the same `cached_path` when they point to the same source directory — `save_cached_path()` fans out to all of them. |
 | `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
@@ -148,6 +151,7 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 | `launch_cwd` | `str \| None` | Working directory for the spawned process (`None` = inherit) |
 | `max_gpus` | `int` | Maximum GPUs selectable in `GpuSelectScreen`: `0` = unlimited (all GPUs, multi-select); `1` = single GPU only (radio-button) |
 | `gpu_count_param` | `str \| None` | When set, `GpuSelectScreen` injects `{gpu_count_param: selected_count}` as a `param_overrides` entry so parallelism flags (e.g. `pipeline_parallel` for vLLM/SGLang) stay consistent with the selected GPU count. `None` for servers that handle variable GPU counts automatically (tabbyAPI `--gpu-split-auto`, llama.cpp layer distribution) |
+| `concurrency_param` | `str \| None` | `default_params` key holding the number of concurrently processed requests (llama.cpp: `"parallel"` slots). When set, `GpuSelectScreen` adjusts it with `+`/`-`, injects it into `param_overrides`, and remembers the launched value per model (`save_server_param`). The catalog `ctx` stays the per-request context; each builder translates (llama.cpp multiplies `--ctx-size` by the slot count) |
 
 Defined once per server type in `data.py`. The `default_params` dict establishes baseline launch parameters; per-model `server_params` only specify deltas.
 
@@ -336,10 +340,16 @@ The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived vi
 
 **`gpu_count_param` auto-adjustment**: vLLM and SGLang require their parallelism flags to match the GPU count. When `server.gpu_count_param == "pipeline_parallel"`, `GpuSelectScreen` calls `compute_parallelism(n, model)` to determine the optimal TP×PP split and builds `param_overrides = {"tensor_parallel": tp, "pipeline_parallel": pp}`. The status bar shows the computed split (e.g. `PP=12` or `TP=2 × PP=7`). No auto-adjustment for tabbyAPI (`--gpu-split-auto`) or llama.cpp (distributes layers to visible GPUs automatically).
 
+**Concurrency slots** (`server.concurrency_param`, llama.cpp `parallel`): a second status line shows `Slots N × <ctx> ctx`; `+`/`-` adjust N (1–64; the bindings are hidden for servers without the param). The starting value is the merged default (server default → model `server_params`), so the last-launched count comes back. `_launch_settings()` is the single source of the `(CUDA_VISIBLE_DEVICES, param_overrides)` pair used by both the fit estimate and the launch. The launch factory calls `save_server_param(model, server, concurrency_param, N)` when the launch actually happens (not on reaching `ConfirmLaunch`); a value equal to the server default removes the override.
+
+**Memory-fit estimate** (`fit.py`): when a `FitProbe` is registered for the server (`_PROBES`, keyed by server id like `launch._BUILDERS`) and usable in the chosen environment, every selection or slot change re-estimates in a `@work(thread=True, exclusive=True, group="fit")` worker after a 0.4 s debounce. The result line shows a verdict — `✓ fits on GPU`, `⚠ only N layers fit on GPU` (llama.cpp would partially offload to CPU), or `✗ does not fit` — plus `needs X of Y GiB free · weights · KV (per slot) · compute`. A generation counter discards stale results; `exclusive=True` cancels the previous worker, and the probe polls `cancelled()` and kills its subprocess, so leaving the screen or launching never leaves an estimator holding GPU memory.
+
+`LlamaCppFitProbe` runs `llama-fit-params` from the same build as `llama-server`, with the launch's model/context arguments (`llamacpp_model_args()`, shared with the builder) and `CUDA_VISIBLE_DEVICES` set to the selection. This is llama.cpp's own fitter (the one behind `llama-server --fit`): it reads only model metadata (~2 s; longer when it has to search for a partial-offload split), so it is exact for every architecture — sliding-window, MLA, hybrid/recurrent — includes compute buffers, and measures against memory already in use by other processes. Stdout (`-c N -ngl M …`, `-ngl -1` = everything on GPU) is the verdict contract; sizes are parsed best-effort from the `-lv 4` log (first memory-breakdown table and the `projected to use … free` line), so a log-format change only drops the detail. Not covered: `--mmproj` projectors (not accepted by `llama-fit-params`) and `extra_flags`. Builds without `llama-fit-params` simply show no estimate.
+
 **Parallelism computation** (`compute_parallelism` in `launch.py`): reads the model's HF `config.json` for `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `num_hidden_layers`, and the linear-attention head counts `linear_num_key_heads` / `linear_num_value_heads` (hybrid Gated-DeltaNet models). Multimodal checkpoints nest these under `text_config`, which takes precedence over the top level. For PCIe topology (no NVLink), prefers the smallest valid TP (largest PP) to minimise cross-GPU tensor traffic. TP must evenly divide the attention, linear-attention and intermediate dimensions; `num_key_value_heads` must be divisible by TP *or* TP a multiple of it (vLLM/SGLang replicate KV heads when TP exceeds them). Architectures in `_NO_PP_ARCHS` (Qwen4Exp — its N-gram PLE embedding needs raw `input_ids`, which non-first PP ranks never receive) get the largest valid TP with PP=1, even if some selected GPUs go unused; the status bar notes why. Additionally, for architectures *not* in `_TP_SCOPED_ARCHS`, `intermediate_size` must also be divisible by the total GPU count — this guards against model implementations that assert `intermediate_size % world_size == 0` using the global process count rather than the TP group size. When no valid plan exists for the selected GPU count, the count is automatically reduced to the largest compatible value and a note is shown in the status bar. Architecture is read from `model.arch` (catalog) with a fallback to `architectures[0]` in `config.json`. Results of `_read_hf_parallelism_fields` are LRU-cached per model path.
 
 **`build_cmd` / `launch` signatures**:
-- `build_cmd(server, env, model, runtime_quant, param_overrides)` — `param_overrides` is merged last in `_merged()`.
+- `build_cmd(server, env, model, runtime_quant, param_overrides)` — resolves params via `launch_params()` (`_merged()` with `param_overrides` last, plus the injected `_model_path` / `_runtime_quant`); the fit probe uses the same resolver.
 - `build_launch_command(server, env, model, runtime_quant, cuda_devices, param_overrides)` — wraps `build_cmd()` in the explicit environment and working-directory shell syntax shown in `ConfirmLaunch`.
 - `launch(server, env, model, runtime_quant, cuda_devices, param_overrides, command)` — `command` is the shell text edited in `ConfirmLaunch`; it is logged and executed verbatim. Callers that omit it get the default from `build_launch_command()`.
 
@@ -352,12 +362,12 @@ The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived vi
 ```
 ServerSoftware.default_params
     + AIModel.server_params[server.id]   (merged at build time; skipped when model=None)
-    + param_overrides                    (from GpuSelectScreen — e.g. pipeline_parallel = N)
+    + param_overrides                    (from GpuSelectScreen — e.g. pipeline_parallel = N, parallel slots)
     + AIModel.resolve_path() → injected as _model_path  (skipped when model=None)
     → _build_<server_id>(server, env, model, merged_params) → list[str]
 ```
 
-All builders receive `model.effective_ctx` (not `model.ctx` directly) so that `ctx_override` values are respected without each builder needing to know about the field. Builders for `stage_all_models` servers (e.g. `_build_comfyui`) accept `model=None` and must not access model attributes.
+All builders receive `model.effective_ctx` (not `model.ctx` directly) so that `ctx_override` values are respected without each builder needing to know about the field. `effective_ctx` is always the **per-request** context; a builder whose server sizes context for all concurrent requests together translates it (llama.cpp: `--ctx-size effective_ctx × parallel`). Builders for `stage_all_models` servers (e.g. `_build_comfyui`) accept `model=None` and must not access model attributes.
 
 `resolve_path()` returns `model.cached_path` if it is set and the path exists on disk (`Path.exists()` — handles both files and directories uniformly); otherwise returns `model.path`. The `mounts` list in `CacheMount` is used only to determine *where* to place new cached copies and to display disk-space info in the UI.
 
@@ -464,7 +474,9 @@ Log files are named `logs/{timestamp}_{server}_{model}.log` and are gitignored.
 
 tabbyAPI requires all models to be subdirectories inside a single `--model-dir`. Rather than maintaining a permanent symlink forest, `launch()` creates `<tabby_model_dir>/<model.id>` → `resolved_path` immediately before spawning. Stale symlinks are replaced (unlink + re-link).
 
-This generalises to any server that requires a model to be reachable under a specific directory: set `uses_staging_dir=True` and populate `staging_format_suffixes` if the server's scanner needs a file extension to detect the format. `launch()` reads `server.staging_format_suffixes.get(model.format, "")` to determine whether to append a suffix. No branching on `server.id` is needed.
+This generalises to any server that requires a model to be reachable under a specific directory: set `uses_staging_dir=True` and populate `staging_format_suffixes` if the server's scanner needs a file extension to detect the format. `_staged_name()` determines the entry name and `_stage_model()` creates it; builders that reference the staged model (ooba's `--model`) use `_staged_name()` too, so the two cannot drift. No branching on `server.id` is needed.
+
+**Split GGUFs** are staged as a real directory `<model.id>/` holding one link per shard under its original filename, instead of a single renamed link: llama.cpp locates shards 2..N from the first shard's `-00001-of-000NN` name and directory. ooba is given `--model <model.id>/<shard-1 filename>` explicitly because its GGUF metadata reader takes the first hit of an unsorted glob. Re-staging removes a previous staging directory only when it contains nothing but links, so real model data in the staging dir is never deleted.
 
 ---
 
@@ -511,6 +523,8 @@ Statuses are stored as a nested dict: `server_status[server_id][env_name][quant_
 
 `save_favorite(model, favorite)` follows the same pattern: mutates `model.favorite` in-memory, then sets or removes the `favorite` key in the JSON entry (`False` → key removed to keep the catalog tidy).
 
+`save_server_param(model, server, key, value)` persists one per-model launch parameter in `server_params[server.id]` (used for the remembered slot count). A value equal to `server.default_params[key]` removes the key, and emptied `server_params` dicts are dropped.
+
 ---
 
 ## vLLM-Specific Constraints
@@ -555,20 +569,39 @@ the model's `trust_remote_code` field is True. `--enable-auto-tool-choice
 Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
 "gpu_mem_util": 0.8}`) and are merged over these defaults at launch time.
 
+---
+
+## llama.cpp Launch Flags
+
+`_build_llamacpp` = `llama-server` + `llamacpp_model_args()` (shared with `LlamaCppFitProbe`, so the estimate always describes the command that will run) + serving flags.
+
+| Param (`default_params`) | Default | Flag emitted |
+|---|---|---|
+| `n_gpu_layers` | `"auto"` | `--n-gpu-layers <v>` — `auto` lets llama.cpp's fitter place layers |
+| `split_mode` | `"layer"` | `--split-mode <v>` |
+| `parallel` | `1` | `--parallel <v>` and `--ctx-size effective_ctx × v` — with fixed slots llama.cpp splits `--ctx-size` evenly, so every slot gets the full per-request context. The `concurrency_param`, adjusted per launch on `GpuSelectScreen` |
+| `kv_cache_type` | `"q8_0"` | `--cache-type-k <v> --cache-type-v <v>`; `""` = llama.cpp default (f16). q8_0 halves KV memory at negligible quality loss — for large dense models it is what lets several long-context slots fit (BeMag 123B: 5 × 128K is ≈117 GiB at q8_0 vs ≈220 GiB at f16) |
+| `cache_ram_mib` | `CONFIG.host_cache_ram_mib` | `--cache-ram <v>` when not `None`. Host-RAM store of saved slot states, restored instead of re-processing a prompt when more conversations are active than slots; filled on demand. llama.cpp's 8 GiB default holds less than one full 128K slot of a large model |
+| `threads` | `0` | `--threads <v>` only when non-zero; otherwise llama.cpp uses the physical core count (hyperthreads only add contention for CPU math, and fully offloaded models barely use the CPU) |
+
+Always-on: `--model`, `--alias <model.id>`, `--host 0.0.0.0`, `--port`, `--log-prefix`, `--log-timestamps`; `--mmproj` when the model has a projector. `extra_flags` are appended last.
+
+Possible extension: newer builds add `--kv-unified-per-slot N` (one shared KV pool sized `n_parallel × N`, each slot capped at N), which would allow more slots than the pool could hold at full length simultaneously. It needs build-capability gating before it can become a param.
+
 
 ---
 
 ## Cache Management
 
-`cache_model()` runs `rsync -ah --info=progress2` from the model's `path` to a local cache mount. Single-file models are detected with `src_p.is_file()` (not extension-based, so `.safetensors`, `.gguf`, and any future single-file formats are handled correctly); directories use trailing-slash semantics to sync contents. `stdout=PIPE` is set so the TUI can read rsync output live; `stderr=PIPE` captures error text on failure. The returned `Popen` lets the UI poll progress without blocking.
+`cache_model()` runs `rsync -ah --info=progress2` from the model's `path` to a local cache mount. Single-file models are detected with `src_p.is_file()` (not extension-based, so `.safetensors`, `.gguf`, and any future single-file formats are handled correctly); directories use trailing-slash semantics to sync contents. A split GGUF set (`<base>-00001-of-000NN.gguf`) is catalogued by its first shard, so file models are expanded via `gguf_shard_paths()` (`models.py`, shared with ingest) and every shard is copied into the same destination directory — llama.cpp locates the remaining shards next to the first. A file model's `mmproj_path` is copied into that same directory too (`_source_files()` lists shards + mmproj for sizing and copying); `resolve_mmproj_path()` returns the cached copy whenever the cached model is in use, and builders pass that as `--mmproj`. Re-running `cache_model()` on an existing cache copies only what is missing. `stdout=PIPE` is set so the TUI can read rsync output live; `stderr=PIPE` captures error text on failure. The returned `Popen` lets the UI poll progress without blocking.
 
-`uncache_model()` deletes the cached copy only — it never touches the original source. Raises `FileNotFoundError` if `model.cached_path` is empty or the path no longer exists.
+`uncache_model()` deletes the cached copy only — it never touches the original source; for a split GGUF it deletes every shard, plus the cached mmproj. Raises `FileNotFoundError` if `model.cached_path` is empty or the path no longer exists. `resolve_path()` only returns `cached_path` when every shard of a split set is present, so an interrupted copy falls back to the source.
 
 **Cache destination**: `cache_model()` places directory models at `mount.root / <cache_subdir> / src_p.name` (the source directory's own basename, e.g. `BeMag-123B-v0.1/`) and single-file models at `mount.root / <cache_subdir> / model.id / <filename>`. Using the source directory name means that multiple catalog entries pointing to the same source path (e.g. different format variants extracted from one directory) share the same cached location.
 
 **Fan-out on save/clear**: `save_cached_path(model, path)` updates *all* in-memory `AI_MODELS` entries and all JSON catalog entries that share `model.path`, in a single catalog write. This keeps every co-path entry in sync when a directory is cached or uncached.
 
-**Space estimation**: `cache_source_size_gb(path)` returns the actual on-disk footprint of the source, recursively summing all files while excluding `.git` subtrees. This is separate from `size_gb` (which records logical weight-file size only and is shown in the model list). `CacheActionScreen` computes the actual source size asynchronously on mount — buttons initially show `~{size_gb}` until the worker finishes and updates them with the accurate value. On rsync completion, `CacheProgressScreen` calls `save_cached_path(model, dest_path)`. `uncache_model()` deletes the path stored in `model.cached_path` and calls `save_cached_path(model, "")` to clear all co-path entries.
+**Space estimation**: `cache_source_size_gb(path)` returns the actual on-disk footprint of the source, recursively summing all files while excluding `.git` subtrees (for a file model, the sum over all shards of a split GGUF). This is separate from `size_gb` (which records logical weight-file size only and is shown in the model list). `CacheActionScreen` computes the actual source size asynchronously on mount — buttons initially show `~{size_gb}` until the worker finishes and updates them with the accurate value. On rsync completion, `CacheProgressScreen` calls `save_cached_path(model, dest_path)`. `uncache_model()` deletes the path stored in `model.cached_path` and calls `save_cached_path(model, "")` to clear all co-path entries.
 
 **Progress display**: `CacheProgressScreen._run_cache()` runs in a `@work(thread=True)` worker. It reads rsync stdout in a `select.select()` loop with a 0.5 s timeout, splits on `\r` and `\n` (rsync uses `\r` for in-place progress updates), and passes the most recent non-empty fragment to `_update_progress_line()`. That method parses `(\d+)%\s+([\d.]+\S+/s)\s+([\d:]+)` to extract percentage, speed, and ETA, then updates a Textual `ProgressBar` widget and a detail `Label`. After stdout EOF, `proc.wait()` is called to ensure `returncode` is populated (EOF alone does not guarantee this) before checking success. Stderr content is surfaced in the detail label on failure.
 
@@ -584,6 +617,7 @@ Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
 3. Register in `_BUILDERS`.
 4. If the server needs a staging model directory, add a block in `launch()`.
 5. Register an environment for it — `e` on the server list, or `user_data/environments.json`.
+6. Optional: set `concurrency_param` if it serves several requests concurrently, and register a `FitProbe` subclass in `fit._PROBES` if it has a cheap way to predict memory use.
 
 **Add an environment**: `e` on the server or environment list → `a`. No code changes needed.
 
@@ -621,7 +655,7 @@ Scans a given `scan_root` directory for model paths not already in `models_local
 Entries are sorted alphabetically. For each item in `scan_root`:
 
 - **Top-level `.gguf` file** → yielded as a standalone candidate.
-- **GGUF bundle directory** → each `.gguf` file inside yielded individually (one entry per quant variant). Scans flat bundles (`entry/*.gguf`) and per-quant-subdir bundles (`entry/<quant>/*.gguf`). Files named `mmproj-*` are excluded.
+- **GGUF bundle directory** → each `.gguf` file inside yielded individually (one entry per quant variant). Scans flat bundles (`entry/*.gguf`) and per-quant-subdir bundles (`entry/<quant>/*.gguf`). Files named `mmproj-*` (vision projectors) and `mtp-*` (multi-token-prediction draft heads) are companions, not models, and are excluded (`_COMPANION_GGUF_PREFIXES`).
 - **llama.cpp split sets** (`<base>-00001-of-000NN.gguf`) → collapsed to the first shard only, which is the file passed to the server; it carries the metadata and pulls in the remaining shards on load. Without this a 7-shard model would become 7 bogus entries each sized as a single shard.
 - **HF model directory** (has `config.json` or weight files) → yielded as a whole directory. Directories with both safetensors and pytorch_bin weights yield one entry per format so each becomes a separate catalog entry.
 
@@ -635,7 +669,7 @@ Directories with no `config.json` and no weight files are skipped.
 - **`params_m`**: from `config.json` `num_parameters` if present; falls back to regex extraction from filename (e.g. `70B` → 70000).
 - **`arch`**, **MoE**, **`vision`**, **`trust_remote_code`**: from `config.json` when present.
 - **`mmproj_path`**: auto-detected from `mmproj-*.gguf` in bundle root when `vision=True`.
-- **`name`**: derived from the parent dir name when it contains "gguf", else the file stem. The split-shard suffix and the quant label are stripped first, so `Model-GGUF-Q5_K_S/…` yields `Model` rather than carrying tags that the quant slug would then duplicate.
+- **`name`**: derived from the parent dir name when it contains "gguf", else the file stem. The split-shard suffix and the quant label are stripped first, so `Model-GGUF-Q5_K_S/…` yields `Model` rather than carrying tags that the quant slug would then duplicate. Unsloth's `UD` (Unsloth Dynamic) tag, which prefixes the quant label (`Model-GGUF-UD-Q6_K_XL`), is stripped along with the other provenance suffixes.
 - **`id`**: `<name-slug>-<quant-slug>` where quant slug drops underscores and trailing `0` (e.g. `Q8_0` → `q8`, `Q4_K_M` → `q4km`). Collision guard appends `-gguf` if the ID already belongs to a different path.
 
 ### Detection — HF model directories

@@ -114,8 +114,19 @@ SERVERS: list[ServerSoftware] = [
         default_params={
             "n_gpu_layers": "auto",
             "split_mode":   "layer",
+            # Concurrent request slots.  Each slot gets the model's full effective_ctx:
+            # with fixed slots llama.cpp splits --ctx-size evenly between them, so the
+            # builder emits --ctx-size effective_ctx × parallel.
             "parallel":     1,
-            "threads":      16,
+            # 0 = omit --threads; llama.cpp then uses the physical core count, which
+            # is optimal for CPU math (hyperthreads only add contention).
+            "threads":      0,
+            # KV cache dtype for both K and V ("" = llama.cpp default f16).  q8_0 halves
+            # KV VRAM at negligible quality cost — often what lets multiple long-context
+            # slots fit at all.  Override per model with "f16" if quality suffers.
+            "kv_cache_type": "q8_0",
+            # Host-RAM prompt cache ceiling in MiB (--cache-ram); None = llama.cpp default.
+            "cache_ram_mib": CONFIG.host_cache_ram_mib,
             "port":         CONFIG.server_ports.get("llamacpp", 5000),
             "extra_flags":  [],
         },
@@ -132,6 +143,7 @@ SERVERS: list[ServerSoftware] = [
             ),
             template="llama.cpp b{build} ({commit})",
         ),
+        concurrency_param="parallel",
     ),
 
     ServerSoftware(

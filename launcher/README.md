@@ -83,6 +83,7 @@ All system-specific paths live in **`user_data/config.toml`** (gitignored). The 
 | `[paths]` | `cuda_home_sglang` | `CUDA_HOME` injected for SGLang (flashinfer JIT); leave `""` to skip |
 | `[paths]` | `cuda_visible_devices` | Explicit GPU list; `""` = auto-derive from `pipeline_parallel` |
 | `[gpu]` | `pipeline_parallel` | GPU count for vLLM pipeline parallelism; `0` = auto-detect via NVML at startup |
+| `[memory]` | `host_cache_ram` | Ceiling for the host-RAM prompt cache (llama.cpp `--cache-ram`): a share of physical RAM (`"60%"`) or integer MiB; omit for the server default (8 GiB) |
 | `[[cache_mounts]]` | `label` / `root` / `priority` | Local storage tiers for caching models locally from remote sources |
 
 `~` and environment variables are expanded in all path values.
@@ -216,6 +217,7 @@ Override server defaults per model with a `server_params` key:
 | `q` | Quit from any screen |
 | `Space` | Toggle GPU selection (GPU screen) |
 | `a` | Select all GPUs (GPU screen, multi-GPU servers only) |
+| `+` / `-` | More / fewer concurrent request slots (GPU screen, llama.cpp) |
 | `c` | Cache focused model to local storage (model list) |
 | `u` | Uncache focused model (model list) |
 | `l` | Set or clear context-length cap for focused model (model list) |
@@ -227,6 +229,19 @@ Override server defaults per model with a `server_params` key:
 | `Ctrl+Q` | Quit from the final command editor (`q` inserts text there) |
 
 The final **Ready to launch** screen is an editor containing the exact shell command that will run. Launcher-controlled values such as `CUDA_VISIBLE_DEVICES`, non-default `CUDA_HOME` and library paths, `PYTHONPATH` removal, and the launch working directory are explicit in that command. Edit any part of it to test alternate arguments or environment values; the edited text is written unchanged to the session log and executed through Bash.
+
+## Concurrent slots and memory fit (llama.cpp)
+
+The GPU screen shows how many requests llama.cpp will serve at once — `Slots N × 128K ctx` — and `+` / `-` change it. Every slot gets the model's full context (its `ctx`, or the `l` override): the launcher passes `--ctx-size` as context × slots, because llama.cpp divides it evenly between slots. The count you launch with is remembered for that model.
+
+While you pick GPUs and slots, the launcher asks llama.cpp's own planner (`llama-fit-params`, from the selected build) whether the launch fits in the GPUs' currently free memory, and shows the answer a couple of seconds later:
+
+- `✓ fits on GPU  needs 287 of 353 GiB free · weights 121 · KV 117 (23.4/slot) · compute 49 GiB`
+- `⚠ only 49 layers fit on GPU — rest offloaded to CPU (slow)` — fewer slots, more GPUs, or a smaller quant will help.
+
+Memory already used by other processes counts against the fit. Vision projectors (`--mmproj`) and `extra_flags` are not included in the estimate.
+
+llama.cpp launches also default to a q8_0 KV cache (half the memory of f16, negligible quality loss; set `"kv_cache_type": "f16"` in a model's `server_params.llamacpp` to opt out) and to a host-RAM prompt cache sized by `[memory] host_cache_ram`, which lets returning conversations skip re-processing their prompt when there are more of them than slots.
 
 ## File map
 
@@ -240,11 +255,12 @@ launcher/
   environments.py      Server environments (conda envs / native builds) + registry
   environments.json.example  Template for user_data/environments.json
   launch.py            Command builders and subprocess launcher
+  fit.py               Pre-launch memory-fit estimates (llama.cpp: llama-fit-params)
   gpu.py               NVML polling (pynvml) + GpuRow helpers (shared with gpu_monitor)
   config.py            Config loader — reads user_data/config.toml at import time
   config.toml.example  Documented template (copy to user_data/config.toml)
   user_data/           ← gitignored; machine-specific and personal data
-    config.toml          machine paths, GPU counts
+    config.toml          machine paths, GPU counts, host RAM budget
     environments.json    registered environments per server
     models_local.json    model catalog
   model_launcher.tcss    Textual CSS layout

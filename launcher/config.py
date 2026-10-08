@@ -24,6 +24,23 @@ def expand_path(p: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(p)))
 
 
+def _total_ram_mib() -> int:
+    """Physical RAM of this host in MiB."""
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+
+
+def _parse_ram_mib(value: int | str | None) -> int | None:
+    """Resolve a RAM size setting: "60%" → share of physical RAM in MiB; an int → MiB as given."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.endswith("%"):
+            raise ValueError(f"RAM size must be an integer MiB or a percentage like '60%', got {value!r}")
+        return int(_total_ram_mib() * float(text[:-1]) / 100)
+    return int(value)
+
+
 def _count_gpus() -> int:
     """Return the number of available CUDA GPUs via NVML."""
     try:
@@ -58,6 +75,9 @@ class SiteConfig:
     exl2_convert_script:  Path   # path to ExLlamaV2 convert.py; falls back to -m exllamav2.conversion.convert_exl2 if absent
     comfyui_main:         Path   # path to ComfyUI main.py
     comfyui_models_dir:   Path   # base staging dir for ComfyUI symlinks (~/ComfyUI/models/)
+    # Ceiling (MiB) for a server's host-RAM prompt cache (llama.cpp --cache-ram);
+    # None = not configured, servers keep their own default.
+    host_cache_ram_mib:   int | None = None
     server_ports:         dict[str, int] = field(default_factory=dict)  # per-server port overrides from [ports]
     cache_mounts:         list[CacheMountConfig] = field(default_factory=list)
 
@@ -88,8 +108,9 @@ def _load() -> SiteConfig:
     with open(_CONFIG_PATH, "rb") as f:
         raw = tomllib.load(f)
 
-    paths = raw.get("paths", {})
-    gpu   = raw.get("gpu",   {})
+    paths  = raw.get("paths",  {})
+    gpu    = raw.get("gpu",    {})
+    memory = raw.get("memory", {})
     ports = {k: int(v) for k, v in raw.get("ports", {}).items()}
 
     pp = int(gpu.get("pipeline_parallel", 0))
@@ -126,6 +147,7 @@ def _load() -> SiteConfig:
             paths.get("comfyui_main", "~/ComfyUI/main.py")),
         comfyui_models_dir=expand_path(
             paths.get("comfyui_models_dir", "~/ComfyUI/models")),
+        host_cache_ram_mib=_parse_ram_mib(memory.get("host_cache_ram")),
         server_ports=ports,
         cache_mounts=mounts,
     )

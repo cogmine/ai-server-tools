@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from launcher.config import CONFIG
-from launcher.models import GGUF_QUANTS_LONGEST_FIRST
+from launcher.models import GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -107,6 +107,15 @@ def _looks_like_model_dir(path: Path) -> bool:
     return False
 
 
+# GGUF files shipped inside a bundle that are not standalone models:
+# multimodal projectors and multi-token-prediction draft heads.
+_COMPANION_GGUF_PREFIXES = ("mmproj", "mtp-")
+
+
+def _is_companion_gguf(path: Path) -> bool:
+    return path.stem.lower().startswith(_COMPANION_GGUF_PREFIXES)
+
+
 def _iter_candidates(scan_dir: Path):
     """Yield (path, format) candidate pairs from scan_dir in sorted order.
 
@@ -128,8 +137,8 @@ def _iter_candidates(scan_dir: Path):
         if entry.name.startswith("."):
             continue
         if entry.is_file():
-            if entry.suffix.lower() == ".gguf" and not entry.stem.lower().startswith("mmproj"):
-                info = _gguf_split_info(entry)
+            if entry.suffix.lower() == ".gguf" and not _is_companion_gguf(entry):
+                info = gguf_split_info(entry)
                 if info is None or info[1] == 1:
                     yield entry, "gguf"
         elif entry.is_dir():
@@ -142,9 +151,8 @@ def _iter_candidates(scan_dir: Path):
                     if subdir.is_dir() and not subdir.name.startswith("."):
                         gguf_files.extend(sorted(subdir.glob("*.gguf")))
             if gguf_files:
-                # Skip mmproj-* files (multimodal projectors — not standalone models).
                 for gguf_file in _primary_gguf_files(gguf_files):
-                    if not gguf_file.stem.lower().startswith("mmproj"):
+                    if not _is_companion_gguf(gguf_file):
                         yield gguf_file, "gguf"
             elif _looks_like_model_dir(entry):
                 cfg = _read_hf_config(entry)
@@ -354,37 +362,19 @@ def _quant_slug(quant: str) -> str:
     return s
 
 
-# llama.cpp splits large models into '<base>-00001-of-000NN.gguf' shards.  The
-# first shard carries the metadata and pulls in the rest when loaded, so a split
-# set is one model — not NN of them.
-_GGUF_SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})$")
-
-
-def _gguf_split_info(gguf_path: Path) -> tuple[str, int, int] | None:
-    """Return (base_stem, index, total) for a llama.cpp split shard, else None."""
-    match = _GGUF_SPLIT_RE.match(gguf_path.stem)
-    if match is None:
-        return None
-    return match["base"], int(match["index"]), int(match["total"])
-
-
+# llama.cpp split sets are one model; only the first shard becomes a candidate.
 def _primary_gguf_files(gguf_files: list[Path]) -> list[Path]:
     """Drop non-first shards so each split set contributes a single candidate."""
     return [
         f for f in gguf_files
-        if (info := _gguf_split_info(f)) is None or info[1] == 1
+        if (info := gguf_split_info(f)) is None or info[1] == 1
     ]
 
 
 def _gguf_size_gb(gguf_path: Path) -> float:
     """Size in GB of a GGUF model, summing every shard when it is a split set."""
-    info = _gguf_split_info(gguf_path)
-    if info is None:
-        return _file_size_gb(gguf_path)
-    base, _, total = info
     total_bytes = 0
-    for index in range(1, total + 1):
-        shard = gguf_path.parent / f"{base}-{index:05d}-of-{total:05d}.gguf"
+    for shard in gguf_shard_paths(gguf_path):
         try:
             total_bytes += shard.stat().st_size
         except OSError:
@@ -407,6 +397,7 @@ def _dir_to_display_name(dirname: str) -> str:
     strip_suffixes = [
         "-GGUF", "_GGUF", "-BF16", "-FP16", "-FP8", "-INT8",
         "-EXL2", "-AWQ", "-GPTQ", "-hf",
+        "-UD", "_UD",  # Unsloth Dynamic tag that prefixes the quant label
     ]
     while True:
         for suffix in strip_suffixes:
@@ -1012,7 +1003,7 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     # "Model-GGUF-Q5_K_S" reduce to "Model" rather than keeping the tags, which
     # would then be duplicated by the quant_suffix appended below.
     parent = gguf_path.parent
-    split_info = _gguf_split_info(gguf_path)
+    split_info = gguf_split_info(gguf_path)
     base_name = (
         parent.name if "gguf" in parent.name.lower()
         else (split_info[0] if split_info else gguf_path.stem)

@@ -59,6 +59,17 @@ cuda_visible_devices = ""
 pipeline_parallel = 0
 
 
+[memory]
+
+# Ceiling for a server's host-RAM prompt cache (llama.cpp --cache-ram).
+# Saved slot states are restored from it instead of re-processing long prompts
+# when more conversations are active than there are server slots.  Filled on
+# demand, not reserved up front.  Either a share of physical RAM ("60%") or an
+# integer MiB value; -1 = unlimited, 0 = disable.  Omit to keep the server
+# default (8 GiB for llama.cpp — less than one full 128K slot of a large model).
+host_cache_ram = "60%"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Local cache mounts
 #

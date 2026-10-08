@@ -143,6 +143,36 @@ GGUF_QUANTS_LONGEST_FIRST: tuple[GGUFQuant, ...] = tuple(
 )
 
 
+# llama.cpp splits large models into '<base>-00001-of-000NN.gguf' shards.  The
+# first shard carries the metadata and pulls in the rest when loaded, so a split
+# set is one model whose catalog path is the first shard.
+_GGUF_SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})$")
+
+
+def gguf_split_info(gguf_path: Path) -> tuple[str, int, int] | None:
+    """Return (base_stem, index, total) for a llama.cpp split shard, else None."""
+    match = _GGUF_SPLIT_RE.match(gguf_path.stem)
+    if match is None:
+        return None
+    return match["base"], int(match["index"]), int(match["total"])
+
+
+def gguf_shard_paths(gguf_path: Path) -> list[Path]:
+    """Every file making up the model at *gguf_path*: all shards of a split set, else itself.
+
+    Shard names are derived from the split pattern, so shards missing from disk
+    are still listed — callers decide whether that is an error.
+    """
+    info = gguf_split_info(gguf_path)
+    if info is None:
+        return [gguf_path]
+    base, _, total = info
+    return [
+        gguf_path.parent / f"{base}-{index:05d}-of-{total:05d}{gguf_path.suffix}"
+        for index in range(1, total + 1)
+    ]
+
+
 class RuntimeQuant(str, Enum):
     """Runtime quantization mode applied by a server at model-load time.
 
@@ -352,9 +382,21 @@ class AIModel:
         """Return the fastest available path: cached_path if present on disk, else path."""
         if self.cached_path:
             p = Path(self.cached_path)
-            if p.exists():
+            # An incomplete copy of a split GGUF would fail to load; fall back to the source.
+            if all(shard.exists() for shard in gguf_shard_paths(p)):
                 return self.cached_path
         return self.path
+
+    def resolve_mmproj_path(self) -> str:
+        """Return the mmproj copy beside the cached model when the cache is in use, else mmproj_path."""
+        if not self.mmproj_path:
+            return ""
+        resolved = self.resolve_path()
+        if resolved != self.path:
+            cached = Path(resolved).parent / Path(self.mmproj_path).name
+            if cached.is_file():
+                return str(cached)
+        return self.mmproj_path
 
     def cached_in(self, mounts: "list[CacheMount]") -> "CacheMount | None":
         """Return the cache mount that contains cached_path, or None if not cached."""
@@ -578,7 +620,11 @@ class ServerSoftware:
     # number of GPUs actually selected.  Set to None for servers that handle any GPU count
     # automatically (tabbyAPI --gpu-split-auto, llama.cpp layer distribution).
     gpu_count_param: str | None = None
-
+    # concurrency_param: names the default_params key holding the number of requests the
+    # server processes concurrently (llama.cpp "parallel" slots).  When set, GpuSelectScreen
+    # lets the user adjust it per launch and remembers the value per model.
+    # The model's effective_ctx stays the per-request context; each builder translates.
+    concurrency_param: str | None = None
     def available_runtime_quants(self, fmt: ModelFormat) -> tuple[RuntimeQuant, ...]:
         """Return ordered runtime quant options for the given input format.
 

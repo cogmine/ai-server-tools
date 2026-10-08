@@ -83,13 +83,14 @@ cd ~/ai-server-tools
         gpu.py                      NVML poller (pynvml) + GpuRow data + formatting helpers
         ingest.py                   CLI tool — scans a directory for new models and appends entries to models_local.json
         launch.py                   Command builders, process spawner, cache manager
+        fit.py                      Pre-launch memory-fit estimates (FitProbe per server; llama.cpp: llama-fit-params)
         models.py                   Schema — ModelFormat enum, AIModel/ServerSoftware dataclasses
         models_local.json.example   Tracked template — schema reference + 3 sample entries
         screens.py                  All Textual screens (AITypeScreen → ModelSelectScreen → …)
         model_launcher.tcss         Textual CSS layout
         DESIGN.md                   Architecture and design decisions
         user_data/                  Gitignored — all machine-specific and personal data
-            config.toml             Machine-specific paths and GPU counts
+            config.toml             Machine-specific paths, GPU counts, host RAM budget ([memory])
             environments.json       Registered environments per server (maintained by the TUI)
             models_local.json       AI_MODELS catalog (model paths, quant details, test results)
     gpu_monitor/                    Standalone GPU stats Textual app
@@ -126,6 +127,16 @@ Two native environments (registered in the launcher, `kind: native`):
   && /usr/bin/cmake --build build -j 32` (~10 min). The launcher shows each build's version
   (`llama-server --version`, via `VersionProbe`); promote it with `s` (set default) in the
   environment manager once validated.
+- **Launch flags** (`_build_llamacpp`, see launcher `DESIGN.md` → "llama.cpp Launch Flags"): `parallel`
+  slots (set per launch with `+`/`-` on the GPU screen, remembered per model) → `--parallel N
+  --ctx-size effective_ctx × N` (fixed slots split `--ctx-size` evenly, so catalog `ctx` stays per-request);
+  `kv_cache_type` default `q8_0` (`--cache-type-k/-v`; lets BeMag 123B Q8 fit 5 × 128K slots — ≈117 GiB KV
+  vs ≈220 GiB at f16); `cache_ram_mib` from `[memory] host_cache_ram` in `config.toml` (`--cache-ram`,
+  `"60%"` ≈ 150 GiB here; llama.cpp's 8 GiB default holds < one full 128K slot state); `--threads` omitted
+  (llama.cpp uses the 16 physical cores).
+- **Memory-fit estimate**: `launcher/fit.py` runs `llama-fit-params` (same build, same model/context args via
+  `llamacpp_model_args()`) in a background worker on the GPU screen — exact for any architecture, ~2 s,
+  measured against currently free VRAM. Excludes `--mmproj` and `extra_flags`.
 
 ---
 
@@ -149,7 +160,7 @@ Two native environments (registered in the launcher, `kind: native`):
 
 - **Conda env**: `textgen` (`~/miniconda3/envs/textgen/`)
 - **Entry point**: `~/text-generation-webui/server.py`
-- **Staging symlink**: `launch.py` creates `~/text-generation-webui/user_data/models/<model.id>` → resolved path before spawning. GGUF files get a `.gguf` suffix in the link name so ooba's scanner identifies the format automatically.
+- **Staging symlink**: `launch.py` creates `~/text-generation-webui/user_data/models/<model.id>` → resolved path before spawning. GGUF files get a `.gguf` suffix in the link name so ooba's scanner identifies the format automatically. Split GGUFs are staged as a directory `<model.id>/` of per-shard links keeping their original names (llama.cpp finds shards 2..N by name), and launched with `--model <model.id>/<shard-1 filename>`.
 - **Formats**: safetensors BF16/FP16, legacy `.bin`, GGUF, INT8_BNB, EXL2
 - **Ports**: API on `--api-port` (default from `default_params`), WebUI on `--listen-port`
 
@@ -252,7 +263,7 @@ Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted
 `min_sm` field: integer minimum CUDA compute capability (e.g. `89` for sm_89+); `0` = no constraint. Checked against `system_min_sm()` from `gpu.py` (cached). When `model.hw_compat(system_sm)` is `False`, the warn column shows `⛔` and the note bar below the model table shows `model.hw_note`.
 `hw_note` field: string explaining the hardware requirement — shown in the launcher note bar when incompatible. Omitted from JSON when empty.
 `comfyui_subdir` field: `image_gen` models only — ComfyUI `models/` subdirectory to stage into (e.g. `"checkpoints"` for SDXL, `"diffusion_models"` for FLUX UNets, `"vae"`, `"loras"`). Default `"checkpoints"` — key omitted from JSON for checkpoints. Staging uses the original source filename (`staging_use_source_filename=True` on ComfyUI's `ServerSoftware`) so ComfyUI workflows can reference models by their natural names (e.g. `flux1-dev.safetensors`, `ae.safetensors`).
-`mmproj_path` field: absolute path to the companion `mmproj-*.gguf` vision encoder file; omitted from JSON when empty. Auto-detected by `ingest`/`refresh` when found in the GGUF bundle root (flat layout) or bundle root one level above the quant subdir. Populated via `copy-mmproj` + `refresh` workflow. Passed as `--mmproj` to llama.cpp and ooba at launch time.
+`mmproj_path` field: absolute path to the companion `mmproj-*.gguf` vision encoder file; omitted from JSON when empty. Auto-detected by `ingest`/`refresh` when found in the GGUF bundle root (flat layout) or bundle root one level above the quant subdir. Populated via `copy-mmproj` + `refresh` workflow. Passed as `--mmproj` to llama.cpp and ooba at launch time via `resolve_mmproj_path()` (prefers the copy cached beside the model; caching copies the mmproj along with the GGUF).
 `tool_call_parser` field: vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, vLLM emits `--enable-auto-tool-choice --tool-call-parser <name>` and SGLang emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP` in `launch.py`). Omitted from JSON when empty.
 Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. Default order: `fav → status → name`. Clicking a header promotes it to primary (ascending); clicking the primary toggles direction. `_STATUS_RANK` maps composite status symbols (✓, ✓?, ✓✗, ✗?, ✗, ?) to integers 0–5 for sort.
 
@@ -262,7 +273,7 @@ Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. D
 The launcher does **not** embed GPU stats — run `gpu_monitor` separately while a model is loaded.
 
 **Flow** (text-gen): AITypeScreen → ModelSelectScreen → ServerSelectScreen → [EnvSelectScreen] → [QuantSelectScreen] → GpuSelectScreen → ConfirmLaunch → exits TUI with a `LaunchJob(factory, model, server, env)` → `Popen` → `proc.wait()`. `EnvSelectScreen` only appears when the server has >1 registered environment (default pre-focused); `_continue_launch()` refuses environments missing on disk.
-`GpuSelectScreen`: shows all GPUs with VRAM utilization; multi-select (Space) for multi-GPU servers, radio-button for `max_gpus=1` servers. `→`/`Enter` to confirm. `a` selects all. Status bar shows live `CUDA_VISIBLE_DEVICES` string and auto-adjusted `gpu_count_param` (e.g. `pipeline_parallel → N` for vLLM/SGLang). If NVML unavailable, skips to ConfirmLaunch with default devices. Selected devices → `cuda_devices` arg to `launch()`; GPU count → `param_overrides[gpu_count_param]` → `build_cmd()` last-layer merge.
+`GpuSelectScreen`: shows all GPUs with VRAM utilization; multi-select (Space) for multi-GPU servers, radio-button for `max_gpus=1` servers. `→`/`Enter` to confirm. `a` selects all. Status bar shows live `CUDA_VISIBLE_DEVICES` string and auto-adjusted `gpu_count_param` (e.g. `pipeline_parallel → N` for vLLM/SGLang). If NVML unavailable, skips to ConfirmLaunch with default devices. Selected devices → `cuda_devices` arg to `launch()`; GPU count → `param_overrides[gpu_count_param]` → `build_cmd()` last-layer merge. For servers with `concurrency_param` (llama.cpp `parallel`), `+`/`-` set the slot count (→ `param_overrides`; persisted per model on launch via `save_server_param()`), and when `fit.py` has a probe for the server, a debounced background worker shows a memory-fit verdict for the current selection.
 `g`/`x`/`?` marking happens on the deepest screen of the launch: `ServerSelectScreen` only for single-env servers without runtime quants for the model; `EnvSelectScreen` for multi-env servers without quants; `QuantSelectScreen` (per env + quant option) otherwise. Shallower screens disable the bindings via `check_action`.
 Path validation before GpuSelectScreen; missing files show a toast notification.
 

@@ -214,10 +214,14 @@ GpuTable DataTable {
     border: round $primary-darken-1;
 }
 
-#gpu-status {
+#gpu-status, #gpu-fit {
     height: 2;
     margin: 0 1;
     padding: 0 1;
     background: $panel;
     color: $text;
+}
+
+#gpu-fit.-empty {
+    display: none;
 }
