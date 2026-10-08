@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# gpu-power-limit — idempotently apply NVIDIA GPU power limits.
+#
+# Usage: gpu-power-limit IDX[,IDX...]=WATTS|default ...
+#   e.g. gpu-power-limit 0,1,2=250 3=default
+#
+# Indices are nvidia-smi (NVML) indices; "default" is the card's factory limit.
+# Only GPUs whose current limit differs from the target are changed, so sudo (and
+# its password prompt) is needed only when something actually changes — typically
+# after a reboot or GPU reset.  Emitted by the launcher ahead of a server command
+# (launcher/gpu_power.py) so the logged command reproduces the power setup.
+set -euo pipefail
+export LC_ALL=C
+
+usage() {
+    echo "usage: $(basename "$0") IDX[,IDX...]=WATTS|default ..." >&2
+    exit 2
+}
+(( $# )) || usage
+
+declare -A target=()  # index → watts | "default"
+for arg in "$@"; do
+    [[ $arg =~ ^([0-9]+(,[0-9]+)*)=([0-9]+|default)$ ]] || usage
+    value=${BASH_REMATCH[3]}
+    IFS=, read -ra indices <<< "${BASH_REMATCH[1]}"
+    for i in "${indices[@]}"; do target[$i]=$value; done
+done
+
+ids=$(IFS=,; echo "${!target[*]}")
+if ! current=$(nvidia-smi -i "$ids" --query-gpu=index,power.limit,power.default_limit --format=csv,noheader,nounits); then
+    echo "gpu-power-limit: cannot query GPUs $ids: $current" >&2
+    exit 1
+fi
+
+declare -A change=()  # watts → comma-separated indices
+while IFS=', ' read -r idx limit default; do
+    want=${target[$idx]}
+    [[ $want == default ]] && want=$default
+    want=$(printf '%.0f' "$want")
+    if [[ $(printf '%.0f' "$limit") != "$want" ]]; then
+        change[$want]+="${change[$want]:+,}$idx"
+    fi
+done <<< "$current"
+
+if (( ${#change[@]} == 0 )); then
+    echo "GPU power limits already set: $*"
+    exit 0
+fi
+for watts in "${!change[@]}"; do
+    echo "Setting GPU ${change[$watts]} power limit → ${watts} W"
+    sudo -p "[sudo] password for %u (GPU power limit): " nvidia-smi -i "${change[$watts]}" -pl "$watts"
+done

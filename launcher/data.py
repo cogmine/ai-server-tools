@@ -31,20 +31,23 @@ from launcher.config import CONFIG
 # A model's server_params[server.id] is merged on top at launch time;
 # only values that differ from these defaults need to be specified there.
 
+# Checkpoints described by an HF config.json, which vLLM / SGLang can override at launch.
+_HF_CONFIG_FORMATS: frozenset[ModelFormat] = frozenset({
+    ModelFormat.SAFETENSORS_BF16,
+    ModelFormat.SAFETENSORS_FP16,
+    ModelFormat.SAFETENSORS_FP8,
+    ModelFormat.AWQ,
+    ModelFormat.GPTQ,
+    ModelFormat.INT8_BNB,
+    ModelFormat.PYTORCH_BIN,
+})
+
 SERVERS: list[ServerSoftware] = [
 
     ServerSoftware(
         id="vllm",
         label="vLLM",
-        supported_formats=frozenset({
-            ModelFormat.SAFETENSORS_BF16,
-            ModelFormat.SAFETENSORS_FP16,
-            ModelFormat.SAFETENSORS_FP8,
-            ModelFormat.AWQ,
-            ModelFormat.GPTQ,
-            ModelFormat.INT8_BNB,
-            ModelFormat.PYTORCH_BIN,
-        }),
+        supported_formats=_HF_CONFIG_FORMATS,
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
         default_params={
             "tensor_parallel":   1,
@@ -104,6 +107,10 @@ SERVERS: list[ServerSoftware] = [
         # pipeline_parallel must equal the number of GPUs selected; GpuSelectScreen
         # will auto-inject param_overrides["pipeline_parallel"] = selected_gpu_count.
         gpu_count_param="pipeline_parallel",
+        # RoPE scaling via --hf-overrides; vLLM refuses a max-model-len past the
+        # config's own limit unless explicitly allowed.
+        rope_scaling_formats=_HF_CONFIG_FORMATS,
+        rope_scaling_env={"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
     ),
 
     ServerSoftware(
@@ -146,6 +153,7 @@ SERVERS: list[ServerSoftware] = [
             template="llama.cpp b{build} ({commit})",
         ),
         concurrency_param="parallel",
+        rope_scaling_formats=frozenset({ModelFormat.GGUF}),
     ),
 
     ServerSoftware(
@@ -217,6 +225,8 @@ SERVERS: list[ServerSoftware] = [
         # format scanner can identify them automatically.
         uses_staging_dir=True,
         staging_format_suffixes={ModelFormat.GGUF: ".gguf"},
+        # Only its llama.cpp loader can apply RoPE scaling (forwarded via --extra-flags).
+        rope_scaling_formats=frozenset({ModelFormat.GGUF}),
     ),
 
     ServerSoftware(
@@ -257,16 +267,7 @@ SERVERS: list[ServerSoftware] = [
     ServerSoftware(
         id="sglang",
         label="SGLang",
-        supported_formats=frozenset({
-            ModelFormat.SAFETENSORS_BF16,
-            ModelFormat.SAFETENSORS_FP16,
-            ModelFormat.SAFETENSORS_FP8,
-            ModelFormat.AWQ,
-            ModelFormat.GPTQ,
-            ModelFormat.INT8_BNB,
-            ModelFormat.PYTORCH_BIN,
-            ModelFormat.GGUF,
-        }),
+        supported_formats=_HF_CONFIG_FORMATS | {ModelFormat.GGUF},
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
         default_params={
             "tensor_parallel":   1,
@@ -287,6 +288,9 @@ SERVERS: list[ServerSoftware] = [
         cuda_home=CONFIG.cuda_home_sglang,
         # Same parallelism constraint as vLLM: pipeline_parallel must match GPU count.
         gpu_count_param="pipeline_parallel",
+        # RoPE scaling via --json-model-override-args (HF-config checkpoints only).
+        rope_scaling_formats=_HF_CONFIG_FORMATS,
+        rope_scaling_env={"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"},
     ),
 
 ]

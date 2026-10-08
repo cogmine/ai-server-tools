@@ -47,8 +47,8 @@ class FitProbe(ABC):
 
     @abstractmethod
     def estimate(
-        self, env: Environment, model: AIModel, params: dict[str, Any], cuda_devices: str,
-        cancelled: Callable[[], bool],
+        self, server: ServerSoftware, env: Environment, model: AIModel, params: dict[str, Any],
+        cuda_devices: str, cancelled: Callable[[], bool],
     ) -> FitEstimate:
         """Estimate memory use for a launch of *model* with resolved builder *params*.
 
@@ -82,10 +82,10 @@ class LlamaCppFitProbe(FitProbe):
         return env.executable(self.executable).is_file()
 
     def estimate(
-        self, env: Environment, model: AIModel, params: dict[str, Any], cuda_devices: str,
-        cancelled: Callable[[], bool],
+        self, server: ServerSoftware, env: Environment, model: AIModel, params: dict[str, Any],
+        cuda_devices: str, cancelled: Callable[[], bool],
     ) -> FitEstimate:
-        cmd = [str(env.executable(self.executable)), *llamacpp_model_args(model, params), "-lv", "4"]
+        cmd = [str(env.executable(self.executable)), *llamacpp_model_args(server, model, params), "-lv", "4"]
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -161,4 +161,4 @@ def estimate_fit(
     if probe is None:
         return None
     params = launch_params(server, model, param_overrides=param_overrides)
-    return probe.estimate(env, model, params, cuda_devices, cancelled)
+    return probe.estimate(server, env, model, params, cuda_devices, cancelled)

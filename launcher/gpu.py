@@ -35,6 +35,8 @@ def _ensure_nvml() -> bool:
                 _nvml_ready = False
     return _nvml_ready
 
+_POWER_LIMIT_TOLERANCE_W = 0.5  # NVML reports mW; ignore rounding noise vs. default
+
 from textual.app import ComposeResult
 from textual.reactive import reactive
 from textual.widget import Widget
@@ -56,9 +58,28 @@ class GpuRow:
     pcie_gen: str     # e.g. "4/4"
     pcie_width: str   # e.g. "16/16"
     error: str = ""          # non-empty → row is in error state
-    uuid: str = ""           # first 8 hex chars of GPU UUID (stable across slot rotations)
+    uuid: str = ""           # full NVML UUID, e.g. "GPU-1a2b3c4d-…" (stable across slot rotations)
     compute_cap: str = ""    # CUDA compute capability, e.g. "8.6" for sm_86
     pci_root: str = ""       # root complex domain hex, e.g. "15" — GPUs sharing a root are on the same physical slot
+    power_default_w: float = 0.0  # factory (VBIOS) default power limit
+    power_min_w: float = 0.0      # lowest settable power limit
+    power_max_w: float = 0.0      # highest settable power limit
+
+    @property
+    def short_uuid(self) -> str:
+        """First 8 hex chars of the UUID — compact display identifier."""
+        return self.uuid.removeprefix("GPU-")[:8]
+
+    @property
+    def power_limit_delta_w(self) -> float:
+        """Current power limit minus the factory default (negative = capped)."""
+        if self.power_default_w <= 0:
+            return 0.0
+        return self.power_limit_w - self.power_default_w
+
+    @property
+    def power_limit_is_default(self) -> bool:
+        return abs(self.power_limit_delta_w) <= _POWER_LIMIT_TOLERANCE_W
 
     @property
     def mem_pct(self) -> float:
@@ -108,10 +129,20 @@ def _fmt_temp(row: GpuRow) -> str:
     return f"[{color}]{row.temp_c:.0f}°C[/]"
 
 
+def fmt_power_limit_w(row: GpuRow, watts: float) -> str:
+    """*watts* as a power limit for *row*'s card: ``↓`` below / ``↑`` above its factory default."""
+    text = f"{watts:.0f}"
+    if row.power_default_w <= 0 or abs(watts - row.power_default_w) <= _POWER_LIMIT_TOLERANCE_W:
+        return text
+    if watts < row.power_default_w:
+        return f"[cyan]{text}↓[/]"
+    return f"[magenta]{text}↑[/]"
+
+
 def _fmt_power(row: GpuRow) -> str:
     pct = (row.power_w / row.power_limit_w * 100) if row.power_limit_w > 0 else 0
     color = _color(pct, 60, 90)
-    return f"[{color}]{row.power_w:.0f}[/]/{row.power_limit_w:.0f}W"
+    return f"[{color}]{row.power_w:.0f}[/]/{fmt_power_limit_w(row, row.power_limit_w)}W"
 
 
 def _pci_root(bus_addr: str) -> str:
@@ -192,6 +223,8 @@ def poll_gpus() -> list[GpuRow]:
             temp        = nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
             power_draw  = nvml.nvmlDeviceGetPowerUsage(handle) / 1000.0          # mW → W
             power_limit = nvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0
+            power_default = nvml.nvmlDeviceGetPowerManagementDefaultLimit(handle) / 1000.0
+            power_min_mw, power_max_mw = nvml.nvmlDeviceGetPowerManagementLimitConstraints(handle)
 
             gen_cur   = nvml.nvmlDeviceGetCurrPcieLinkGeneration(handle)
             gen_max   = nvml.nvmlDeviceGetMaxPcieLinkGeneration(handle)
@@ -212,9 +245,12 @@ def poll_gpus() -> list[GpuRow]:
                 temp_c=float(temp),
                 pcie_gen=f"{gen_cur}/{gen_max}",
                 pcie_width=f"{width_cur}/{width_max}",
-                uuid=uid_short,
+                uuid=uuid_raw,
                 compute_cap=f"{cap_major}.{cap_minor}",
                 pci_root=_pci_root(bus_id),
+                power_default_w=power_default,
+                power_min_w=power_min_mw / 1000.0,
+                power_max_w=power_max_mw / 1000.0,
             ))
         except nvml.NVMLError as exc:
             rows.append(GpuRow(

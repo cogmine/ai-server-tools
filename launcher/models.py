@@ -255,6 +255,33 @@ def fmt_ctx(ctx: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RopeScaling:
+    """Context extension by RoPE scaling (e.g. YaRN), applied at launch by servers that support it.
+
+    Serialised in the catalog as {"factor": 4.0} with optional "method" and "original_ctx".
+    """
+    factor: float
+    method: str = "yarn"     # RoPE scaling type as named by llama.cpp and HF configs
+    original_ctx: int = 0    # pre-scaling (trained) context; 0 = the model's native ctx
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RopeScaling":
+        return cls(
+            factor=float(d["factor"]),
+            method=d.get("method", "yarn"),
+            original_ctx=int(d.get("original_ctx", 0)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"factor": self.factor}
+        if self.method != "yarn":
+            d["method"] = self.method
+        if self.original_ctx:
+            d["original_ctx"] = self.original_ctx
+        return d
+
+
 @dataclass
 class CacheMount:
     """A local storage tier that holds a faster copy of a model.
@@ -294,6 +321,7 @@ class AIModel:
     ai_types: frozenset[AIType]    # capabilities this model exposes
     ctx: int = 32_768              # model's native/trained max context length (tokens)
     ctx_override: int = 0         # launch override — passed to the server instead of ctx; 0 = use ctx
+    rope_scaling: RopeScaling | None = None  # context extension; scales the default launch ctx
     cached_path: str = ""          # faster local copy; resolve_path() returns this when set and present
     size_gb: float = 0.0           # disk footprint in GB
     params_m: int = 0              # parameter count in millions (0 = unknown)
@@ -343,6 +371,7 @@ class AIModel:
             ai_types=frozenset(AIType(t) for t in d.get("ai_types", ["text_gen"])),
             ctx=int(d.get("ctx", 32_768)),
             ctx_override=int(d.get("ctx_override", 0)),
+            rope_scaling=RopeScaling.from_dict(d["rope_scaling"]) if d.get("rope_scaling") else None,
             size_gb=float(d.get("size_gb", 0.0)),
             params_m=int(d.get("params_m", 0)),
             moe_experts=int(d.get("moe_experts", 0)),
@@ -425,9 +454,19 @@ class AIModel:
         return None
 
     @property
+    def scaled_ctx(self) -> int:
+        """Native ctx extended by rope_scaling's factor (ctx when unscaled)."""
+        return round(self.ctx * self.rope_scaling.factor) if self.rope_scaling else self.ctx
+
+    @property
+    def rope_original_ctx(self) -> int:
+        """Pre-scaling context that rope_scaling extends from."""
+        return (self.rope_scaling.original_ctx if self.rope_scaling else 0) or self.ctx
+
+    @property
     def effective_ctx(self) -> int:
-        """Context length to pass to the server: ctx_override if set, otherwise ctx."""
-        return self.ctx_override if self.ctx_override else self.ctx
+        """Context length to pass to the server: ctx_override if set, otherwise scaled_ctx."""
+        return self.ctx_override if self.ctx_override else self.scaled_ctx
 
     @property
     def format_tag(self) -> str:
@@ -638,6 +677,24 @@ class ServerSoftware:
     # lets the user adjust it per launch and remembers the value per model.
     # The model's effective_ctx stays the per-request context; each builder translates.
     concurrency_param: str | None = None
+    # Formats for which this server's builder applies a model's rope_scaling.  Empty =
+    # unsupported: such launches fall back to the native context (see launch_ctx).
+    rope_scaling_formats: frozenset[ModelFormat] = field(default_factory=frozenset)
+    # Env vars set when rope_scaling is applied (e.g. vLLM's long-context permission).
+    rope_scaling_env: dict[str, str] = field(default_factory=dict)
+
+    def applies_rope_scaling(self, model: AIModel) -> bool:
+        return model.rope_scaling is not None and model.format in self.rope_scaling_formats
+
+    def launch_ctx(self, model: AIModel) -> int:
+        """Per-request context to launch *model* with on this server.
+
+        Without RoPE scaling support a scaled model is capped at its native ctx —
+        running past the trained length unscaled degrades output badly.
+        """
+        if model.rope_scaling is not None and not self.applies_rope_scaling(model):
+            return min(model.effective_ctx, model.ctx)
+        return model.effective_ctx
     def available_runtime_quants(self, fmt: ModelFormat) -> tuple[RuntimeQuant, ...]:
         """Return ordered runtime quant options for the given input format.
 

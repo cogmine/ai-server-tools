@@ -44,9 +44,10 @@ from typing import Any, Callable
 
 from launcher.data import AI_MODELS, CACHE_MOUNTS
 from launcher.environments import ENVIRONMENTS, Environment
+from launcher.gpu_power import PowerLimitStep
 from launcher.models import (
     AIModel, CacheMount, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
-    QuantizationTool, RuntimeQuant, ServerSoftware, _quant_key, gguf_shard_paths,
+    QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key, gguf_shard_paths,
 )
 from launcher.config import CONFIG
 
@@ -347,7 +348,7 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         "--tensor-parallel-size",         str(p["tensor_parallel"]),
         "--pipeline-parallel-size",       str(p["pipeline_parallel"]),
         "--gpu-memory-utilization",       str(p["gpu_mem_util"]),
-        "--max-model-len",                "-1" if p.get("auto_fit_ctx") else str(model.effective_ctx),
+        "--max-model-len",                "-1" if p.get("auto_fit_ctx") else str(server.launch_ctx(model)),
         "--host",                         "0.0.0.0",
         "--port",                         str(p["port"]),
     ]
@@ -378,14 +379,57 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd += ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"]
     if model.tool_call_parser:
         cmd += ["--enable-auto-tool-choice", "--tool-call-parser", model.tool_call_parser]
+    if server.applies_rope_scaling(model):
+        cmd += ["--hf-overrides", json.dumps(_hf_rope_override(model))]
     cmd.extend(p.get("extra_flags", []))
     return cmd
+
+
+def _hf_rope_override(model: AIModel) -> dict[str, Any]:
+    """config.json override enabling model.rope_scaling (vLLM --hf-overrides, SGLang --json-model-override-args).
+
+    Built from the model's own RoPE block: servers replace the block wholesale, so
+    architecture fields such as mrope_section, partial_rotary_factor and rope_theta
+    must be carried over.  Multimodal checkpoints nest it under text_config;
+    transformers ≥ 5 names it rope_parameters, older configs rope_scaling.
+    """
+    rs = model.rope_scaling
+    assert rs is not None
+    root = Path(model.resolve_path())
+    cfg_path = (root if root.is_dir() else root.parent) / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    nested = isinstance(cfg.get("text_config"), dict)
+    section = cfg["text_config"] if nested else cfg
+    key = "rope_parameters" if "rope_parameters" in section else "rope_scaling"
+    rope = dict(section.get(key) or {})
+    if "type" in rope:
+        rope["type"] = rs.method  # legacy spelling of rope_type
+    rope.update(
+        rope_type=rs.method,
+        factor=rs.factor,
+        original_max_position_embeddings=model.rope_original_ctx,
+    )
+    return {"text_config": {key: rope}} if nested else {key: rope}
+
+
+def _llamacpp_rope_args(model: AIModel) -> list[str]:
+    """llama-server flags applying model.rope_scaling (also forwarded by ooba)."""
+    rs = model.rope_scaling
+    assert rs is not None
+    return [
+        "--rope-scaling",  rs.method,
+        "--rope-scale",    f"{rs.factor:g}",
+        "--yarn-orig-ctx", str(model.rope_original_ctx),
+    ]
 
 
 def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     cmd = [
         str(env.executable("llama-server")),
-        *llamacpp_model_args(model, p),
+        *llamacpp_model_args(server, model, p),
         "--alias",        model.id,
         "--host",         "0.0.0.0",
         "--port",         str(p["port"]),
@@ -410,21 +454,23 @@ def _mtp_args(model: AIModel, p: dict) -> list[str]:
     return ["--spec-type", "draft-mtp", "--model-draft", model.resolve_mtp_path()]
 
 
-def llamacpp_model_args(model: AIModel, p: dict) -> list[str]:
+def llamacpp_model_args(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:
     """Model, placement and context arguments shared by llama-server and llama-fit-params.
 
     With fixed slots llama.cpp divides --ctx-size evenly between them, so it is
-    emitted as effective_ctx × parallel to give every slot the full per-request context.
+    emitted as the per-request context × parallel to give every slot the full context.
     """
     args = [
         "--model",        p["_model_path"],
         "--n-gpu-layers", str(p["n_gpu_layers"]),
         "--split-mode",   p["split_mode"],
-        "--ctx-size",     str(model.effective_ctx * p["parallel"]),
+        "--ctx-size",     str(server.launch_ctx(model) * p["parallel"]),
         "--parallel",     str(p["parallel"]),
     ]
     if p["kv_cache_type"]:
         args += ["--cache-type-k", p["kv_cache_type"], "--cache-type-v", p["kv_cache_type"]]
+    if server.applies_rope_scaling(model):
+        args += _llamacpp_rope_args(model)
     return args
 
 
@@ -436,7 +482,7 @@ def _build_tabby(server: ServerSoftware, env: Environment, model: AIModel, p: di
         "--model-dir",    p["model_dir"],
         "--model-name",   model.id,
         "--cache-mode",   p["cache_mode"],
-        "--max-seq-len",  str(model.effective_ctx),
+        "--max-seq-len",  str(server.launch_ctx(model)),
         "--host",         "0.0.0.0",
         "--port",         str(p["port"]),
         "--disable-auth", str(p["disable_auth"]),
@@ -458,7 +504,7 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         "--model",          model_ref,
         "--model-dir",      p["model_dir"],
         "--user-data-dir",  user_data_dir,
-        "--ctx-size",       str(model.effective_ctx),
+        "--ctx-size",       str(server.launch_ctx(model)),
         "--api",
         "--api-port",       str(p["api_port"]),
         "--listen",
@@ -476,6 +522,9 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         if model.mmproj_path:
             cmd += ["--mmproj", model.resolve_mmproj_path()]
         cmd += _mtp_args(model, p)
+    if server.applies_rope_scaling(model):
+        # ooba has no RoPE options of its own; it forwards these to its llama-server.
+        cmd += ["--extra-flags", shlex.join(_llamacpp_rope_args(model))]
     if p.get("cache_type"):
         cmd += ["--cache-type", p["cache_type"]]
     rq = p.get("_runtime_quant")
@@ -496,7 +545,7 @@ def _build_sglang(server: ServerSoftware, env: Environment, model: AIModel, p: d
         "--tensor-parallel-size",  str(p["tensor_parallel"]),
         "--pipeline-parallel-size", str(p["pipeline_parallel"]),
         "--mem-fraction-static",   str(p["mem_fraction"]),
-        "--context-length",        str(model.effective_ctx),
+        "--context-length",        str(server.launch_ctx(model)),
         "--trust-remote-code",
         "--host",                  "0.0.0.0",
         "--port",                  str(p["port"]),
@@ -512,6 +561,8 @@ def _build_sglang(server: ServerSoftware, env: Environment, model: AIModel, p: d
     if model.tool_call_parser:
         sglang_name = _SGLANG_TOOL_PARSER_MAP.get(model.tool_call_parser, model.tool_call_parser)
         cmd += ["--tool-call-parser", sglang_name]
+    if server.applies_rope_scaling(model):
+        cmd += ["--json-model-override-args", json.dumps(_hf_rope_override(model))]
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -835,8 +886,13 @@ def build_launch_command(
     runtime_quant: "RuntimeQuant | None" = None,
     cuda_devices: str | None = None,
     param_overrides: dict[str, Any] | None = None,
+    power_step: PowerLimitStep | None = None,
 ) -> str:
-    """Return the complete paste-ready shell command for a server launch."""
+    """Return the complete paste-ready shell command for a server launch.
+
+    power_step: GPU power limits applied first (``&&`` — the server never starts
+    with the limits unapplied).
+    """
     env_cmd = ["env"]
     if server.strip_pythonpath:
         env_cmd += ["-u", "PYTHONPATH"]
@@ -853,11 +909,15 @@ def build_launch_command(
         env_vars["LD_LIBRARY_PATH"] = _prepend_path(lib_dir, "LD_LIBRARY_PATH")
         env_vars["LIBRARY_PATH"]    = _prepend_path(lib_dir, "LIBRARY_PATH")
     env_vars.update(server.extra_env)
+    if model is not None and server.applies_rope_scaling(model):
+        env_vars.update(server.rope_scaling_env)
 
     cmd = build_cmd(server, env, model, runtime_quant=runtime_quant, param_overrides=param_overrides)
     command = format_cmd([*env_cmd, *(f"{key}={value}" for key, value in env_vars.items()), *cmd])
     if server.launch_cwd:
         command = f"cd {shlex.quote(server.launch_cwd)} && \\\n  {command}"
+    if power_step is not None:
+        command = f"{power_step.command()} && \\\n  {command}"
     return command
 
 
@@ -895,12 +955,13 @@ def _spawn_with_pty(
     return proc, master_fd
 
 
-def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, cuda_devices: str | None = None, param_overrides: dict[str, Any] | None = None, command: str | None = None) -> tuple[subprocess.Popen[bytes], Path, int]:
+def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, cuda_devices: str | None = None, param_overrides: dict[str, Any] | None = None, power_step: PowerLimitStep | None = None, command: str | None = None) -> tuple[subprocess.Popen[bytes], Path, int]:
     """Build the command and spawn the server process.
 
     env: the Environment (conda env / native build) providing the server's interpreter or binaries.
     cuda_devices: overrides CONFIG.resolved_cuda_devices when set (from GpuSelectScreen).
     param_overrides: merged on top of server/model params (e.g. pipeline_parallel → GPU count).
+    power_step: GPU power limits applied before the server starts (from GpuSelectScreen).
     command: complete shell command override from ConfirmLaunch; executed verbatim when set.
     """
     proc_env = os.environ.copy()
@@ -943,6 +1004,7 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
             runtime_quant=runtime_quant,
             cuda_devices=cuda_devices,
             param_overrides=param_overrides,
+            power_step=power_step,
         )
     quant_str = f" + {runtime_quant.value}" if runtime_quant else ""
     if model is not None:
@@ -1227,6 +1289,22 @@ def save_ctx_override(model: AIModel, value: int) -> None:
             entry["ctx_override"] = value
         else:
             entry.pop("ctx_override", None)
+
+    _patch_catalog(model.id, _apply)
+
+
+def save_rope_scaling(model: AIModel, rope_scaling: RopeScaling | None) -> None:
+    """Persist rope_scaling for a model.  None clears it (native context, unscaled).
+
+    Mutates the in-memory model immediately, then updates the JSON catalog.
+    """
+    model.rope_scaling = rope_scaling
+
+    def _apply(entry: dict) -> None:
+        if rope_scaling is not None:
+            entry["rope_scaling"] = rope_scaling.to_dict()
+        else:
+            entry.pop("rope_scaling", None)
 
     _patch_catalog(model.id, _apply)
 

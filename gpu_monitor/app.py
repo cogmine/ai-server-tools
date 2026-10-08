@@ -97,6 +97,8 @@ class GpuMonitorApp(App):
 
         total_mem_used = 0.0
         total_mem_total = 0.0
+        total_power = 0.0
+        total_power_limit = 0.0
         error_count = 0
         group_counts: dict[int, int] = {}  # group → GPU count
 
@@ -106,7 +108,7 @@ class GpuMonitorApp(App):
             group_counts[grp] = group_counts.get(grp, 0) + 1
             if row.error:
                 error_count += 1
-                vals = [str(row.index), row.uuid or row.bus_id]
+                vals = [str(row.index), row.short_uuid or row.bus_id]
                 if self._grp_col_visible:
                     vals.append(grp_str)
                 vals += [
@@ -119,7 +121,9 @@ class GpuMonitorApp(App):
             else:
                 total_mem_used  += row.mem_used_mib
                 total_mem_total += row.mem_total_mib
-                vals = [str(row.index), row.uuid]
+                total_power       += row.power_w
+                total_power_limit += row.power_limit_w
+                vals = [str(row.index), row.short_uuid]
                 if self._grp_col_visible:
                     vals.append(grp_str)
                 vals += [
@@ -146,6 +150,7 @@ class GpuMonitorApp(App):
                 f"[dim]VRAM:[/]  [bold]{total_gb:.0f}[/] GB total"
                 f"  ·  {used_gb:.0f} GB used"
                 f"  ·  [{free_color}][bold]{free_gb:.0f}[/] GB free[/]"
+                f"  ·  [dim]Power:[/] {total_power / 1000:.1f}/{total_power_limit / 1000:.1f} kW"
                 f"{err_str}"
                 f"{grp_str}"
                 f"{live_str}"

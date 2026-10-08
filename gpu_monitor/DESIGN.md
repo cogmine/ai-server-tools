@@ -20,10 +20,10 @@ A standalone full-screen Textual TUI that shows live per-GPU statistics for all 
 
 `launcher/gpu.py` contains:
 
-- `GpuRow` — dataclass holding one GPU's snapshot: index, bus_id, pci_root, UUID, PCIe gen/width, memory used/total, utilisation, temperature, power used/limit, error flag. `pci_root` is the root complex domain hex (e.g. `"15"`) resolved from sysfs — GPUs sharing a root complex sit on the same physical PCIe slot (possibly via bifurcation).
+- `GpuRow` — dataclass holding one GPU's snapshot: index, bus_id, pci_root, full UUID (`short_uuid` = first 8 hex chars for display), PCIe gen/width, memory used/total, utilisation, temperature, power used/limit, power default/min/max limits, error flag. `pci_root` is the root complex domain hex (e.g. `"15"`) resolved from sysfs — GPUs sharing a root complex sit on the same physical PCIe slot (possibly via bifurcation). `power_limit_delta_w` = current limit − factory default (negative = capped).
 - `poll_gpus() → list[GpuRow]` — queries all GPUs via direct NVML calls (pynvml). On per-device error sets `row.error` and fills what it can. Returns `[]` if NVML is unavailable. Resolves `pci_root` via `/sys/bus/pci/devices/` symlinks (no root required).
 - `assign_slot_groups(rows) → dict[str, int]` — maps each *shared* `pci_root` (2+ GPUs) to a 1-based group number ordered by bus_id. Solitary roots are omitted so the UI shows "-" for ungrouped GPUs. Used by the GPU monitor to display a "Grp" column showing which GPUs share a physical slot.
-- Formatting helpers: `_fmt_mem`, `_fmt_util`, `_fmt_temp`, `_fmt_power` — each returns a Textual-markup string with colour thresholds.
+- Formatting helpers: `_fmt_mem`, `_fmt_util`, `_fmt_temp`, `_fmt_power` — each returns a Textual-markup string with colour thresholds. `_fmt_power` marks a non-default power limit (`↓` cyan = capped, `↑` magenta = raised).
 
 **Why pynvml over nvidia-smi subprocess?** Each `subprocess` spawn costs 5–50 ms (fork + exec + CSV parse). At the fast polling rate of 0.1 s that is 5–50% of the entire interval just spawning a process. pynvml calls the same underlying NVML C library directly; the cost per poll is sub-millisecond. pynvml also returns typed values (ints/floats), eliminating all string parsing and `[N/A]` edge-case handling.
 
@@ -83,9 +83,9 @@ Static identity/topology columns are listed first so they never shift while dyna
 | `Memory` | Dynamic | Block-char progress bar + used/total GB; green → yellow → red at 60%/90% |
 | `Util` | Dynamic | Compute utilisation %; colour-coded |
 | `Temp` | Dynamic | Core temperature °C; colour-coded |
-| `Power` | Dynamic | Current/TDP watts; colour-coded |
+| `Power` | Dynamic | Current draw / power limit watts; draw colour-coded vs. limit. Limit marked `↓`/`↑` when it differs from the factory default, so manually capped cards stand out |
 
-The summary bar at the bottom aggregates total VRAM used vs. total across all GPUs — the single number most relevant when loading a large model. It also shows a per-slot GPU count (e.g. `Slots: 1:1 2:2 3:3 4:3 5:1 6:1 7:1`) so a missing GPU is immediately visible as a group with fewer GPUs than expected.
+The summary bar at the bottom aggregates total VRAM used vs. total across all GPUs — the single number most relevant when loading a large model. It also shows total power draw vs. the sum of power limits (the worst-case PSU load), and a per-slot GPU count (e.g. `Slots: 1:1 2:2 3:3 4:3 5:1 6:1 7:1`) so a missing GPU is immediately visible as a group with fewer GPUs than expected.
 
 ---
 

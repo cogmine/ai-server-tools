@@ -34,9 +34,9 @@ Press `q` or `Escape` to exit.
 | `Memory` | Bar + used / total GB (green → yellow → red at 60% / 90%) |
 | `Util` | GPU compute utilisation % |
 | `Temp` | Core temperature °C |
-| `Power` | Current / TDP watts |
+| `Power` | Current draw / power limit (W). The limit is marked `↓` (cyan) when capped below the card's factory default, `↑` (magenta) when raised above it |
 
-A summary bar at the bottom shows total VRAM used vs. total across all GPUs.
+A summary bar at the bottom shows total VRAM used vs. total across all GPUs, and total power draw vs. the sum of the power limits.
 
 ## File map
 

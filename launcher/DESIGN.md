@@ -28,10 +28,13 @@ fit.py                      Pre-launch memory-fit estimates (FitProbe per server
 screens.py                  All Textual screens
 app.py                      Top-level App class, entry to screen stack
 gpu.py                      NVML polling via pynvml (shared with gpu_monitor)
+gpu_power.py                Per-GPU power limits — PowerLimitStore (per-card choices) + PowerLimitStep (launch-command step)
+scripts/gpu-power-limit     Idempotent applier: sudo nvidia-smi -pl only for GPUs whose limit differs
 ingest.py                   CLI tool — scans a directory for new models and appends entries to models_local.json
 user_data/                  Gitignored — all machine-specific and personal data
     config.toml               Machine-specific paths and GPU counts
     environments.json         Registered environments per server (written by the TUI)
+    gpu_power.json            Chosen GPU power limits keyed by GPU UUID (written by GpuSelectScreen; absent = all defaults)
     models_local.json         AI_MODELS catalog (model paths, quant details, test results)
 ```
 
@@ -94,8 +97,9 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `format` | Gates server compatibility (`ModelFormat` enum) |
 | `ai_types` | frozenset of AIType — determines which type-selection menus it appears in |
 | `ctx` | Native/trained maximum context length (tokens); used verbatim if no `ctx_override` is set |
-| `ctx_override` | Optional launch override (tokens); `0` = use `ctx`. Can be higher or lower than `ctx`. Persisted in JSON. |
-| `effective_ctx` | Property — returns `ctx_override` if non-zero, else `ctx`. This is what builders receive. |
+| `ctx_override` | Optional launch override (tokens); `0` = use `ctx` (scaled by `rope_scaling` when set). Can be higher or lower than `ctx`. Persisted in JSON. |
+| `rope_scaling` | Optional `RopeScaling` — JSON `{"factor": 4.0}` plus optional `"method"` (default `"yarn"`) and `"original_ctx"` (default `ctx`). Extends the default launch context to `ctx × factor` (`scaled_ctx`) on servers that can apply it; see "RoPE scaling" below. Omitted from JSON when unset. |
+| `effective_ctx` | Property — returns `ctx_override` if non-zero, else `scaled_ctx` (`ctx`, or `ctx × rope_scaling.factor`). Builders receive it via `server.launch_ctx(model)`. |
 | `favorite` | Boolean; `True` = pinned model floats to the top of the sorted list. Persisted in JSON (key omitted when `False`). |
 | `min_sm` | Minimum CUDA compute capability required to load this model (integer, e.g. `89` for sm_89+). `0` = no constraint. Checked against `system_min_sm()` at display time. |
 | `hw_note` | Optional human-readable explanation shown in the note bar when `hw_compat()` returns `False`. When omitted, `hw_compat_note` generates a default: `"Requires sm_{min_sm}+ GPU"`. |
@@ -144,6 +148,8 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 | `bundled_cuda_glob` | `str` | Glob, relative to the environment's site-packages, locating a pip-bundled CUDA toolkit (vLLM: `"nvidia/cu1[0-9]*"`). When it matches, that root becomes `CUDA_HOME` and its `lib/` is prepended to `LD_LIBRARY_PATH` / `LIBRARY_PATH` |
 | `lib_symlinks` | `dict[str, str]` | `{link_name: target_glob}` linker-name symlinks self-healed inside the bundled toolkit's `lib/` before spawn (e.g. `libcudart.so` → `libcudart.so.13`) |
 | `extra_env` | `dict[str, str]` | Extra `KEY=VALUE` pairs merged into the command's `env` prefix |
+| `rope_scaling_formats` | `frozenset[ModelFormat]` | Formats for which the builder applies a model's `rope_scaling`. Empty = unsupported; `launch_ctx()` then caps a scaled model at its native `ctx` |
+| `rope_scaling_env` | `dict[str, str]` | Env vars added only when `rope_scaling` is applied (vLLM `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`, SGLang `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`) |
 | `uses_staging_dir` | `bool` | Create symlinks under `model_dir` before launch |
 | `stage_all_models` | `bool` | When `True`, stage every compatible catalog model (ComfyUI — model is chosen per API request, not at launch) |
 | `staging_format_suffixes` | `dict[ModelFormat, str]` | Maps format → file extension suffix for the staging symlink (e.g. `{GGUF: ".gguf"}`; empty = no suffix) |
@@ -278,8 +284,8 @@ Pure button screens need none of this — buttons don't consume `enter`, `right`
 
 **Footer binding conventions**: All screens follow a consistent ordering and glyph convention for footer bindings:
 
-1. **Quit** — always first: `Binding("q", "quit_app", "Quit")`. Omitted on `SetCtxOverrideScreen` (Input captures `q`) and on `CacheProgressScreen` (`q` is the cancel key, not quit).
-2. **Back / Cancel** — always second: `key_display="esc/←"`. Escape-only modals (e.g. `SetCtxOverrideScreen`) use `key_display="esc"`.
+1. **Quit** — always first: `Binding("q", "quit_app", "Quit")`. Omitted on `ContextSettingsScreen` (Input captures `q`) and on `CacheProgressScreen` (`q` is the cancel key, not quit).
+2. **Back / Cancel** — always second: `key_display="esc/←"`. Escape-only modals (e.g. `ContextSettingsScreen`) use `key_display="esc"`.
 3. **Contextual bindings** — alphabetical by key character (e.g. `?`, `c`, `f`, `g`, `l`, `x`, `z`).
 4. **Select / primary action** — always last:
    - DataTable screens: `key_display="↵/→/dbl-click"` — all three methods invoke the same action.
@@ -292,7 +298,7 @@ The App-level `q → quit_app` binding uses `show=False` to prevent duplication 
 
 **Cursor preservation**: `ModelSelectScreen._populate()` saves `table.cursor_row` before rebuild and calls `table.move_cursor(row=saved_row)` after. This ensures navigating Back from the server screen and returning does not reset the position.
 
-**`SetCtxOverrideScreen`**: Pressing `l` on the model list opens a modal `Input` screen. Accepts a plain integer or K-suffixed value (`32K`); blank or `0` clears the override. Values above the native ctx are permitted (for extended-context inference via RoPE scaling). On confirm, calls `save_ctx_override()` and pops itself — `ModelSelectScreen.on_screen_resume()` fires, re-sorts, and calls `_populate()` to refresh the Ctx column.
+**`ContextSettingsScreen`**: Pressing `l` on the model list opens a modal with two `Input`s: a YaRN factor (blank or `1` = off) and a ctx override (plain integer or K-suffixed value such as `32K`; blank or `0` = none). A live preview shows the resulting launch context, warns when it exceeds the (scaled) trained length, and lists which of the model's servers apply YaRN (derived from `rope_scaling_formats`). Editing the factor keeps an existing `method` / `original_ctx`. On confirm, calls `save_rope_scaling()` and `save_ctx_override()` and pops itself — `ModelSelectScreen.on_screen_resume()` fires, re-sorts, and calls `_populate()` to refresh the Ctx column (shown as `effective/native` whenever they differ).
 
 **Favorites (`f` key)**: Pressing `f` on a focused model calls `save_favorite(model, not model.favorite)`, toggling the pinned state. The star column (`★`) shows `★` for favorites and blank for others. Changing favorite state triggers an immediate re-sort and repopulate so the row moves to/from the top without requiring any other interaction.
 
@@ -333,10 +339,11 @@ The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived vi
 **Mechanism**: `CUDA_VISIBLE_DEVICES` is the universal cross-tool GPU selector — every CUDA-based tool (vLLM, llama.cpp, tabbyAPI, SGLang, ComfyUI) respects it. Setting it to `"0,3,5"` remaps those physical GPUs to logical indices 0,1,2 for the process. Physical indices are stable (sourced from NVML/nvidia-smi).
 
 **Screen behaviour**:
-- Calls `poll_gpus()` synchronously on mount (fast NVML call); shows each GPU with current VRAM used/total.
+- Calls `poll_gpus()` synchronously on mount (fast NVML call); shows each GPU with current VRAM used/total and its power limit. The first GPU is highlighted.
 - `max_gpus == 0` (default): multi-select with Space; `a` selects all.
 - `max_gpus == 1`: radio-button behaviour — selecting a GPU auto-deselects any other. `SelectionList.SelectionToggled` is handled to enforce this.
-- `→`/`Enter` confirms. Status bar shows the live `CUDA_VISIBLE_DEVICES` string and, when applicable, the auto-adjusted parallelism param.
+- `p` / `P`: set the power limit for the highlighted / all selected GPUs (see Power limits below).
+- `→`/`Enter` confirms. Status bar shows the live `CUDA_VISIBLE_DEVICES` string and, when applicable, the auto-adjusted parallelism param and the power-limit step.
 - If `poll_gpus()` returns no valid rows (NVML unavailable), the screen skips itself and pushes `ConfirmLaunch` directly with the default device list.
 
 **`gpu_count_param` auto-adjustment**: vLLM and SGLang require their parallelism flags to match the GPU count. When `server.gpu_count_param == "pipeline_parallel"`, `GpuSelectScreen` calls `compute_parallelism(n, model)` to determine the optimal TP×PP split and builds `param_overrides = {"tensor_parallel": tp, "pipeline_parallel": pp}`. The status bar shows the computed split (e.g. `PP=12` or `TP=2 × PP=7`). No auto-adjustment for tabbyAPI (`--gpu-split-auto`) or llama.cpp (distributes layers to visible GPUs automatically).
@@ -347,12 +354,18 @@ The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived vi
 
 `LlamaCppFitProbe` runs `llama-fit-params` from the same build as `llama-server`, with the launch's model/context arguments (`llamacpp_model_args()`, shared with the builder) and `CUDA_VISIBLE_DEVICES` set to the selection. This is llama.cpp's own fitter (the one behind `llama-server --fit`): it reads only model metadata (~2 s; longer when it has to search for a partial-offload split), so it is exact for every architecture — sliding-window, MLA, hybrid/recurrent — includes compute buffers, and measures against memory already in use by other processes. Stdout (`-c N -ngl M …`, `-ngl -1` = everything on GPU) is the verdict contract; sizes are parsed best-effort from the `-lv 4` log (first memory-breakdown table and the `projected to use … free` line), so a log-format change only drops the detail. Not covered: `--mmproj` projectors (not accepted by `llama-fit-params`) and `extra_flags`. Builds without `llama-fit-params` simply show no estimate.
 
+**Power limits** (`gpu_power.py`): each GPU line shows the card's limit (`fmt_power_limit`: `250↓ W`, or `370→250↓ W` when the next launch will change it). `p` sets the limit for the highlighted GPU, `P` for all selected GPUs, via `TextPromptScreen` (whole watts within the cards' common min–max; blank = factory default). Choices persist immediately in `PowerLimitStore` (`POWER_LIMITS`, `user_data/gpu_power.json`), keyed by **full GPU UUID** so a limit follows the physical card across slot changes and applies to every model; a value equal to a card's default is stored as "no limit". `power_limit_step(rows, indices)` returns a `PowerLimitStep` (NVML index → watts, `None` = default) for the GPUs the launch uses (`_launch_indices()` — the selection trimmed to the parallelism plan), or `None` when every launched card is, and should stay, at its default. The step is included whenever a launched card has a choice *or* currently runs at a non-default limit, so the command also resets stray limits and stays reproducible. The status bar previews the step's arguments.
+
+*Why apply at launch rather than at boot?* NVIDIA power limits are lost on reboot, driver reload and GPU reset; persistence mode does not help. Re-applying them in the launch command needs no privileged system setup (no root-owned service or helper), covers every reset cause, and puts the limits in the session log's reproducible command. The trade-off is that cards run at their defaults after a reboot until the next launcher (or pasted) launch, and servers started outside the launcher are unaffected.
+
+*Why a script instead of `sudo nvidia-smi -pl` in the command?* `scripts/gpu-power-limit IDX[,IDX…]=WATTS|default …` queries the current limits first and only invokes `sudo nvidia-smi -i … -pl …` for GPUs that differ, so sudo (and its password prompt) is needed only after a reboot/reset rather than on every launch. The command runs in the server's PTY, but sudo prompts and reads the password on the controlling terminal (`/dev/tty`), which the child inherits from the launcher after the TUI has exited.
+
 **Parallelism computation** (`compute_parallelism` in `launch.py`): reads the model's HF `config.json` for `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `num_hidden_layers`, and the linear-attention head counts `linear_num_key_heads` / `linear_num_value_heads` (hybrid Gated-DeltaNet models). Multimodal checkpoints nest these under `text_config`, which takes precedence over the top level. For PCIe topology (no NVLink), prefers the smallest valid TP (largest PP) to minimise cross-GPU tensor traffic. TP must evenly divide the attention, linear-attention and intermediate dimensions; `num_key_value_heads` must be divisible by TP *or* TP a multiple of it (vLLM/SGLang replicate KV heads when TP exceeds them). Architectures in `_NO_PP_ARCHS` (Qwen4Exp — its N-gram PLE embedding needs raw `input_ids`, which non-first PP ranks never receive) get the largest valid TP with PP=1, even if some selected GPUs go unused; the status bar notes why. Additionally, for architectures *not* in `_TP_SCOPED_ARCHS`, `intermediate_size` must also be divisible by the total GPU count — this guards against model implementations that assert `intermediate_size % world_size == 0` using the global process count rather than the TP group size. When no valid plan exists for the selected GPU count, the count is automatically reduced to the largest compatible value and a note is shown in the status bar. Architecture is read from `model.arch` (catalog) with a fallback to `architectures[0]` in `config.json`. Results of `_read_hf_parallelism_fields` are LRU-cached per model path.
 
 **`build_cmd` / `launch` signatures**:
 - `build_cmd(server, env, model, runtime_quant, param_overrides)` — resolves params via `launch_params()` (`_merged()` with `param_overrides` last, plus the injected `_model_path` / `_runtime_quant`); the fit probe uses the same resolver.
-- `build_launch_command(server, env, model, runtime_quant, cuda_devices, param_overrides)` — wraps `build_cmd()` in the explicit environment and working-directory shell syntax shown in `ConfirmLaunch`.
-- `launch(server, env, model, runtime_quant, cuda_devices, param_overrides, command)` — `command` is the shell text edited in `ConfirmLaunch`; it is logged and executed verbatim. Callers that omit it get the default from `build_launch_command()`.
+- `build_launch_command(server, env, model, runtime_quant, cuda_devices, param_overrides, power_step)` — wraps `build_cmd()` in the explicit environment and working-directory shell syntax shown in `ConfirmLaunch`; a `power_step` is prepended as `<gpu-power-limit …> && \` so the server never starts with its limits unapplied.
+- `launch(server, env, model, runtime_quant, cuda_devices, param_overrides, power_step, command)` — `command` is the shell text edited in `ConfirmLaunch`; it is logged and executed verbatim. Callers that omit it get the default from `build_launch_command()`.
 
 **Editable confirmation**: `ConfirmLaunch` displays the complete shell command in a focused `TextArea`. The user may change arguments, environment assignments, or shell syntax before launching with `Ctrl+Enter` or the Launch button. The edited text becomes the zero-argument process factory returned through `App.exit()`, so the preview, session log, and command passed to Bash cannot diverge. `Ctrl+Q` quits from this screen because plain `q` must remain available for editing.
 
@@ -368,7 +381,18 @@ ServerSoftware.default_params
     → _build_<server_id>(server, env, model, merged_params) → list[str]
 ```
 
-All builders receive `model.effective_ctx` (not `model.ctx` directly) so that `ctx_override` values are respected without each builder needing to know about the field. `effective_ctx` is always the **per-request** context; a builder whose server sizes context for all concurrent requests together translates it (llama.cpp: `--ctx-size effective_ctx × parallel`). Builders for `stage_all_models` servers (e.g. `_build_comfyui`) accept `model=None` and must not access model attributes.
+All builders take their context from `server.launch_ctx(model)` (not `model.ctx` directly), which is `model.effective_ctx` — so `ctx_override` and `rope_scaling` are respected without each builder knowing the fields — except that a `rope_scaling` model on a server that cannot apply it is capped at its native `ctx`. It is always the **per-request** context; a builder whose server sizes context for all concurrent requests together translates it (llama.cpp: `--ctx-size launch_ctx × parallel`).
+
+**RoPE scaling** (`rope_scaling`, e.g. YaRN for Qwen3.8-Flash-Next 256K → 1M): when `server.applies_rope_scaling(model)`, each builder translates it, and `build_launch_command()` adds `server.rope_scaling_env`:
+
+| Server | Flags |
+|---|---|
+| llama.cpp | `--rope-scaling <method> --rope-scale <factor> --yarn-orig-ctx <original>` — in `llamacpp_model_args()`, so `llama-fit-params` estimates the scaled KV cache too |
+| ooba (GGUF) | the same flags inside `--extra-flags '…'`, which ooba forwards to its llama-server (a model's own ooba `--extra-flags` in `extra_flags` would override them) |
+| vLLM | `--hf-overrides <json>` |
+| SGLang | `--json-model-override-args <json>` |
+
+The vLLM/SGLang JSON (`_hf_rope_override()`) starts from the model's own RoPE block in `config.json` (`text_config` for multimodal checkpoints; `rope_parameters` in transformers ≥ 5, else `rope_scaling`) and sets `rope_type`, `factor` and `original_max_position_embeddings`: the servers replace the block wholesale, so fields like `mrope_section`, `partial_rotary_factor` and `rope_theta` must be carried over. Frameworks implement static YaRN, which can cost quality on short prompts, so it is opt-in per model. Builders for `stage_all_models` servers (e.g. `_build_comfyui`) accept `model=None` and must not access model attributes.
 
 `resolve_path()` returns `model.cached_path` if it is set and the path exists on disk (`Path.exists()` — handles both files and directories uniformly); otherwise returns `model.path`. The `mounts` list in `CacheMount` is used only to determine *where* to place new cached copies and to display disk-space info in the UI.
 
@@ -384,6 +408,7 @@ Builders take the interpreter / binaries from `env` (`env.python`, `env.executab
 - `extra_env`: arbitrary extra `KEY=VALUE` pairs merged into the prefix (no server currently sets any)
 - `uses_staging_dir=True` (tabbyAPI, ooba, ComfyUI): creates symlinks under `model_dir`; `staging_format_suffixes` maps `ModelFormat` → file extension suffix; `stage_all_models=True` (ComfyUI) stages every compatible catalog model rather than only the selected one; `staging_subdir_attr="comfyui_subdir"` (ComfyUI) routes each model to `model_dir/<model.comfyui_subdir>/` — `launch.py` reads `getattr(model, staging_subdir_attr)` generically with no branching on `server.id`
 - `launch_cwd` (vLLM → `/tmp`, ooba → install dir): emits a leading `cd <dir> &&` in the command; vLLM avoids any `vllm/` directory on `sys.path`; ooba needs CWD at its install root because Gradio resolves `allowed_paths` relative to CWD
+- GPU power limits (any server, from `GpuSelectScreen`): a `PowerLimitStep` emits a leading `scripts/gpu-power-limit … &&` before everything else (see GPU Selection → Power limits)
 
 ---
 
@@ -453,7 +478,7 @@ After the TUI exits, `launch()` in `launch.py` creates a log file and spawns the
    <paste-ready command, one arg per line with backslash continuation>
    # ────────────────────────────────────────────────────────────────────────
    ```
-  The command block has no `#` prefix so it can be copied directly to a terminal. It is the exact text accepted from `ConfirmLaunch`, with a default `env KEY=VALUE …` prefix carrying all launcher-injected environment variables (including `CUDA_VISIBLE_DEVICES`) and a visible `cd` prefix when needed.
+  The command block has no `#` prefix so it can be copied directly to a terminal. It is the exact text accepted from `ConfirmLaunch`, with a default `env KEY=VALUE …` prefix carrying all launcher-injected environment variables (including `CUDA_VISIBLE_DEVICES`), a visible `cd` prefix when needed, and a leading `gpu-power-limit … &&` step when GPU power limits apply.
 
 2. **PTY** — `pty.openpty()` creates a master/slave pair. The slave fd is given to the child as stdout+stderr. `TIOCSWINSZ` stamps the slave with the real terminal dimensions so width-sensitive output (tqdm progress bars etc.) renders correctly.
 
@@ -520,7 +545,7 @@ Statuses are stored as a nested dict: `server_status[server_id][env_name][quant_
 
 **Environment renames / removals** migrate results catalog-wide in one write: `apply_env_rename()` moves `server_status[server][old]` → `[new]`; `apply_env_removal()` drops `server_status[server][name]` (`count_env_status()` feeds the confirmation dialog).
 
-`save_ctx_override(model, value)` follows the same pattern: mutates `model.ctx_override` in-memory, then updates or removes the `ctx_override` key in the matching JSON entry (`value=0` → key removed).
+`save_ctx_override(model, value)` follows the same pattern: mutates `model.ctx_override` in-memory, then updates or removes the `ctx_override` key in the matching JSON entry (`value=0` → key removed). `save_rope_scaling(model, rope_scaling)` does the same for `rope_scaling` (`None` → key removed).
 
 `save_favorite(model, favorite)` follows the same pattern: mutates `model.favorite` in-memory, then sets or removes the `favorite` key in the JSON entry (`False` → key removed to keep the catalog tidy).
 

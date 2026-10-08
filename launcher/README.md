@@ -218,9 +218,10 @@ Override server defaults per model with a `server_params` key:
 | `Space` | Toggle GPU selection (GPU screen) |
 | `a` | Select all GPUs (GPU screen, multi-GPU servers only) |
 | `+` / `-` | More / fewer concurrent request slots (GPU screen, llama.cpp) |
+| `p` / `P` | Set the power limit for the highlighted GPU / all selected GPUs (GPU screen) |
 | `c` | Cache focused model to local storage (model list) |
 | `u` | Uncache focused model (model list) |
-| `l` | Set or clear context-length cap for focused model (model list) |
+| `l` | Context settings for focused model (model list): YaRN factor to extend the context (e.g. `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF) and/or a context-length override |
 | `f` | Toggle favorite pin for focused model (model list) |
 | `z` | Quantize focused model — opens tool/quant/destination picker (model list) |
 | `g` / `x` / `?` | Mark the launch as good / bad / unknown — on the deepest screen for that server (server list, environment picker, or quantization picker) |
@@ -228,7 +229,7 @@ Override server defaults per model with a `server_params` key:
 | `Ctrl+Enter` | Execute the edited command (final Ready to launch screen) |
 | `Ctrl+Q` | Quit from the final command editor (`q` inserts text there) |
 
-The final **Ready to launch** screen is an editor containing the exact shell command that will run. Launcher-controlled values such as `CUDA_VISIBLE_DEVICES`, non-default `CUDA_HOME` and library paths, `PYTHONPATH` removal, and the launch working directory are explicit in that command. Edit any part of it to test alternate arguments or environment values; the edited text is written unchanged to the session log and executed through Bash.
+The final **Ready to launch** screen is an editor containing the exact shell command that will run. Launcher-controlled values such as `CUDA_VISIBLE_DEVICES`, non-default `CUDA_HOME` and library paths, `PYTHONPATH` removal, the launch working directory, and GPU power limits are explicit in that command. Edit any part of it to test alternate arguments or environment values; the edited text is written unchanged to the session log and executed through Bash.
 
 ## Concurrent slots and memory fit (llama.cpp)
 
@@ -242,6 +243,27 @@ While you pick GPUs and slots, the launcher asks llama.cpp's own planner (`llama
 Memory already used by other processes counts against the fit. Vision projectors (`--mmproj`), MTP draft heads, and `extra_flags` are not included in the estimate.
 
 llama.cpp launches also default to a q8_0 KV cache (half the memory of f16, negligible quality loss; set `"kv_cache_type": "f16"` in a model's `server_params.llamacpp` to opt out) and to a host-RAM prompt cache sized by `[memory] host_cache_ram`, which lets returning conversations skip re-processing their prompt when there are more of them than slots.
+
+## GPU power limits
+
+Each line on the GPU screen ends with the card's power limit in watts — `250↓ W` when it is below the card's factory default, `370→250↓ W` when the next launch will change it. Press `p` to set the limit for the highlighted GPU or `P` for every selected GPU (whole watts; leave blank for the factory default). The choice is remembered per physical card (by UUID, in `user_data/gpu_power.json`) and applies to every model.
+
+Limits are applied as the first step of the launch command, so the session log reproduces them:
+
+```
+/home/you/ai-server-tools/launcher/scripts/gpu-power-limit 0,1,2=250 3=default && \
+  env CUDA_VISIBLE_DEVICES=0,1,2,3 …
+```
+
+`gpu-power-limit` only calls `sudo nvidia-smi -pl` for GPUs whose current limit differs, so you are asked for your password only when something changes — typically the first launch after a reboot or GPU reset (NVIDIA power limits do not survive either). If sudo fails or is cancelled, the server does not start. The step is included whenever a launched GPU has a chosen limit or is currently not at its default, and launches with every card at its default omit it.
+
+For prompt-free launches you can optionally allow exactly this `nvidia-smi` invocation without a password (`sudo visudo -f /etc/sudoers.d/gpu-power-limit`; requires sudo ≥ 1.9.10 for the regex; not yet verified on this machine):
+
+```
+youruser ALL=(root) NOPASSWD: /usr/bin/nvidia-smi ^-i [0-9\,]+ -pl [0-9]+$
+```
+
+Do not use a wildcard rule such as `nvidia-smi *` — `nvidia-smi -f <file>` would let it overwrite any file as root.
 
 ## File map
 
@@ -257,11 +279,15 @@ launcher/
   launch.py            Command builders and subprocess launcher
   fit.py               Pre-launch memory-fit estimates (llama.cpp: llama-fit-params)
   gpu.py               NVML polling (pynvml) + GpuRow helpers (shared with gpu_monitor)
+  gpu_power.py         Per-GPU power limits — remembered choices + launch-command step
+  scripts/
+    gpu-power-limit    Applies power limits (sudo nvidia-smi -pl) only where they differ
   config.py            Config loader — reads user_data/config.toml at import time
   config.toml.example  Documented template (copy to user_data/config.toml)
   user_data/           ← gitignored; machine-specific and personal data
     config.toml          machine paths, GPU counts, host RAM budget
     environments.json    registered environments per server
+    gpu_power.json       chosen GPU power limits (written by the GPU screen)
     models_local.json    model catalog
   model_launcher.tcss    Textual CSS layout
 ```

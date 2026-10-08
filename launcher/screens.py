@@ -18,6 +18,7 @@ ChoiceScreen and CommandRunScreen dialogs.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import re
 import subprocess
@@ -46,7 +47,10 @@ from textual.widgets import (
 from textual.containers import Horizontal, Vertical
 from textual.worker import get_current_worker
 
-from launcher.gpu import poll_gpus, system_min_sm
+from launcher.gpu import GpuRow, poll_gpus, system_min_sm
+from launcher.gpu_power import (
+    POWER_LIMITS, PowerLimitStep, fmt_power_limit, parse_power_limit, power_limit_range, power_limit_step,
+)
 from launcher.models import (
     AIModel,
     AIType,
@@ -55,6 +59,7 @@ from launcher.models import (
     FORMAT_SHORT,
     ModelFormat,
     QuantizationTool,
+    RopeScaling,
     RuntimeQuant,
     RUNTIME_QUANT_LABEL,
     RUNTIME_QUANT_SHORT,
@@ -1209,6 +1214,11 @@ class GpuSelectScreen(DataTableScreen):
     concurrent request slots; the value is remembered per model on launch.  When the
     server has a fit probe (fit.py), a memory-fit estimate for the current selection is
     computed in the background and shown below the status bar.
+
+    Each GPU line shows its power limit (``current→target`` when a launch would change
+    it).  ``p`` sets the limit for the highlighted GPU, ``P`` for all selected GPUs; the
+    choice is remembered per card (gpu_power.py) and applied as the first step of the
+    launch command.
     """
 
     _MAX_SLOTS = 64
@@ -1220,6 +1230,8 @@ class GpuSelectScreen(DataTableScreen):
         Binding("a",             "select_all",      "All GPUs"),
         Binding("plus,equals_sign", "slots(1)",     "Slots+",  key_display="+"),
         Binding("minus",         "slots(-1)",       "Slots−",  key_display="-"),
+        Binding("p",             "power_limit(False)", "Power limit"),
+        Binding("P",             "power_limit(True)",  "Limit selected"),
         Binding("f5",            "dt_select",       "Confirm", key_display="↵/→"),
     ]
 
@@ -1280,14 +1292,19 @@ class GpuSelectScreen(DataTableScreen):
             pre_select = n_available
         sl = self.query_one(SelectionList)
         for i, row in enumerate(self._valid_rows):
-            initial = i < pre_select
-            free_gb = (row.mem_total_mib - row.mem_used_mib) / 1024
-            free_ratio = free_gb / max(row.mem_total_gb, 1)
-            free_color = "bright_green" if free_ratio > 0.8 else ("yellow" if free_ratio > 0.3 else "red")
-            used_label = f"[{free_color}]{row.mem_used_gb:.1f}[/] / {row.mem_total_gb:.0f} GB"
-            label = f"GPU {row.index}  ·  {row.name}  ·  {used_label}"
-            sl.add_option((label, row.index, initial))
+            sl.add_option((self._gpu_label(row), row.index, i < pre_select))
+        sl.highlighted = 0
         self._refresh_status()
+
+    @staticmethod
+    def _gpu_label(row: GpuRow) -> str:
+        free_gb = (row.mem_total_mib - row.mem_used_mib) / 1024
+        free_ratio = free_gb / max(row.mem_total_gb, 1)
+        free_color = "bright_green" if free_ratio > 0.8 else ("yellow" if free_ratio > 0.3 else "red")
+        used_label = f"[{free_color}]{row.mem_used_gb:.1f}[/] / {row.mem_total_gb:.0f} GB"
+        power = fmt_power_limit(row)
+        power_label = f"  ·  {power}" if power else ""
+        return f"GPU {row.index}  ·  {row.short_uuid}  ·  {used_label}{power_label}"
 
     def _skip_to_confirm(self) -> None:
         """Fall back to ConfirmLaunch with the default CUDA_VISIBLE_DEVICES when no GPUs found."""
@@ -1314,6 +1331,10 @@ class GpuSelectScreen(DataTableScreen):
         self._refresh_status()
 
     def _refresh_status(self) -> None:
+        self._render_status()
+        self._refresh_fit()
+
+    def _render_status(self) -> None:
         sl = self.query_one(SelectionList)
         selected = sorted(sl.selected)
         n = len(selected)
@@ -1321,7 +1342,6 @@ class GpuSelectScreen(DataTableScreen):
         if not selected:
             label.update("[red]No GPUs selected — select at least one before confirming.[/]")
             self._plan = None
-            self._refresh_fit()
             return
         devices_str = ",".join(str(i) for i in selected)
         parts = [
@@ -1350,23 +1370,91 @@ class GpuSelectScreen(DataTableScreen):
             parts.append(f"[dim]{self._server.gpu_count_param}[/] → [bold]{n}[/]")
         else:
             self._plan = None
+        power_step = self._power_step()
+        if power_step is not None:
+            parts.append(f"[dim]power limits[/] {' '.join(power_step.args())}")
         label.update("   ·   ".join(parts))
-        self._refresh_fit()
+
+    def _launch_indices(self) -> list[int]:
+        """GPU indices the launch will use — the selection, trimmed to the parallelism plan."""
+        selected = sorted(self.query_one(SelectionList).selected)
+        if self._plan is not None:
+            selected = selected[:self._plan.gpu_count]
+        return selected
 
     def _launch_settings(self) -> tuple[str, dict[str, Any]] | None:
         """(CUDA_VISIBLE_DEVICES, param_overrides) for the current selection; None when nothing is selected."""
-        selected = sorted(self.query_one(SelectionList).selected)
-        if not selected:
+        indices = self._launch_indices()
+        if not indices:
             return None
         overrides: dict[str, Any] = {}
         if self._plan is not None:
-            selected = selected[:self._plan.gpu_count]
             overrides = {"tensor_parallel": self._plan.tp, "pipeline_parallel": self._plan.pp}
         elif self._server.gpu_count_param:
-            overrides = {self._server.gpu_count_param: len(selected)}
+            overrides = {self._server.gpu_count_param: len(indices)}
         if self._slots is not None and self._server.concurrency_param:
             overrides[self._server.concurrency_param] = self._slots
-        return ",".join(str(i) for i in selected), overrides
+        return ",".join(str(i) for i in indices), overrides
+
+    def _power_step(self) -> PowerLimitStep | None:
+        return power_limit_step(self._valid_rows, self._launch_indices())
+
+    # -- Power limits -----------------------------------------------------
+
+    def action_power_limit(self, selected: bool) -> None:
+        sl = self.query_one(SelectionList)
+        if selected:
+            chosen = set(sl.selected)
+            rows = [r for r in self._valid_rows if r.index in chosen]
+        elif sl.highlighted is not None:
+            rows = [self._valid_rows[sl.highlighted]]
+        else:
+            rows = []
+        if not rows:
+            self.notify(f"No GPU {'selected' if selected else 'highlighted'}", severity="warning", timeout=3)
+            return
+        lo, hi = power_limit_range(rows)
+        defaults = sorted({round(r.power_default_w) for r in rows})
+        default_str = f"{defaults[0]} W" if len(defaults) == 1 else f"{defaults[0]}–{defaults[-1]} W per card"
+        stored = {POWER_LIMITS.get(r.uuid) for r in rows}
+        initial = str(next(iter(stored))) if len(stored) == 1 and None not in stored else ""
+        ids = ",".join(str(r.index) for r in rows)
+
+        def validate(text: str) -> str | None:
+            try:
+                parse_power_limit(text, rows)
+            except ValueError as e:
+                return str(e)
+            return None
+
+        def on_result(text: str | None) -> None:
+            if text is None:
+                return
+            watts = parse_power_limit(text, rows)
+            try:
+                POWER_LIMITS.set_for(rows, watts)
+            except OSError as e:
+                self.notify(f"Could not save power limit: {e}", severity="error", timeout=5)
+                return
+            for i, row in enumerate(self._valid_rows):
+                sl.replace_option_prompt_at_index(i, self._gpu_label(row))
+            self._render_status()
+            target = "factory default" if watts is None else f"{watts} W"
+            self.notify(f"GPU {ids} power limit → {target} (applied at launch)", timeout=3)
+
+        self.app.push_screen(
+            TextPromptScreen(
+                f"Power limit for GPU{'s' if len(rows) > 1 else ''} {ids}",
+                prompt=(
+                    f"Watts, {lo}–{hi}.  Blank = factory default ({default_str}).\n"
+                    "Remembered per card; applied (via sudo, only when it differs) when a launch starts."
+                ),
+                initial=initial,
+                placeholder=f"{lo}–{hi}",
+                validate=validate,
+            ),
+            on_result,
+        )
 
     # -- Slots and memory-fit estimate ------------------------------------
 
@@ -1401,7 +1489,7 @@ class GpuSelectScreen(DataTableScreen):
     def _render_fit(self) -> None:
         parts: list[str] = []
         if self._slots is not None and self._model is not None:
-            parts.append(f"Slots [bold]{self._slots}[/] × {fmt_ctx(self._model.effective_ctx)} ctx  [dim](+/-)[/]")
+            parts.append(f"Slots [bold]{self._slots}[/] × {fmt_ctx(self._server.launch_ctx(self._model))} ctx  [dim](+/-)[/]")
         if self._fit_probe is not None and self.query_one(SelectionList).selected:
             parts.append(_fit_markup(self._fit, self._slots))
         label = self.query_one("#gpu-fit", Label)
@@ -1441,6 +1529,7 @@ class GpuSelectScreen(DataTableScreen):
                 self._runtime_quant,
                 cuda_devices=cuda_devices,
                 param_overrides=param_overrides,
+                power_step=self._power_step(),
             )
         except Exception as e:
             self.notify(str(e), severity="error", timeout=5)
@@ -1828,7 +1917,7 @@ class ModelSelectScreen(DataTableScreen):
         Binding("c",             "uncache_selected",  "Uncache"),
         Binding("f",             "mark_favorite",     "Favorite"),
         Binding("f",             "unmark_favorite",   "Unfavorite"),
-        Binding("l",             "set_ctx_override",  "Set ctx override"),
+        Binding("l",             "set_ctx_override",  "Context / YaRN"),
         Binding("z",             "quantize_selected", "Quantize"),
         Binding("f5",            "dt_select",         "Select", key_display="↵/→/dbl-click"),
     ]
@@ -2027,7 +2116,7 @@ class ModelSelectScreen(DataTableScreen):
                 self._warn_cell(m),
                 self._size_cell(m),
                 self._params_cell(m),
-                fmt_ctx(m.effective_ctx) if not m.ctx_override
+                fmt_ctx(m.effective_ctx) if m.effective_ctx == m.ctx
                     else f"{fmt_ctx(m.effective_ctx)}[dim]/{fmt_ctx(m.ctx)}[/]",
                 self._moe_cell(m),
                 self._vision_cell(m),
@@ -2178,7 +2267,7 @@ class ModelSelectScreen(DataTableScreen):
         model = self._focused_model()
         if model is not None:
             self.app.push_screen(
-                SetCtxOverrideScreen(model),
+                ContextSettingsScreen(model),
                 callback=lambda _: self._sort_models() or self._populate(),
             )
 
@@ -2219,16 +2308,15 @@ class ModelSelectScreen(DataTableScreen):
 
 
 # ---------------------------------------------------------------------------
-# Set ctx override — inline editor for a model's ctx_override
+# Context settings — inline editor for a model's ctx_override and rope_scaling
 # ---------------------------------------------------------------------------
 
-class SetCtxOverrideScreen(Screen):
-    """Prompt the user to enter a ctx_override for the focused model.
+class ContextSettingsScreen(Screen):
+    """Edit the focused model's launch context: a YaRN factor and/or a ctx override.
 
-    Accepts a plain integer (e.g. 32768) or a K-suffixed value (e.g. 32K).
-    Enter with an empty field or '0' clears the override (reverts to native ctx).
-    Values above the native ctx are permitted — use this to enable extended-context
-    inference (e.g. via RoPE scaling) beyond the model's training length.
+    YaRN factor: blank or 1 = off; otherwise RoPE-scales the native ctx (e.g. 4 →
+    256K × 4 = 1M) on servers that support it.  Ctx override: a plain integer or a
+    K-suffixed value (32K); blank or 0 = use the native ctx (scaled when YaRN is on).
     """
 
     BINDINGS: ClassVar = [
@@ -2240,21 +2328,27 @@ class SetCtxOverrideScreen(Screen):
         self._model = model
 
     def compose(self) -> ComposeResult:
-        native = fmt_ctx(self._model.ctx)
-        current = fmt_ctx(self._model.ctx_override) if self._model.ctx_override else ""
-        placeholder = f"e.g. 32768 or 32K  (native: {native})"
+        m = self._model
+        native = fmt_ctx(m.ctx)
         yield Header()
         yield Vertical(
             Label(
-                f"[bold]Set ctx override for:[/]  {self._model.name}  ·  {self._model.format_tag}"
-                f"\n[dim]Enter a value to override the launch ctx, or leave blank to use the native {native}.[/]",
+                f"[bold]Context settings for:[/]  {m.name}  ·  {m.format_tag}  ·  native {native}",
                 id="screen-title",
             ),
+            Label("YaRN factor  [dim](blank = off; e.g. 2 or 4 — static scaling may cost quality on short prompts)[/]"),
             Input(
-                value=current,
-                placeholder=placeholder,
+                value=f"{m.rope_scaling.factor:g}" if m.rope_scaling else "",
+                placeholder="e.g. 4",
+                id="yarn-input",
+            ),
+            Label("Ctx override  [dim](blank = native, or native × YaRN factor)[/]"),
+            Input(
+                value=fmt_ctx(m.ctx_override) if m.ctx_override else "",
+                placeholder="e.g. 32768 or 32K",
                 id="ctx-input",
             ),
+            Label("", id="ctx-preview"),
             Horizontal(
                 Button("Set",    variant="success", id="btn-set"),
                 Button("Clear",  variant="warning", id="btn-clear"),
@@ -2266,9 +2360,11 @@ class SetCtxOverrideScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#ctx-input", Input).focus()
+        self.query_one("#yarn-input", Input).focus()
+        self._update_preview()
 
-    def _parse_value(self, text: str) -> int:
+    @staticmethod
+    def _parse_ctx(text: str) -> int:
         """Parse '32768', '32K', '32k' → int. Returns 0 for empty/zero."""
         text = text.strip()
         if not text or text == "0":
@@ -2277,37 +2373,86 @@ class SetCtxOverrideScreen(Screen):
             return int(float(text[:-1]) * 1024)
         return int(text)
 
-    def _apply(self, value_str: str) -> None:
+    @staticmethod
+    def _parse_factor(text: str) -> float:
+        """Parse a YaRN factor; 0 = off (blank or 1).  Raises ValueError when below 1."""
+        text = text.strip()
+        if not text:
+            return 0.0
+        factor = float(text)
+        if factor < 1:
+            raise ValueError("YaRN factor must be at least 1")
+        return 0.0 if factor == 1 else factor
+
+    def _read(self) -> tuple[RopeScaling | None, int]:
+        """The rope_scaling and ctx_override currently entered (raises ValueError when invalid)."""
+        factor = self._parse_factor(self.query_one("#yarn-input", Input).value)
+        limit = self._parse_ctx(self.query_one("#ctx-input", Input).value)
+        current = self._model.rope_scaling
+        if not factor:
+            rope = None
+        elif current is not None:
+            rope = dataclasses.replace(current, factor=factor)  # keep method / original_ctx
+        else:
+            rope = RopeScaling(factor=factor)
+        return rope, limit
+
+    def _update_preview(self) -> None:
+        label = self.query_one("#ctx-preview", Label)
         try:
-            limit = self._parse_value(value_str)
-        except ValueError:
-            self.notify(f"Invalid value: {value_str!r}", severity="error", timeout=4)
+            rope, limit = self._read()
+        except ValueError as e:
+            label.update(f"[red]{e}[/]")
             return
-        if limit and limit > self._model.ctx:
-            self.notify(
-                f"{fmt_ctx(limit)} exceeds native ctx {fmt_ctx(self._model.ctx)}",
-                severity="information", timeout=4,
-            )
+        m = self._model
+        scaled = round(m.ctx * rope.factor) if rope else m.ctx
+        launch = limit or scaled
+        basis = f"{fmt_ctx(m.ctx)} × {rope.factor:g} YaRN" if rope else "native"
+        text = f"Launch context: [bold]{fmt_ctx(launch)}[/]  [dim]({'override' if limit else basis})[/]"
+        if launch > scaled:
+            text += f"\n[yellow]⚠ exceeds {fmt_ctx(scaled)} ({basis}) — quality degrades past it[/]"
+        if rope:
+            servers = servers_for_model(SERVERS, m)
+            scaling = [s.label for s in servers if m.format in s.rope_scaling_formats]
+            native_only = [s.label for s in servers if m.format not in s.rope_scaling_formats]
+            text += f"\n[dim]YaRN applied by: {', '.join(scaling) or 'none'}"
+            if native_only:
+                text += f"  ·  native ctx on: {', '.join(native_only)}"
+            text += "[/]"
+        label.update(text)
+
+    @on(Input.Changed)
+    def on_changed(self, event: Input.Changed) -> None:
+        self._update_preview()
+
+    def _apply(self) -> None:
         try:
+            rope, limit = self._read()
+        except ValueError as e:
+            self.notify(str(e), severity="error", timeout=4)
+            return
+        try:
+            launcher.save_rope_scaling(self._model, rope)
             launcher.save_ctx_override(self._model, limit)
         except Exception as e:
             self.notify(str(e), severity="error", timeout=5)
             return
-        msg = f"ctx override cleared" if not limit else f"ctx override set to {fmt_ctx(limit)}"
-        self.notify(msg, timeout=3)
+        self.notify(f"Launch context: {fmt_ctx(self._model.effective_ctx)}", timeout=3)
         self.app.pop_screen()
 
     @on(Input.Submitted)
     def on_submitted(self, event: Input.Submitted) -> None:
-        self._apply(event.value)
+        self._apply()
 
     @on(Button.Pressed, "#btn-set")
     def on_set(self) -> None:
-        self._apply(self.query_one("#ctx-input", Input).value)
+        self._apply()
 
     @on(Button.Pressed, "#btn-clear")
     def on_clear(self) -> None:
-        self._apply("0")
+        self.query_one("#yarn-input", Input).value = ""
+        self.query_one("#ctx-input", Input).value = ""
+        self._apply()
 
     @on(Button.Pressed, "#btn-cancel")
     def on_cancel(self) -> None:
@@ -2471,7 +2616,7 @@ class CacheActionScreen(ButtonMenuScreen):
             f"  ·  {self._model.size_gb:.0f} GB  ·  {fmt_ctx(self._model.effective_ctx)} ctx"
             + (
                 f"[dim]  (native: {fmt_ctx(self._model.ctx)})[/]"
-                if self._model.ctx_override
+                if self._model.effective_ctx != self._model.ctx
                 else ""
             ),
             id="screen-title",
