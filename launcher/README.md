@@ -144,13 +144,13 @@ python -m launcher.ingest ingest /path/to/models --ai-type image_gen --all [--dr
 
 Without `--all`, scanning stops after the first new model (useful for testing detection). With `--all`, every uncatalogued model is added in one pass.
 
-Auto-detected fields: `id`, `name`, `format`, `ctx`, `size_gb`, `params_m`, `arch`, MoE expert counts, `vision`, `trust_remote_code`, `mmproj_path` (for vision GGUFs), and FP8 `min_sm` constraints.
+Auto-detected fields: `id`, `name`, `format`, `ctx`, `size_gb`, `params_m`, `arch`, MoE expert counts, `vision`, `trust_remote_code`, `mmproj_path` (for vision GGUFs), `mtp_path` (MTP draft heads shipped as `mtp-*.gguf`), and FP8 `min_sm` constraints.
 
 HF directories with both safetensors and pytorch_bin weights get a separate catalog entry per format. GGUF bundle directories yield one entry per quant variant.
 
 #### refresh
 
-Re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, MoE, `vision`, `mmproj_path`) for existing entries without touching user-curated fields (`id`, `name`, `format`, `server_status`, `favorite`, etc.):
+Re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, MoE, `vision`, `mmproj_path`, `mtp_path`) for existing entries without touching user-curated fields (`id`, `name`, `format`, `server_status`, `favorite`, etc.):
 
 ```bash
 # Refresh all entries (may be slow over NAS)
@@ -239,7 +239,7 @@ While you pick GPUs and slots, the launcher asks llama.cpp's own planner (`llama
 - `✓ fits on GPU  needs 287 of 353 GiB free · weights 121 · KV 117 (23.4/slot) · compute 49 GiB`
 - `⚠ only 49 layers fit on GPU — rest offloaded to CPU (slow)` — fewer slots, more GPUs, or a smaller quant will help.
 
-Memory already used by other processes counts against the fit. Vision projectors (`--mmproj`) and `extra_flags` are not included in the estimate.
+Memory already used by other processes counts against the fit. Vision projectors (`--mmproj`), MTP draft heads, and `extra_flags` are not included in the estimate.
 
 llama.cpp launches also default to a q8_0 KV cache (half the memory of f16, negligible quality loss; set `"kv_cache_type": "f16"` in a model's `server_params.llamacpp` to opt out) and to a host-RAM prompt cache sized by `[memory] host_cache_ram`, which lets returning conversations skip re-processing their prompt when there are more of them than slots.
 

@@ -14,6 +14,7 @@
     "moe_active":    "(auto) Experts active per token for MoE models; omit or 0 for dense models.",
     "vision":        "(auto) true if the model accepts image input. Populated by ingest/refresh.",
     "mmproj_path":   "(optional, gguf vision only) Absolute path to the companion mmproj-*.gguf vision encoder. Passed as --mmproj at launch time.",
+    "mtp_path":      "(auto, gguf only) Absolute path to the companion mtp-*.gguf multi-token-prediction draft head. llama.cpp/ooba launch with --spec-type draft-mtp --model-draft <path> unless server param mtp is false.",
     "quant":         "(optional) Quantisation label for display, e.g. Q4_K_M — mainly for GGUF",
     "ctx_override":  "(optional) Override the context length at launch time; 0 = use native ctx. Set with the 'l' key in the TUI.",
     "min_sm":        "(optional) Minimum CUDA compute capability required, e.g. 89 for sm_89+. 0 = no constraint.",

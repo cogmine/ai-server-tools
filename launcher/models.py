@@ -301,6 +301,7 @@ class AIModel:
     moe_active: int = 0            # experts active per token (0 when dense)
     vision: bool = False           # model accepts image/vision input
     mmproj_path: str = ""          # path to companion mmproj .gguf file (vision GGUF only)
+    mtp_path: str = ""             # path to companion multi-token-prediction draft head .gguf (GGUF only)
     trust_remote_code: bool = False  # servers must pass --trust-remote-code
     quant: str = ""                # quant suffix for display, e.g. "Q4_K_M" (mainly GGUF)
     note: str = ""                 # user-defined note shown in the status bar
@@ -348,6 +349,7 @@ class AIModel:
             moe_active=int(d.get("moe_active", 0)),
             vision=bool(d.get("vision", False)),
             mmproj_path=d.get("mmproj_path", ""),
+            mtp_path=d.get("mtp_path", ""),
             trust_remote_code=bool(d.get("trust_remote_code", False)),
             quant=d.get("quant", ""),
             note=d.get("note", ""),
@@ -387,16 +389,27 @@ class AIModel:
                 return self.cached_path
         return self.path
 
-    def resolve_mmproj_path(self) -> str:
-        """Return the mmproj copy beside the cached model when the cache is in use, else mmproj_path."""
-        if not self.mmproj_path:
+    @property
+    def companion_paths(self) -> list[str]:
+        """Source paths of companion files that must sit beside the model (mmproj, MTP head)."""
+        return [p for p in (self.mmproj_path, self.mtp_path) if p]
+
+    def _resolve_companion(self, source_path: str) -> str:
+        """Return the companion's copy beside the cached model when the cache is in use, else source_path."""
+        if not source_path:
             return ""
         resolved = self.resolve_path()
         if resolved != self.path:
-            cached = Path(resolved).parent / Path(self.mmproj_path).name
+            cached = Path(resolved).parent / Path(source_path).name
             if cached.is_file():
                 return str(cached)
-        return self.mmproj_path
+        return source_path
+
+    def resolve_mmproj_path(self) -> str:
+        return self._resolve_companion(self.mmproj_path)
+
+    def resolve_mtp_path(self) -> str:
+        return self._resolve_companion(self.mtp_path)
 
     def cached_in(self, mounts: "list[CacheMount]") -> "CacheMount | None":
         """Return the cache mount that contains cached_path, or None if not cached."""

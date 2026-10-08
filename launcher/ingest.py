@@ -917,6 +917,15 @@ def _find_mmproj(bundle_root: Path) -> Path | None:
     return matches[0] if matches else None
 
 
+def _find_mtp(bundle_root: Path, quant: str) -> Path | None:
+    """Return the mtp-*.gguf draft head in bundle_root, preferring one tagged with *quant*."""
+    matches = sorted(bundle_root.glob("mtp-*.gguf"))
+    for m in matches:
+        if quant and _extract_gguf_quant(m.name) == quant:
+            return m
+    return matches[0] if matches else None
+
+
 def do_copy_mmproj(scan_root: Path, dry_run: bool) -> None:
     """Copy mmproj files from original model dirs into their GGUF bundle directories.
 
@@ -1049,6 +1058,7 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     # Only search for an mmproj file when this is a vision model — non-vision GGUFs
     # never have one, and glob() on slow storage is expensive at catalog-refresh scale.
     mmproj_path = (_find_mmproj(parent) or _find_mmproj(parent.parent)) if vision else None
+    mtp_path = _find_mtp(parent, quant) or _find_mtp(parent.parent, quant)
 
     entry: dict[str, Any] = {
         "id": entry_id,
@@ -1067,6 +1077,7 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     if moe_active:    entry["moe_active"]   = moe_active
     if vision:        entry["vision"]       = True
     if mmproj_path:   entry["mmproj_path"]  = str(mmproj_path)
+    if mtp_path:      entry["mtp_path"]     = str(mtp_path)
     if trust_rc:      entry["trust_remote_code"] = True
     return entry
 
@@ -1224,7 +1235,7 @@ def detect_image_gen(path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
 # favorite, server_status, server_params, min_sm, hw_note, comfyui_subdir,
 # quant, trust_remote_code) are never touched by refresh.
 _REFRESHABLE_FIELDS: frozenset[str] = frozenset({
-    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "params_m", "size_gb", "vision",
+    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "mtp_path", "params_m", "size_gb", "vision",
 })
 
 
@@ -1270,14 +1281,14 @@ def _refresh_one(
         if field == "params_m":              return int(raw)   if raw else 0
         if field == "size_gb":               return float(raw) if raw else 0.0
         if field in ("arch",):               return str(raw) if raw else ""
-        if field == "mmproj_path":            return str(raw) if raw else ""
+        if field in ("mmproj_path", "mtp_path"): return str(raw) if raw else ""
         if field == "ctx":                   return int(raw) if raw else 32_768
         if field in ("moe_experts", "moe_active"): return int(raw) if raw else 0
         if field in ("vision",):              return bool(raw)
         return raw
 
     # Fields omitted from JSON when default — delete key rather than write falsy value
-    _omit_when_default = frozenset({"params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path"})
+    _omit_when_default = frozenset({"params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path", "mtp_path"})
 
     changes: list[str] = []
     updated = dict(entry)

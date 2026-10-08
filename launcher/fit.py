@@ -62,7 +62,7 @@ class LlamaCppFitProbe(FitProbe):
     llama.cpp's own fitter (also used by llama-server's default --fit) loads only the model
     metadata, so the estimate is exact for every architecture (sliding-window, MLA, hybrid)
     and accounts for compute buffers and memory already in use on the devices.
-    Not covered: --mmproj vision projectors and anything passed via extra_flags.
+    Not covered: --mmproj vision projectors, MTP draft heads, and anything passed via extra_flags.
     """
 
     executable = "llama-fit-params"

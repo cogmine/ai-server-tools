@@ -398,8 +398,16 @@ def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p:
         cmd += ["--cache-ram", str(p["cache_ram_mib"])]
     if model.mmproj_path:
         cmd += ["--mmproj", model.resolve_mmproj_path()]
+    cmd += _mtp_args(model, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
+
+
+def _mtp_args(model: AIModel, p: dict) -> list[str]:
+    """Speculative-decoding flags using the model's MTP draft head (llama-server and ooba share them)."""
+    if not (model.mtp_path and p.get("mtp")):
+        return []
+    return ["--spec-type", "draft-mtp", "--model-draft", model.resolve_mtp_path()]
 
 
 def llamacpp_model_args(model: AIModel, p: dict) -> list[str]:
@@ -467,6 +475,7 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
             cmd += ["--tensor-split", p["tensor_split"]]
         if model.mmproj_path:
             cmd += ["--mmproj", model.resolve_mmproj_path()]
+        cmd += _mtp_args(model, p)
     if p.get("cache_type"):
         cmd += ["--cache-type", p["cache_type"]]
     rq = p.get("_runtime_quant")
@@ -1055,11 +1064,8 @@ def cache_disk_info(mount: CacheMount) -> tuple[float, float]:
 
 
 def _source_files(model: AIModel) -> list[Path]:
-    """Source files of a file-based model: every GGUF shard plus its mmproj."""
-    files = gguf_shard_paths(Path(model.path))
-    if model.mmproj_path:
-        files.append(Path(model.mmproj_path))
-    return files
+    """Source files of a file-based model: every GGUF shard plus its companion files."""
+    return gguf_shard_paths(Path(model.path)) + [Path(c) for c in model.companion_paths]
 
 
 def cache_source_size_gb(model: AIModel) -> float:
@@ -1067,7 +1073,7 @@ def cache_source_size_gb(model: AIModel) -> float:
 
     Used by the cache UI to estimate required space — independent of the size_gb
     catalog field, which records only the logical weight files.  For a file
-    model, sums every GGUF shard plus the mmproj.  For a directory, recursively
+    model, sums every GGUF shard plus its companion files (mmproj, MTP head).  For a directory, recursively
     sums all files except those under a .git/ subdirectory.
     """
     path = Path(model.path)
@@ -1097,7 +1103,7 @@ def cache_model(model: AIModel, mount: CacheMount) -> tuple["subprocess.Popen[by
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_p = dest_dir / src_p.name
         # Flattened into one dir: llama.cpp finds split shards beside the first,
-        # and resolve_mmproj_path() looks for the mmproj there too.
+        # and the resolve_*_path() methods look for companion files there too.
         srcs = [str(p) for p in _source_files(model)]
         dst = str(dest_dir) + "/"
     else:                                   # directory → <mount>/<subdir>/<src_dirname>/
@@ -1126,9 +1132,9 @@ def uncache_model(model: AIModel, mount: CacheMount) -> None:
     if not cached_p.exists():
         raise FileNotFoundError(f"Cached path not found on disk: {cached_p}")
     if cached_p.is_file():
-        cached_files = gguf_shard_paths(cached_p)
-        if model.mmproj_path:
-            cached_files.append(cached_p.parent / Path(model.mmproj_path).name)
+        cached_files = gguf_shard_paths(cached_p) + [
+            cached_p.parent / Path(c).name for c in model.companion_paths
+        ]
         for f in cached_files:
             f.unlink(missing_ok=True)
     else:
