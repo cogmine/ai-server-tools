@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from launcher.config import CONFIG
+from launcher.gguf_header import embedded_mtp_layers, read_gguf_metadata
 from launcher.models import GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info
 
 # ---------------------------------------------------------------------------
@@ -1017,10 +1018,13 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
         parent.name if "gguf" in parent.name.lower()
         else (split_info[0] if split_info else gguf_path.stem)
     )
-    if quant:
-        base_name = re.sub(
-            r"[.\-_]" + re.escape(quant) + r"$", "", base_name, flags=re.IGNORECASE
-        )
+    # Bundle names may carry the quant label and a GGUF tag mid-name, followed by
+    # a variant tag ("Model-GGUF-Q8_0-MTP"), so both are removed wherever they occur.
+    tags = [re.escape(quant)] if quant else []
+    tags.append("GGUF")
+    base_name = re.sub(
+        r"[.\-_](?:" + "|".join(tags) + r")(?=[.\-_]|$)", "", base_name, flags=re.IGNORECASE
+    )
     display_name = _dir_to_display_name(base_name)
 
     quant_suffix = f"-{_quant_slug(quant)}" if quant else ""
@@ -1059,6 +1063,11 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     # never have one, and glob() on slow storage is expensive at catalog-refresh scale.
     mmproj_path = (_find_mmproj(parent) or _find_mmproj(parent.parent)) if vision else None
     mtp_path = _find_mtp(parent, quant) or _find_mtp(parent.parent, quant)
+    try:
+        mtp_embedded = embedded_mtp_layers(read_gguf_metadata(gguf_path)) > 0
+    except (OSError, ValueError) as exc:
+        print(f"[ingest] Warning: could not read GGUF header: {exc}", file=sys.stderr)
+        mtp_embedded = False
 
     entry: dict[str, Any] = {
         "id": entry_id,
@@ -1078,6 +1087,7 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     if vision:        entry["vision"]       = True
     if mmproj_path:   entry["mmproj_path"]  = str(mmproj_path)
     if mtp_path:      entry["mtp_path"]     = str(mtp_path)
+    if mtp_embedded:  entry["mtp_embedded"] = True
     if trust_rc:      entry["trust_remote_code"] = True
     return entry
 
@@ -1235,7 +1245,7 @@ def detect_image_gen(path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
 # favorite, server_status, server_params, min_sm, hw_note, comfyui_subdir,
 # quant, trust_remote_code) are never touched by refresh.
 _REFRESHABLE_FIELDS: frozenset[str] = frozenset({
-    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "mtp_path", "params_m", "size_gb", "vision",
+    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "mtp_embedded", "mtp_path", "params_m", "size_gb", "vision",
 })
 
 
@@ -1284,11 +1294,11 @@ def _refresh_one(
         if field in ("mmproj_path", "mtp_path"): return str(raw) if raw else ""
         if field == "ctx":                   return int(raw) if raw else 32_768
         if field in ("moe_experts", "moe_active"): return int(raw) if raw else 0
-        if field in ("vision",):              return bool(raw)
+        if field in ("vision", "mtp_embedded"): return bool(raw)
         return raw
 
     # Fields omitted from JSON when default — delete key rather than write falsy value
-    _omit_when_default = frozenset({"params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path", "mtp_path"})
+    _omit_when_default = frozenset({"params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path", "mtp_path", "mtp_embedded"})
 
     changes: list[str] = []
     updated = dict(entry)

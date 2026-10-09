@@ -134,8 +134,9 @@ SERVERS: list[ServerSoftware] = [
             "kv_cache_type": "q8_0",
             # Host-RAM prompt cache ceiling in MiB (--cache-ram); None = llama.cpp default.
             "cache_ram_mib": CONFIG.host_cache_ram_mib,
-            # Use the model's MTP draft head (mtp_path) for speculative decoding.
-            "mtp":          True,
+            # MTP speculative decoding: None = auto (sidecar mtp-*.gguf heads only),
+            # True = also the model's embedded head (opt-in per model), False = off.
+            "mtp":          None,
             "port":         CONFIG.server_ports.get("llamacpp", 5000),
             "extra_flags":  [],
         },
@@ -205,8 +206,9 @@ SERVERS: list[ServerSoftware] = [
             "gpu_layers":   -1,     # offload all layers
             "tensor_split": "",     # "" = no flag; "1,1,...,1" for equal N-GPU split
             "cache_type":   "",     # "" = default; "q8_0" llama.cpp; "q8" ExLlama
-            # Use the model's MTP draft head (mtp_path) for speculative decoding.
-            "mtp":          True,
+            # MTP speculative decoding: None = auto (sidecar mtp-*.gguf heads only),
+            # True = also the model's embedded head (opt-in per model), False = off.
+            "mtp":          None,
             "api_port":     CONFIG.server_ports.get("ooba", 5000),
             "webui_port":   CONFIG.server_ports.get("ooba_webui", 7860),
             "nowebui":      False,  # True = skip Gradio WebUI, API only

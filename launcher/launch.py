@@ -448,10 +448,21 @@ def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p:
 
 
 def _mtp_args(model: AIModel, p: dict) -> list[str]:
-    """Speculative-decoding flags using the model's MTP draft head (llama-server and ooba share them)."""
-    if not (model.mtp_path and p.get("mtp")):
+    """Speculative-decoding flags using the model's MTP head (llama-server and ooba share them).
+
+    Param "mtp": None (auto) uses a sidecar head (mtp_path) only; True also uses an
+    embedded head; False disables MTP.  Embedded heads are opt-in because many GGUFs
+    keep NextN layers that a given llama.cpp build cannot run for that architecture.
+    An embedded head runs on the main model's own weights, so no draft file is passed.
+    """
+    mode = p.get("mtp")
+    if mode is False:
         return []
-    return ["--spec-type", "draft-mtp", "--model-draft", model.resolve_mtp_path()]
+    if model.mtp_path:
+        return ["--spec-type", "draft-mtp", "--model-draft", model.resolve_mtp_path()]
+    if model.mtp_embedded and mode:
+        return ["--spec-type", "draft-mtp"]
+    return []
 
 
 def llamacpp_model_args(server: ServerSoftware, model: AIModel, p: dict) -> list[str]:

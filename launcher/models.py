@@ -330,6 +330,7 @@ class AIModel:
     vision: bool = False           # model accepts image/vision input
     mmproj_path: str = ""          # path to companion mmproj .gguf file (vision GGUF only)
     mtp_path: str = ""             # path to companion multi-token-prediction draft head .gguf (GGUF only)
+    mtp_embedded: bool = False     # GGUF carries its own MTP layers (nextn_predict_layers > 0)
     trust_remote_code: bool = False  # servers must pass --trust-remote-code
     quant: str = ""                # quant suffix for display, e.g. "Q4_K_M" (mainly GGUF)
     note: str = ""                 # user-defined note shown in the status bar
@@ -379,6 +380,7 @@ class AIModel:
             vision=bool(d.get("vision", False)),
             mmproj_path=d.get("mmproj_path", ""),
             mtp_path=d.get("mtp_path", ""),
+            mtp_embedded=bool(d.get("mtp_embedded", False)),
             trust_remote_code=bool(d.get("trust_remote_code", False)),
             quant=d.get("quant", ""),
             note=d.get("note", ""),
