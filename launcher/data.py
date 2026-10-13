@@ -132,6 +132,11 @@ SERVERS: list[ServerSoftware] = [
             # KV VRAM at negligible quality cost — often what lets multiple long-context
             # slots fit at all.  Override per model with "f16" if quality suffers.
             "kv_cache_type": "q8_0",
+            # Physical micro-batch size (--ubatch-size); None = llama.cpp default (512).
+            # Compute buffers scale with ubatch × total context, so at very long contexts
+            # (YaRN 1M × several slots) a smaller value (256/128) is what lets it fit,
+            # at some cost in prompt-processing speed.
+            "ubatch":       None,
             # Host-RAM prompt cache ceiling in MiB (--cache-ram); None = llama.cpp default.
             "cache_ram_mib": CONFIG.host_cache_ram_mib,
             # MTP speculative decoding: None = auto (sidecar mtp-*.gguf heads only),

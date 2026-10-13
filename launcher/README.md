@@ -239,6 +239,10 @@ While you pick GPUs and slots, the launcher asks llama.cpp's own planner (`llama
 
 - `✓ fits on GPU  needs 287 of 353 GiB free · weights 121 · KV 117 (23.4/slot) · compute 49 GiB`
 - `⚠ only 49 layers fit on GPU — rest offloaded to CPU (slow)` — fewer slots, more GPUs, or a smaller quant will help.
+- `✗ does not fit in free GPU memory — 21 GiB short` — shown within seconds; llama.cpp may then spend minutes searching for a CPU-offload split ("searching…"), which the estimate gives up on after 2 minutes, keeping the verdict.
+- `⚠ fits in total GPU memory, but needs layers rebalanced across GPUs` — enough memory overall, but llama.cpp has to redistribute layers; llama-server does this itself at launch.
+
+At very long contexts (e.g. YaRN 1M × several slots) compute buffers can outweigh the KV cache: they scale with the micro-batch size × total context. Setting the llama.cpp param `ubatch` to `256` (or `128`) for the model shrinks them substantially, at some cost in prompt-processing speed — Qwen3.8-Flash-Next Q8_0 fits 2 × 1M slots on 15 × 3090 with `ubatch: 256`.
 
 Memory already used by other processes counts against the fit. Vision projectors (`--mmproj`), MTP draft heads, and `extra_flags` are not included in the estimate.
 

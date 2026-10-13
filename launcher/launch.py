@@ -480,6 +480,8 @@ def llamacpp_model_args(server: ServerSoftware, model: AIModel, p: dict) -> list
     ]
     if p["kv_cache_type"]:
         args += ["--cache-type-k", p["kv_cache_type"], "--cache-type-v", p["kv_cache_type"]]
+    if p.get("ubatch"):
+        args += ["--ubatch-size", str(p["ubatch"])]
     if server.applies_rope_scaling(model):
         args += _llamacpp_rope_args(model)
     return args

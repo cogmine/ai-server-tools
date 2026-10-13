@@ -139,8 +139,10 @@ Two native environments (registered in the launcher, `kind: native`):
   `"60%"` ≈ 150 GiB here; llama.cpp's 8 GiB default holds < one full 128K slot state); `--threads` omitted
   (llama.cpp uses the 16 physical cores).
 - **Memory-fit estimate**: `launcher/fit.py` runs `llama-fit-params` (same build, same model/context args via
-  `llamacpp_model_args()`) in a background worker on the GPU screen — exact for any architecture, ~2 s,
-  measured against currently free VRAM. Excludes `--mmproj` and `extra_flags`.
+  `llamacpp_model_args()`) in a background worker on the GPU screen — exact for any architecture, measured against
+  currently free VRAM. The verdict comes from the streamed log within ~2 s; the fitter's placement search (minutes for
+  big MoE models at long ctx) only refines it and may time out. Excludes `--mmproj`, MTP heads and `extra_flags`.
+  `ubatch` param (`--ubatch-size`) shrinks compute buffers, which dominate at YaRN 1M contexts.
 
 ---
 

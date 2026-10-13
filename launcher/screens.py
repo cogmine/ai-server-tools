@@ -1477,6 +1477,10 @@ class GpuSelectScreen(DataTableScreen):
         estimate = estimate_fit(
             self._server, self._env, self._model, cuda_devices, overrides,
             cancelled=lambda: worker.is_cancelled,
+            progress=lambda provisional: (
+                None if worker.is_cancelled
+                else self.app.call_from_thread(self._show_fit, generation, provisional)
+            ),
         )
         if not worker.is_cancelled:
             self.app.call_from_thread(self._show_fit, generation, estimate)
@@ -1561,8 +1565,21 @@ def _fit_markup(estimate: FitEstimate | None, slots: int | None) -> str:
         verdict = "[bright_green]✓ fits on GPU[/]"
     elif estimate.gpu_layers is not None:
         verdict = f"[yellow]⚠ only {estimate.gpu_layers} layers fit on GPU — rest offloaded to CPU (slow)[/]"
+    elif estimate.shortfall_mib == 0 and (estimate.searching or estimate.search_timed_out):
+        # Enough memory in total, but the default layer split overloads some devices.
+        verdict = "[yellow]⚠ fits in total GPU memory, but needs layers rebalanced across GPUs[/]"
+        if estimate.searching:
+            verdict += "  [dim]searching for a placement…[/]"
+        else:
+            verdict += "  [dim](placement search timed out — llama-server will attempt it at launch)[/]"
     else:
         verdict = "[bright_red]✗ does not fit in free GPU memory[/]"
+        if estimate.shortfall_mib:
+            verdict += f" [bright_red]— {_gib(estimate.shortfall_mib)} GiB short[/]"
+        if estimate.searching:
+            verdict += "  [dim]searching for a GPU/CPU split…[/]"
+        elif estimate.search_timed_out:
+            verdict += "  [dim](GPU/CPU split search timed out)[/]"
     details: list[str] = []
     if estimate.projected_mib is not None and estimate.free_mib is not None:
         details.append(f"needs {_gib(estimate.projected_mib)} of {_gib(estimate.free_mib)} GiB free")
