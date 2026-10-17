@@ -4,6 +4,7 @@ gpu.py — NVML polling (via pynvml) and the GpuTable Textual widget.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 
@@ -44,6 +45,42 @@ from textual.widgets import DataTable
 from textual import work
 
 
+# Hardware widths of the saturating PCIe error counters (observed on GA102).
+_RX_ERR_COUNTER_MAX = 0xFFFF
+_LANE_ERR_COUNTER_MAX = 0xFF
+
+# Total link errors (since driver load) at which the Link column turns red.
+_LINK_ERR_BAD = 100
+
+
+@dataclass(frozen=True)
+class PcieLinkHealth:
+    """Cumulative PCIe link error counters reported by a GPU since driver load.
+
+    Each error forces a retransmission or a link retrain, so a non-zero count
+    points at a marginal physical connection (riser, cable, connector, slot).
+    """
+    receiver_errors: int  # physical-layer symbol/framing errors (saturates at 16 bits)
+    bad_tlp: int          # transaction packets that failed LCRC
+    bad_dllp: int         # data-link packets that failed CRC
+    replays: int          # packets the GPU had to resend (host-side receive errors)
+    lane_errors: tuple[int, ...] = ()  # per-lane counts; only read when errors exist
+
+    @property
+    def total(self) -> int:
+        return self.receiver_errors + self.bad_tlp + self.bad_dllp + self.replays
+
+    @property
+    def saturated(self) -> bool:
+        """True when a counter is pinned at its hardware maximum (true count is higher)."""
+        return (self.receiver_errors >= _RX_ERR_COUNTER_MAX
+                or any(n >= _LANE_ERR_COUNTER_MAX for n in self.lane_errors))
+
+    @property
+    def bad_lanes(self) -> tuple[int, ...]:
+        return tuple(lane for lane, n in enumerate(self.lane_errors) if n)
+
+
 @dataclass
 class GpuRow:
     index: int
@@ -56,7 +93,8 @@ class GpuRow:
     util_pct: float
     temp_c: float
     pcie_gen: str     # e.g. "4/4"
-    pcie_width: str   # e.g. "16/16"
+    pcie_width_cur: int  # negotiated link width
+    pcie_width_cap: int  # widest attainable: min(GPU max, upstream port max); 0 = unknown
     error: str = ""          # non-empty → row is in error state
     uuid: str = ""           # full NVML UUID, e.g. "GPU-1a2b3c4d-…" (stable across slot rotations)
     compute_cap: str = ""    # CUDA compute capability, e.g. "8.6" for sm_86
@@ -64,6 +102,19 @@ class GpuRow:
     power_default_w: float = 0.0  # factory (VBIOS) default power limit
     power_min_w: float = 0.0      # lowest settable power limit
     power_max_w: float = 0.0      # highest settable power limit
+    link: PcieLinkHealth | None = None  # None = not polled or unsupported by the GPU
+
+    @property
+    def pcie_width(self) -> str:
+        """Negotiated / attainable link width, e.g. ``"4/4"``."""
+        if not self.pcie_width_cap:
+            return "?/?"
+        return f"{self.pcie_width_cur}/{self.pcie_width_cap}"
+
+    @property
+    def pcie_width_degraded(self) -> bool:
+        """True when the link trained narrower than both ends support (failed lanes)."""
+        return 0 < self.pcie_width_cur < self.pcie_width_cap
 
     @property
     def short_uuid(self) -> str:
@@ -145,6 +196,94 @@ def _fmt_power(row: GpuRow) -> str:
     return f"[{color}]{row.power_w:.0f}[/]/{fmt_power_limit_w(row, row.power_limit_w)}W"
 
 
+def _fmt_width(row: GpuRow) -> str:
+    """Link width; red when lanes failed to train (narrower than both ends support)."""
+    return f"[red]{row.pcie_width}[/]" if row.pcie_width_degraded else row.pcie_width
+
+
+def _fmt_count(n: int) -> str:
+    return f"{n / 1000:.0f}k" if n >= 10_000 else f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def _fmt_link(row: GpuRow) -> str:
+    """PCIe link error total (since driver load) plus the lanes reporting errors."""
+    link = row.link
+    if link is None:
+        return "-"
+    if not link.total:
+        return "[green]ok[/]"
+    color = "red" if link.total >= _LINK_ERR_BAD else "yellow"
+    text = _fmt_count(link.total) + ("+" if link.saturated else "")
+    if link.bad_lanes:
+        text += " L" + ",".join(map(str, link.bad_lanes))
+    return f"[{color}]{text}[/]"
+
+
+def _sysfs_device(bus_addr: str) -> Path:
+    """sysfs path for an NVML busId: ``"00000000:16:00.0"`` → ``/sys/bus/pci/devices/0000:16:00.0``."""
+    # NVML uses an 8-char domain and may return uppercase hex; sysfs uses 4-char lowercase.
+    return Path(f"/sys/bus/pci/devices/{bus_addr[4:].lower()}")
+
+
+@lru_cache(maxsize=None)
+def _upstream_max_width(bus_addr: str) -> int:
+    """Max link width of the PCIe port a GPU is attached to (e.g. 4 on a bifurcated x4 port).
+
+    Returns 0 when unknown (no port above the device, or sysfs unreadable).
+    Topology is fixed while the system runs, so the result is cached.
+    """
+    try:
+        port = _sysfs_device(bus_addr).resolve().parent
+        return int((port / "max_link_width").read_text())
+    except (OSError, ValueError):
+        return 0
+
+
+# busId → (error totals at the last per-lane read, per-lane counts).  Lane
+# counters only move alongside the totals, so they are re-read only on change.
+_lane_cache: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+
+
+def _read_link_health(handle, bus_addr: str, width_max: int) -> PcieLinkHealth | None:
+    """Read the GPU's PCIe error counters; per-lane counts only when the totals change.
+
+    The four totals cost about as much as one other NVML call; the per-lane
+    breakdown is ~10x that, so it is read only for links with new errors.
+    """
+    nvml = _nvml
+    assert nvml is not None
+    try:
+        totals = nvml.nvmlDeviceGetFieldValues(handle, [
+            nvml.NVML_FI_DEV_PCIE_COUNT_RECEIVER_ERROR,
+            nvml.NVML_FI_DEV_PCIE_COUNT_BAD_TLP,
+            nvml.NVML_FI_DEV_PCIE_COUNT_BAD_DLLP,
+            nvml.NVML_FI_DEV_PCIE_REPLAY_COUNTER,
+        ])
+    except nvml.NVMLError:
+        return None
+    if any(v.nvmlReturn != nvml.NVML_SUCCESS for v in totals):
+        return None
+    counts = tuple(int(v.value.ullVal) for v in totals)
+    rx, tlp, dllp, replays = counts
+    lanes: tuple[int, ...] = ()
+    if any(counts):
+        cached = _lane_cache.get(bus_addr)
+        if cached and cached[0] == counts:
+            lanes = cached[1]
+        else:
+            try:
+                per_lane = nvml.nvmlDeviceGetFieldValues(
+                    handle, [(nvml.NVML_FI_DEV_PCIE_COUNT_LANE_ERROR, lane) for lane in range(width_max)]
+                )
+                lanes = tuple(int(v.value.ullVal) if v.nvmlReturn == nvml.NVML_SUCCESS else 0
+                              for v in per_lane)
+                _lane_cache[bus_addr] = (counts, lanes)
+            except nvml.NVMLError:
+                pass
+    return PcieLinkHealth(receiver_errors=rx, bad_tlp=tlp, bad_dllp=dllp,
+                          replays=replays, lane_errors=lanes)
+
+
 def _pci_root(bus_addr: str) -> str:
     """Resolve the PCIe root complex domain for a GPU via sysfs.
 
@@ -152,12 +291,8 @@ def _pci_root(bus_addr: str) -> str:
     Returns the root complex hex string (e.g. ``"15"``), or ``""`` on failure.
     The sysfs symlink path contains ``pci0000:XX`` where XX is the root.
     """
-    # NVML uses 8-char domain; sysfs uses 4-char: 00000000:16:00.0 → 0000:16:00.0
-    # Lowercase: NVML may return uppercase hex (e.g. 8F) but sysfs uses lowercase.
-    sysfs_addr = bus_addr[4:].lower()
-    link = Path(f"/sys/bus/pci/devices/{sysfs_addr}")
     try:
-        target = link.resolve().as_posix()  # e.g. .../pci0000:15/0000:15:01.0/0000:16:00.0
+        target = _sysfs_device(bus_addr).resolve().as_posix()  # e.g. .../pci0000:15/0000:15:01.0/0000:16:00.0
         # Extract root complex from "pci0000:XX" segment
         idx = target.find("/pci")
         if idx >= 0:
@@ -194,8 +329,11 @@ def assign_slot_groups(rows: list[GpuRow]) -> dict[str, int]:
     return seen
 
 
-def poll_gpus() -> list[GpuRow]:
-    """Return one GpuRow per GPU via direct NVML calls (pynvml)."""
+def poll_gpus(link_health: bool = False) -> list[GpuRow]:
+    """Return one GpuRow per GPU via direct NVML calls (pynvml).
+
+    *link_health* also reads the PCIe error counters into ``GpuRow.link``.
+    """
     if not _ensure_nvml():
         return []
     nvml = _nvml
@@ -232,6 +370,7 @@ def poll_gpus() -> list[GpuRow]:
             width_max = nvml.nvmlDeviceGetMaxPcieLinkWidth(handle)
 
             cap_major, cap_minor = nvml.nvmlDeviceGetCudaComputeCapability(handle)
+            port_width = _upstream_max_width(bus_id)
 
             rows.append(GpuRow(
                 index=i,
@@ -244,13 +383,15 @@ def poll_gpus() -> list[GpuRow]:
                 util_pct=float(util.gpu),
                 temp_c=float(temp),
                 pcie_gen=f"{gen_cur}/{gen_max}",
-                pcie_width=f"{width_cur}/{width_max}",
+                pcie_width_cur=width_cur,
+                pcie_width_cap=min(width_max, port_width) if port_width else width_max,
                 uuid=uuid_raw,
                 compute_cap=f"{cap_major}.{cap_minor}",
                 pci_root=_pci_root(bus_id),
                 power_default_w=power_default,
                 power_min_w=power_min_mw / 1000.0,
                 power_max_w=power_max_mw / 1000.0,
+                link=_read_link_health(handle, bus_id, width_max) if link_health else None,
             ))
         except nvml.NVMLError as exc:
             rows.append(GpuRow(
@@ -260,7 +401,7 @@ def poll_gpus() -> list[GpuRow]:
                 power_w=0, power_limit_w=0,
                 mem_used_mib=0, mem_total_mib=0,
                 util_pct=0, temp_c=0,
-                pcie_gen="?/?", pcie_width="?/?",
+                pcie_gen="?/?", pcie_width_cur=0, pcie_width_cap=0,
                 error=str(exc),
             ))
 
@@ -349,5 +490,5 @@ class GpuTable(Widget):
                     _fmt_temp(row),
                     _fmt_power(row),
                     row.pcie_gen,
-                    row.pcie_width,
+                    _fmt_width(row),
                 )

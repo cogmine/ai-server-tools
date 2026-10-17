@@ -20,12 +20,15 @@ A standalone full-screen Textual TUI that shows live per-GPU statistics for all 
 
 `launcher/gpu.py` contains:
 
-- `GpuRow` — dataclass holding one GPU's snapshot: index, bus_id, pci_root, full UUID (`short_uuid` = first 8 hex chars for display), PCIe gen/width, memory used/total, utilisation, temperature, power used/limit, power default/min/max limits, error flag. `pci_root` is the root complex domain hex (e.g. `"15"`) resolved from sysfs — GPUs sharing a root complex sit on the same physical PCIe slot (possibly via bifurcation). `power_limit_delta_w` = current limit − factory default (negative = capped).
-- `poll_gpus() → list[GpuRow]` — queries all GPUs via direct NVML calls (pynvml). On per-device error sets `row.error` and fills what it can. Returns `[]` if NVML is unavailable. Resolves `pci_root` via `/sys/bus/pci/devices/` symlinks (no root required).
+- `GpuRow` — dataclass holding one GPU's snapshot: index, bus_id, pci_root, full UUID (`short_uuid` = first 8 hex chars for display), PCIe gen, PCIe width (`pcie_width_cur` negotiated / `pcie_width_cap` attainable), memory used/total, utilisation, temperature, power used/limit, power default/min/max limits, optional `link: PcieLinkHealth`, error flag. `pci_root` is the root complex domain hex (e.g. `"15"`) resolved from sysfs — GPUs sharing a root complex sit on the same physical PCIe slot (possibly via bifurcation). `pcie_width_cap` = min(GPU max width, max width of the upstream port from sysfs), so a card on a bifurcated x4 port reads `4/4`, not `4/16`; `pcie_width_degraded` flags a link that trained narrower than that (failed lanes). `power_limit_delta_w` = current limit − factory default (negative = capped).
+- `PcieLinkHealth` — frozen dataclass of the GPU's cumulative PCIe error counters since driver load (receiver errors, bad TLP, bad DLLP, replays) plus per-lane error counts. `total`, `bad_lanes`, and `saturated` (a counter pinned at its hardware width — 16-bit receiver errors, 8-bit lane counts on GA102 — so the true count is higher).
+- `poll_gpus(link_health=False) → list[GpuRow]` — queries all GPUs via direct NVML calls (pynvml). On per-device error sets `row.error` and fills what it can. Returns `[]` if NVML is unavailable. Resolves `pci_root` and the upstream port width via `/sys/bus/pci/devices/` (no root required; port width cached — topology is fixed at runtime). `link_health=True` (used by the GPU monitor; the launcher doesn't need it) also fills `row.link`, or leaves it `None` when the GPU/driver doesn't support the counters.
 - `assign_slot_groups(rows) → dict[str, int]` — maps each *shared* `pci_root` (2+ GPUs) to a 1-based group number ordered by bus_id. Solitary roots are omitted so the UI shows "-" for ungrouped GPUs. Used by the GPU monitor to display a "Grp" column showing which GPUs share a physical slot.
-- Formatting helpers: `_fmt_mem`, `_fmt_util`, `_fmt_temp`, `_fmt_power` — each returns a Textual-markup string with colour thresholds. `_fmt_power` marks a non-default power limit (`↓` cyan = capped, `↑` magenta = raised).
+- Formatting helpers: `_fmt_mem`, `_fmt_util`, `_fmt_temp`, `_fmt_power`, `_fmt_width`, `_fmt_link` — each returns a Textual-markup string with colour thresholds. `_fmt_power` marks a non-default power limit (`↓` cyan = capped, `↑` magenta = raised). `_fmt_width` turns red for a degraded link; `_fmt_link` shows `ok` or the error total (yellow, red at `_LINK_ERR_BAD` = 100) with the erroring lanes (`L2,3`) and `+` when saturated.
 
 **Why pynvml over nvidia-smi subprocess?** Each `subprocess` spawn costs 5–50 ms (fork + exec + CSV parse). At the fast polling rate of 0.1 s that is 5–50% of the entire interval just spawning a process. pynvml calls the same underlying NVML C library directly; the cost per poll is sub-millisecond. pynvml also returns typed values (ints/floats), eliminating all string parsing and `[N/A]` edge-case handling.
+
+**PCIe link-health cost.** The four error totals come from one `nvmlDeviceGetFieldValues` call per GPU (≈ the cost of any other NVML call). The per-lane breakdown is a 16-field query costing ~10× more (~0.7 ms/GPU), so it is read only for GPUs with non-zero totals, and cached in `_lane_cache` (keyed by busId) until those totals change — lane counters only move alongside them. A 15-GPU poll stays at ~1.5 ms with healthy links and a few ms with several faulty ones.
 
 ---
 
@@ -36,7 +39,7 @@ GpuMonitorApp.on_mount
     └─ _refresh()                   — immediate first poll
 
 _refresh() [@work(thread=True)]
-    └─ poll_gpus()                  — NVML calls via pynvml (non-blocking, sub-ms)
+    └─ poll_gpus(link_health=True)  — NVML calls via pynvml (non-blocking, a few ms)
     └─ call_from_thread(_update)    — safe UI update from worker thread
 
 _update(rows)
@@ -79,13 +82,14 @@ Static identity/topology columns are listed first so they never shift while dyna
 | `Slot` | Static | PCIe bus ID — useful for physical slot identification |
 | `SM` | Static | CUDA compute capability (e.g. `8.6` for RTX 3090). Used by the launcher to gate hw-incompatible models. |
 | `Gen` | Static | PCIe link generation current/max — diagnoses PCIe downgrade (important on x570 boards where x16 slots share bandwidth) |
-| `Width` | Static | PCIe link width current/max — flags accidentally x8-slotted cards |
+| `Width` | Static | PCIe link width negotiated/attainable (attainable = min of GPU and upstream-port max, so bifurcated x4 ports read `4/4`) — red when the link trained narrower, i.e. failed lanes in a riser/cable/connector |
 | `Memory` | Dynamic | Block-char progress bar + used/total GB; green → yellow → red at 60%/90% |
 | `Util` | Dynamic | Compute utilisation %; colour-coded |
 | `Temp` | Dynamic | Core temperature °C; colour-coded |
 | `Power` | Dynamic | Current draw / power limit watts; draw colour-coded vs. limit. Limit marked `↓`/`↑` when it differs from the factory default, so manually capped cards stand out |
+| `Link` | Dynamic | PCIe link errors since driver load (`PcieLinkHealth.total`) + erroring lanes, e.g. `6.7k+ L2`. Healthy links stay at zero even under load, so any count marks a marginal physical connection. Last column because its width varies with the count |
 
-The summary bar at the bottom aggregates total VRAM used vs. total across all GPUs — the single number most relevant when loading a large model. It also shows total power draw vs. the sum of power limits (the worst-case PSU load), and a per-slot GPU count (e.g. `Slots: 1:1 2:2 3:3 4:3 5:1 6:1 7:1`) so a missing GPU is immediately visible as a group with fewer GPUs than expected.
+The summary bar at the bottom aggregates total VRAM used vs. total across all GPUs — the single number most relevant when loading a large model. It also shows total power draw vs. the sum of power limits (the worst-case PSU load), the number of GPUs with PCIe link issues (degraded width or non-zero link errors), and a per-slot GPU count (e.g. `Slots: 1:1 2:2 3:3 4:3 5:1 6:1 7:1`) so a missing GPU is immediately visible as a group with fewer GPUs than expected.
 
 ---
 

@@ -115,12 +115,21 @@ Server tools scan config files at startup — on a NAS or slow drive this causes
 
 ## llama.cpp
 
-Two native environments (registered in the launcher, `kind: native`):
+Three native environments (registered in the launcher, `kind: native`):
 - **`llama.cpp`** (default) — `~/llama.cpp`, build b10109 (2026-07-24), `~/llama.cpp/build/bin`.
 - **`llama.cpp-next`** — `~/llama.cpp-next`, a **git worktree** of the same repo at the latest
   `origin/master` (detached), built into `~/llama.cpp-next/build/bin` (b11461, 2026-10-07; includes
-  `qwen4exp` / Qwen3.8-Flash-Next support). Binaries use RUNPATH to their own `build/bin`, so the two
+  `qwen4exp` / Qwen3.8-Flash-Next support). Binaries use RUNPATH to their own `build/bin`, so the
   builds never share libraries.
+- **`llama.cpp-next-patched`** — `~/llama.cpp-next-patched`, a third worktree: `origin/master` b11706
+  (2026-10-16) plus one **local commit** (never pushed) applying the fix from ggml-org/llama.cpp#29811
+  (`src/models/qwen4exp.cpp`: the MTP draft graph builds k-pool inputs only when the MTP block's
+  `attention.compress_ratios` entry is > 0). Without it, Qwen4Exp MTP heads converted before llama.cpp's
+  merged MTP support (ratio 0 for the MTP block — e.g. orcarouter's embedded `-Q8_0-MTP` GGUF) abort at
+  startup with `GGML_ASSERT(buffer)` in `set_input_k_idxs`. b11706 also fixes MTP + image input (#30257,
+  #30397), which crashes b11461. Validated: `qwen3-8-flash-next-uncensored-mtp-q8`, 3 × 256K, text + image,
+  ~60 t/s, draft acceptance 54–67%. **Update** (re-applies the patch; drop it once merged upstream):
+  `cd ~/llama.cpp-next-patched && git fetch origin && git rebase origin/master && /usr/bin/cmake --build build -j 32`.
 - **Build config** (identical for both): `/usr/bin/cmake` (the `~/.local/bin/cmake` pip shim is broken),
   `-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.5/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=ON

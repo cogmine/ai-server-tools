@@ -12,11 +12,14 @@ from textual.binding import Binding
 from textual.widgets import DataTable, Footer, Header, Label
 from textual import work
 
-from launcher.gpu import GpuRow, poll_gpus, assign_slot_groups, _fmt_mem, _fmt_util, _fmt_temp, _fmt_power
+from launcher.gpu import (
+    GpuRow, poll_gpus, assign_slot_groups,
+    _fmt_mem, _fmt_util, _fmt_temp, _fmt_power, _fmt_width, _fmt_link,
+)
 
 
 # Static identity/topology columns come first, dynamic metrics after
-COLUMNS = ("#", "ID", "Grp", "Slot", "SM", "Gen", "Width", "Memory", "Util", "Temp", "Power")
+COLUMNS = ("#", "ID", "Grp", "Slot", "SM", "Gen", "Width", "Memory", "Util", "Temp", "Power", "Link")
 
 # ---------------------------------------------------------------------------
 # Adaptive polling parameters
@@ -55,7 +58,7 @@ class GpuMonitorApp(App):
     @work(thread=True)
     def _refresh(self) -> None:
         try:
-            rows = poll_gpus()
+            rows = poll_gpus(link_health=True)
         except Exception:
             rows = []
         self.app.call_from_thread(self._update, rows)
@@ -100,12 +103,15 @@ class GpuMonitorApp(App):
         total_power = 0.0
         total_power_limit = 0.0
         error_count = 0
+        link_bad_count = 0
         group_counts: dict[int, int] = {}  # group → GPU count
 
         for row in rows:
             grp = groups.get(row.pci_root, 0)
             grp_str = str(grp) if grp else "-"
             group_counts[grp] = group_counts.get(grp, 0) + 1
+            if row.pcie_width_degraded or (row.link and row.link.total):
+                link_bad_count += 1
             if row.error:
                 error_count += 1
                 vals = [str(row.index), row.short_uuid or row.bus_id]
@@ -113,9 +119,9 @@ class GpuMonitorApp(App):
                     vals.append(grp_str)
                 vals += [
                     row.bus_id, row.compute_cap or "-",
-                    row.pcie_gen, row.pcie_width,
+                    row.pcie_gen, _fmt_width(row),
                     f"[red]!ERROR: {row.error}[/]",
-                    "-", "-", "-",
+                    "-", "-", "-", "-",
                 ]
                 table.add_row(*vals)
             else:
@@ -128,8 +134,9 @@ class GpuMonitorApp(App):
                     vals.append(grp_str)
                 vals += [
                     row.bus_id, row.compute_cap or "-",
-                    row.pcie_gen, row.pcie_width,
+                    row.pcie_gen, _fmt_width(row),
                     _fmt_mem(row), _fmt_util(row), _fmt_temp(row), _fmt_power(row),
+                    _fmt_link(row),
                 ]
                 table.add_row(*vals)
 
@@ -142,6 +149,8 @@ class GpuMonitorApp(App):
             free_pct = (free_gb / total_gb * 100) if total_gb else 0
             free_color = "green" if free_pct > 50 else ("yellow" if free_pct > 20 else "red")
             err_str = f"  [red]{error_count} error(s)[/]" if error_count else ""
+            link_str = (f"  ·  [yellow]{link_bad_count} PCIe link issue(s)[/]"
+                        if link_bad_count else "")
             live_str = "  ·  [bold yellow]⚡[/]" if fast_mode else ""
             grp_str = "  ·  [dim]Slots:[/] " + " ".join(
                 f"{g}:{c}" for g, c in sorted(group_counts.items()) if g
@@ -152,6 +161,7 @@ class GpuMonitorApp(App):
                 f"  ·  [{free_color}][bold]{free_gb:.0f}[/] GB free[/]"
                 f"  ·  [dim]Power:[/] {total_power / 1000:.1f}/{total_power_limit / 1000:.1f} kW"
                 f"{err_str}"
+                f"{link_str}"
                 f"{grp_str}"
                 f"{live_str}"
             )
