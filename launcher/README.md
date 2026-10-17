@@ -79,6 +79,7 @@ All system-specific paths live in **`user_data/config.toml`** (gitignored). The 
 | `[paths]` | `ooba_main` / `ooba_model_dir` | text-generation-webui entry point and model staging directory |
 | `[paths]` | `comfyui_main` / `comfyui_models_dir` | ComfyUI entry point and model staging directory |
 | `[paths]` | `exl2_convert_script` | ExLlamaV2 `convert.py` (falls back to the module entry point when absent) |
+| `[paths]` | `llama_convert_python` | Python with PyTorch, Transformers, and NumPy for HF-to-GGUF conversion; defaults to the launcher interpreter |
 | `[paths]` | `cuda_home_tabby` | `CUDA_HOME` injected for tabbyAPI (flash-attn); leave `""` to skip |
 | `[paths]` | `cuda_home_sglang` | `CUDA_HOME` injected for SGLang (flashinfer JIT); leave `""` to skip |
 | `[paths]` | `cuda_visible_devices` | Explicit GPU list; `""` = auto-derive from `pipeline_parallel` |
@@ -223,7 +224,7 @@ Override server defaults per model with a `server_params` key:
 | `u` | Uncache focused model (model list) |
 | `l` | Context settings for focused model (model list): YaRN factor to extend the context (e.g. `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF) and/or a context-length override |
 | `f` | Toggle favorite pin for focused model (model list) |
-| `z` | Quantize focused model — opens tool/quant/destination picker (model list) |
+| `z` | Convert / quantize focused model — opens tool/output/destination picker (model list) |
 | `g` / `x` / `?` | Mark the launch as good / bad / unknown — on the deepest screen for that server (server list, environment picker, or quantization picker) |
 | `e` | Manage environments for the focused server (server list, environment picker) |
 | `Ctrl+Enter` | Execute the edited command (final Ready to launch screen) |
@@ -309,24 +310,25 @@ Test results are stored per model, server **and environment** in `models_local.j
 | `✗?` | At least one bad, none good |
 | `?` | All untested |
 
-## Quantizing models
+## Converting and quantizing models
 
-Press `z` on any model in the model list to start a quantization job.  Only models in quantizable formats (GGUF, BF16/FP16 safetensors, PyTorch .bin) enable the keybinding.
+Press `z` on any model in the model list to start a conversion or quantization job. Only GGUF, BF16/FP16 safetensors, and PyTorch `.bin` models have an applicable tool.
 
 **Flow:**
 1. If more than one tool supports the model's format, pick a tool. Otherwise this step is skipped.
-2. Pick a target quant level (e.g. Q4_K_M for GGUF, or 4.0 bpw for EXL2).
+2. Pick a target quant level (e.g. Q4_K_M for GGUF re-quantization, F16/BF16 for HF-to-GGUF conversion, or 4.0 bpw for EXL2).
 3. Pick an output destination — one of the configured `[[cache_mounts]]`, with current free space shown.
-4. Choose the GPUs to expose to the tool. The list shows current VRAM usage; all available GPUs start selected. Use Space to toggle a GPU, `a` to select all, and Enter / `→` to continue. At least one GPU must be selected; if GPU polling is unavailable, return and retry after restoring it.
-5. Review the full command (including `CUDA_VISIBLE_DEVICES`) and output path, then confirm. Back returns to the GPU picker with your selection intact.
+4. For CUDA quantizers, choose the GPUs to expose to the tool. The list shows current VRAM usage; all available GPUs start selected. Use Space to toggle a GPU, `a` to select all, and Enter / `→` to continue. At least one GPU must be selected; if GPU polling is unavailable, return and retry after restoring it. CPU-only converters skip this step.
+5. Review the full command and output path, then confirm. For CUDA tools, the command includes `CUDA_VISIBLE_DEVICES`; Back returns to the GPU picker with your selection intact.
 
-The TUI temporarily exits while the conversion runs in your terminal with live output, and the log is written to `logs/`. Outputs are placed under the AI-type subdirectory of the chosen cache mount (for example, `~/fast_models/text-generation/`). After a successful conversion, the launcher copies required EXL2 config/tokenizer metadata, removes resumable conversion work files, adds the generated model to `user_data/models_local.json`, and reopens with that model focused. Failed or interrupted outputs retain their work files and are not added to the catalog.
+The TUI temporarily exits while the conversion runs in your terminal with live output, and the log is written to `logs/`. Outputs are placed under the AI-type subdirectory of the chosen cache mount (for example, `~/fast_models/text-generation/`). After a successful conversion, the launcher copies source config/tokenizer metadata when needed, removes EXL2 resumable work files, adds the generated model to `user_data/models_local.json`, and reopens with that model focused. Failed or interrupted outputs retain their work files and are not added to the catalog.
 
 ### Supported tools
 
 | Tool | Converts | Prerequisite | Auto-install? |
 |---|---|---|---|
 | `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level) | llama.cpp built binary — co-located with `llama-server` in the default llama.cpp environment. No extra install if llama.cpp is set up. | No (requires building llama.cpp with CUDA) |
+| `llama-hf-to-gguf` | BF16 / FP16 safetensors or PyTorch `.bin` → F16 / BF16 GGUF | `convert_hf_to_gguf.py` in the registered llama.cpp source tree and `llama_convert_python` with PyTorch, Transformers, and NumPy. Conversion runs on CPU; it does not need GPUs. Only architectures supported by that llama.cpp converter work; vision models are excluded because their separate projector is not converted by this workflow. | No |
 | `exl2-convert` | BF16 / FP16 / BIN safetensors → EXL2 | `exllamav2` Python package in the default tabbyAPI environment. Already present if tabbyAPI is set up. If missing, the launcher offers to `pip install exllamav2` automatically (uses JIT CUDA compilation — no CUDA toolkit needed at install time). | **Yes** — press Enter in the install prompt |
 
 ### Adding a quantization tool

@@ -179,10 +179,9 @@ def run(no_menu: bool = False, default: int | None = None) -> None:
             if rc == 0:
                 try:
                     preselect_model = finalize_quantization(quantize_job)
-                    print(f"Added quantized model: {preselect_model.id}", flush=True)
+                    print(f"Added generated model: {preselect_model.id}", flush=True)
                 except Exception as exc:
                     print(f"Failed to finalize quantized model: {exc}", file=sys.stderr)
             continue
 
         sys.exit(rc or 0)
-

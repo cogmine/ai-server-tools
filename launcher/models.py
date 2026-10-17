@@ -766,7 +766,10 @@ class QuantizationTool:
       env_server_id     — ServerSoftware.id whose *default* Environment the tool runs from
                           (e.g. "llamacpp" for llama-quantize, "tabby" for exllamav2).
       avail_executable  — executable name that must exist in that environment's bin dir.
-      avail_module      — Python module that must be importable in that environment.
+      avail_script      — script name under the source root above that environment's bin dir.
+      avail_module(s)   — Python module(s) that must be importable in the selected interpreter.
+      python_executable — optional interpreter path; otherwise the environment's Python is used.
+      uses_cuda         — whether the tool needs GPU selection and CUDA visibility.
       pip_package       — pip package installed into that environment for auto-install;
                           "" = not auto-installable.
       install_note      — shown to the user when the tool is unavailable and cannot be auto-installed.
@@ -781,13 +784,21 @@ class QuantizationTool:
     cuda_home: str = ""                      # CUDA_HOME override injected at run time (if non-empty)
     avail_executable: str = ""               # executable in the env's bin dir; must exist
     avail_module: str = ""                   # module importable in the env's python
+    avail_modules: tuple[str, ...] = ()      # modules required by python_executable
+    avail_script: str = ""                   # script under the environment's source root
+    python_executable: str = ""              # interpreter used instead of env.python
+    uses_cuda: bool = True                   # whether the tool needs CUDA visibility / GPU selection
+    supports_vision: bool = True             # whether the tool preserves vision model functionality
     pip_package: str = ""                    # auto-install package; "" = not auto-installable
     install_note: str = ""                   # shown when unavailable and not auto-installable
 
 
 def tools_for_model(tools: "list[QuantizationTool]", model: AIModel) -> "list[QuantizationTool]":
     """All quantization tools that can accept the given model's format as input."""
-    return [t for t in tools if model.format in t.input_formats]
+    return [
+        t for t in tools
+        if model.format in t.input_formats and (not model.vision or t.supports_vision)
+    ]
 
 
 def available_ai_types(models: list[AIModel]) -> list[AIType]:
@@ -795,5 +806,3 @@ def available_ai_types(models: list[AIModel]) -> list[AIType]:
     _ORDER = [AIType.TEXT_GEN, AIType.IMAGE_GEN, AIType.EMBEDDING, AIType.SPEECH]
     present = {t for m in models for t in m.ai_types}
     return [t for t in _ORDER if t in present]
-
-

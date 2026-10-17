@@ -430,9 +430,10 @@ Initial tools:
 | id | Input | Output | Binary |
 |---|---|---|---|
 | `llama-quantize` | `GGUF` | `GGUF` | `llama-quantize` in the default `llamacpp` environment (built alongside `llama-server`) |
+| `llama-hf-to-gguf` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `GGUF` (`F16` or `BF16`) | `convert_hf_to_gguf.py` in the registered llama.cpp source tree; Python interpreter configured by `llama_convert_python` |
 | `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | default `tabby` environment's Python: `CONFIG.exl2_convert_script` or `-m exllamav2.conversion.convert_exl2` |
 
-Tools run from their `env_server_id`'s default environment (`quant_tool_env(tool)`); builders take `(tool, env, model, quant_option, output_path)`. Availability is cached per `(tool, environment location)`, so switching the default environment re-checks it.
+Tools use their `env_server_id`'s default environment (`quant_tool_env(tool)`) for binaries and scripts; builders take `(tool, env, model, quant_option, output_path)`. A tool may use a separate configured Python interpreter and declare the modules needed to run its script. Availability is cached per tool, environment location, and interpreter, so switching the default environment or interpreter re-checks it.
 
 Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matching `_build_<id>` builder in `launch.py` registered in `_QUANT_BUILDERS`.
 
@@ -440,9 +441,9 @@ Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matchi
 
 `compute_quant_output_path(tool, model, quant_option, dest)` in `launch.py` always returns a **directory**. Every job gets its own uniquely-named directory so that removal is always consistent: delete the directory and its contents, regardless of format.
 
-- **GGUF re-quantize**: `<dest.root>/<model.cache_subdir>/<stem_no_quant>-GGUF-<quant>/`
-  — The `.gguf` file inside is `<stem_no_quant>.<quant>.gguf`, placed there by the builder.
-  Example: `<dest>/text-generation/MyModel-GGUF-Q4_K_M/MyModel.Q4_K_M.gguf`
+- **GGUF output**: `<dest.root>/<model.cache_subdir>/<source_stem>-GGUF-<quant>/`
+  — GGUF re-quantization strips the source quant suffix; HF conversion keeps the source directory name. The builder writes a `.gguf` file inside the directory.
+  Example: `<dest>/text-generation/MyModel-GGUF-Q4_K_M/MyModel.Q4_K_M.gguf` or `<dest>/text-generation/MyModel-GGUF-F16/MyModel.F16.gguf`
 
 - **EXL2 convert**: `<dest.root>/<model.cache_subdir>/<source_dirname>-exl2-<bpw>bpw/`
   — `source_dirname` is `Path(model.resolve_path()).name`.
@@ -457,7 +458,7 @@ Follows the same PTY + log structure as `launch()`:
 - Output directory created before spawn
 - `build_quantize_cmd(tool, model, quant_option, dest, cuda_devices=None)` includes an explicit `env CUDA_VISIBLE_DEVICES=…` prefix and `CUDA_HOME` from `tool.cuda_home` when non-empty. The picker passes its selected devices through confirmation to `quantize()`; non-TUI callers default to `CONFIG.resolved_cuda_devices`. Preview, log, and execution use the same builder.
 - Same PTY window-size stamping and bash wrapper
-- On exit code 0, `finalize_quantization()` copies EXL2 metadata, removes converter work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), and registers the explicit output path through `ingest_model()`
+- On exit code 0, `finalize_quantization()` copies source config/tokenizer metadata for directory inputs, removes EXL2 work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), resolves the first shard of GGUF outputs, and registers the generated model through `ingest_model()`
 - The launcher then reopens with the generated model focused; failed or interrupted outputs remain on disk for inspection/resume but are not registered
 
 ### `exl2_convert_script` config field
@@ -465,6 +466,8 @@ Follows the same PTY + log structure as `launch()`:
 `CONFIG.exl2_convert_script` (path, from `config.toml` key `exl2_convert_script`; default `~/exllamav2/convert.py`).  The `_build_exl2_convert` builder checks whether the script file exists on disk:
 - If yes → `<tabby env python> <script> -i ... -o ... -b ...`
 - If no → `<tabby env python> -m exllamav2.conversion.convert_exl2 -i ... -o ... -b ...`
+
+`llama-hf-to-gguf` invokes llama.cpp's `convert_hf_to_gguf.py` with `--outtype f16|bf16`. It accepts full-precision, non-vision HF directories only; vision checkpoints are filtered out because this flow does not convert their separate projector. Conversion runs without CUDA/GPU selection and uses `CONFIG.llama_convert_python` (from `config.toml` key `llama_convert_python`; defaults to the Python running the launcher). That interpreter needs PyTorch, Transformers, and NumPy. The output GGUF and source config/tokenizer files are stored together; the normal GGUF ingest path detects the new model and records its F16/BF16 type.
 
 ---
 

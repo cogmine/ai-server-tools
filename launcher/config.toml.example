@@ -36,6 +36,10 @@ comfyui_models_dir = "~/ComfyUI/models"
 # (the module entrypoint for exllamav2 >= 0.3.x installed as a package).
 exl2_convert_script = "~/exllamav2/convert.py"
 
+# Python interpreter with PyTorch and Transformers for llama.cpp's
+# convert_hf_to_gguf.py. Defaults to the Python running the launcher.
+llama_convert_python = ""
+
 # CUDA_HOME injected when launching tabbyAPI (needed for flash-attn)
 # Leave empty ("") to skip setting it.
 cuda_home_tabby  = "/usr/local/cuda-12.5"

@@ -73,6 +73,7 @@ class SiteConfig:
     cuda_visible_devices: str    # explicit GPU list, or "" to derive from pipeline_parallel
     pipeline_parallel:    int    # GPU count for vLLM PP (never 0 after load)
     exl2_convert_script:  Path   # path to ExLlamaV2 convert.py; falls back to -m exllamav2.conversion.convert_exl2 if absent
+    llama_convert_python: Path   # Python interpreter with llama.cpp HF-converter dependencies
     comfyui_main:         Path   # path to ComfyUI main.py
     comfyui_models_dir:   Path   # base staging dir for ComfyUI symlinks (~/ComfyUI/models/)
     # Ceiling (MiB) for a server's host-RAM prompt cache (llama.cpp --cache-ram);
@@ -143,6 +144,8 @@ def _load() -> SiteConfig:
         pipeline_parallel=pp,
         exl2_convert_script=expand_path(
             paths.get("exl2_convert_script", "~/exllamav2/convert.py")),
+        llama_convert_python=expand_path(
+            paths.get("llama_convert_python") or sys.executable),
         comfyui_main=expand_path(
             paths.get("comfyui_main", "~/ComfyUI/main.py")),
         comfyui_models_dir=expand_path(

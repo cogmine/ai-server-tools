@@ -47,7 +47,8 @@ from launcher.environments import ENVIRONMENTS, Environment
 from launcher.gpu_power import PowerLimitStep
 from launcher.models import (
     AIModel, CacheMount, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
-    QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key, gguf_shard_paths,
+    QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key,
+    gguf_shard_paths, gguf_split_info,
 )
 from launcher.config import CONFIG
 
@@ -87,7 +88,7 @@ class LaunchJob:
 
 @dataclass(frozen=True)
 class QuantizeJob:
-    """A quantization process plus the information needed to finalize it."""
+    """A conversion/quantization process plus the information needed to finalize it."""
 
     factory: Callable[[], tuple[subprocess.Popen[bytes], Path, int]]
     model: AIModel
@@ -608,7 +609,7 @@ _BUILDERS = {
 
 # Availability is checked once per (tool, environment) and cached; exl2-convert
 # requires a subprocess call (to check importability without triggering JIT compilation).
-_tool_avail_cache: dict[tuple[str, str], bool] = {}
+_tool_avail_cache: dict[tuple[str, ...], bool] = {}
 
 
 def quant_tool_env(tool: QuantizationTool) -> Environment | None:
@@ -631,7 +632,7 @@ def quant_tool_available(tool: QuantizationTool) -> bool:
     env = quant_tool_env(tool)
     if env is None or not env.exists():
         return False
-    key = (tool.id, str(env.location))
+    key = (tool.id, str(env.location), tool.python_executable)
     if key not in _tool_avail_cache:
         _tool_avail_cache[key] = _check_tool_available(tool, env)
     return _tool_avail_cache[key]
@@ -640,12 +641,19 @@ def quant_tool_available(tool: QuantizationTool) -> bool:
 def _check_tool_available(tool: QuantizationTool, env: Environment) -> bool:
     if tool.avail_executable and not env.executable(tool.avail_executable).is_file():
         return False
-    if tool.avail_module:
-        module = tool.avail_module
+    if tool.avail_script and not (env.bin_dir.parent.parent / tool.avail_script).is_file():
+        return False
+    modules = tool.avail_modules or ((tool.avail_module,) if tool.avail_module else ())
+    if modules:
+        interpreter = tool.python_executable or str(env.python)
         try:
             r = subprocess.run(
-                [str(env.python), "-c",
-                 f"import importlib.util; raise SystemExit(0 if importlib.util.find_spec({module!r}) else 1)"],
+                [
+                    interpreter, "-c",
+                    "import importlib.util, sys; "
+                    f"modules = {modules!r}; "
+                    "raise SystemExit(0 if all(importlib.util.find_spec(m) for m in modules) else 1)",
+                ],
                 capture_output=True, timeout=5,
             )
             return r.returncode == 0
@@ -672,7 +680,7 @@ def install_quant_tool(tool: QuantizationTool) -> tuple[bool, str]:
             timeout=300,
         )
     success = result.returncode == 0
-    _tool_avail_cache[(tool.id, str(env.location))] = success
+    _tool_avail_cache[(tool.id, str(env.location), tool.python_executable)] = success
     return success, log_path
 
 
@@ -706,11 +714,10 @@ def compute_quant_output_path(
     Every job produces its own uniquely-named directory so that removal
     is always consistent: delete the directory and its contents.
 
-    GGUF re-quantize:
+    GGUF output:
         <dest.root>/<model.cache_subdir>/<stem_no_quant>-GGUF-<quant>/
-        e.g. ~/fast_models/text-generation/BeMag-123B-v0.1-GGUF-Q4_K_M/
-        The .gguf file inside is <stem_no_quant>.<quant>.gguf,
-        constructed by _build_llama_quantize.
+        Existing GGUF inputs have their quant suffix removed; HF directory
+        inputs keep their source directory name.
 
     EXL2 convert:
         <dest.root>/<model.cache_subdir>/<source_dirname>-exl2-<bpw>bpw/
@@ -719,7 +726,7 @@ def compute_quant_output_path(
     src = Path(model.resolve_path())
     output_root = dest.root / model.cache_subdir
     if tool.output_format == ModelFormat.GGUF:
-        stem = _strip_gguf_quant(src.stem)
+        stem = _strip_gguf_quant(src.stem) if model.format == ModelFormat.GGUF else src.name
         return output_root / f"{stem}-GGUF-{quant_option}"
     else:
         return output_root / f"{src.name}-exl2-{quant_option}bpw"
@@ -764,8 +771,33 @@ def _build_exl2_convert(
     ]
 
 
+def _build_llama_hf_to_gguf(
+    tool: QuantizationTool,
+    env: Environment,
+    model: AIModel,
+    quant_option: str,
+    output_dir: Path,
+) -> list[str]:
+    source_root = env.bin_dir.parent.parent
+    script = source_root / "convert_hf_to_gguf.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"llama.cpp converter script not found: {script}")
+    source = Path(model.resolve_path())
+    if not source.is_dir():
+        raise ValueError(f"HF-to-GGUF conversion requires a model directory: {source}")
+    output_file = output_dir / f"{source.name}.{quant_option}.gguf"
+    return [
+        tool.python_executable or str(env.python),
+        str(script),
+        "--outfile", str(output_file),
+        "--outtype", quant_option.lower(),
+        str(source),
+    ]
+
+
 _QUANT_BUILDERS: dict[str, Any] = {
     "llama-quantize": _build_llama_quantize,
+    "llama-hf-to-gguf": _build_llama_hf_to_gguf,
     "exl2-convert":   _build_exl2_convert,
 }
 
@@ -783,6 +815,8 @@ def build_quantize_cmd(
     if builder is None:
         raise ValueError(f"No command builder registered for quantization tool: {tool.id!r}")
     cmd = builder(tool, _tool_env(tool), model, quant_option, output_path)
+    if not tool.uses_cuda:
+        return cmd, output_path
     env_cmd = [
         "env",
         f"CUDA_VISIBLE_DEVICES={cuda_devices if cuda_devices is not None else CONFIG.resolved_cuda_devices}",
@@ -1101,9 +1135,25 @@ def finalize_quantization(job: QuantizeJob) -> AIModel:
     """Copy model metadata, catalog a successful output, and return its model."""
     from launcher.ingest import copy_model_metadata, ingest_model
 
+    ingest_path = job.output_path
     if job.tool.output_format == ModelFormat.EXL2:
         copy_model_metadata(Path(job.model.resolve_path()), job.output_path)
         _remove_exl2_work_artifacts(job.output_path)
+    elif job.tool.output_format == ModelFormat.GGUF:
+        source = Path(job.model.resolve_path())
+        if source.is_dir():
+            copy_model_metadata(source, job.output_path)
+        gguf_files = sorted(job.output_path.glob("*.gguf"))
+        if not gguf_files:
+            raise FileNotFoundError(f"GGUF conversion produced no .gguf output in {job.output_path}")
+        first_shard = next(
+            (p for p in gguf_files if (info := gguf_split_info(p)) is not None and info[1] == 1),
+            None,
+        )
+        ingest_path = first_shard or gguf_files[0]
+        missing_shards = [p for p in gguf_shard_paths(ingest_path) if not p.is_file()]
+        if missing_shards:
+            raise FileNotFoundError(f"GGUF output is missing shard(s): {', '.join(map(str, missing_shards))}")
 
     entry_overrides = {
         "id": job.output_path.name.lower().replace(".", "-"),
@@ -1111,11 +1161,11 @@ def finalize_quantization(job: QuantizeJob) -> AIModel:
         "quant": (
             f"{job.quant_option} bpw"
             if job.tool.output_format == ModelFormat.EXL2
-            else job.quant_option
+            else job.quant_option.upper()
         ),
     }
     entry = ingest_model(
-        job.output_path,
+        ingest_path,
         fmt=job.tool.output_format.value,
         entry_overrides=entry_overrides,
     )

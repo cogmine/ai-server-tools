@@ -28,7 +28,7 @@ from typing import Any, Callable, ClassVar
 
 from rich.markup import escape
 from textual import on, work
-from textual.app import ComposeResult
+from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import (
@@ -1628,7 +1628,7 @@ def _fit_markup(estimate: FitEstimate | None, slots: int | None) -> str:
 # ---------------------------------------------------------------------------
 
 class QuantizeToolScreen(DataTableScreen):
-    """Select which quantization tool to use.
+    """Select which conversion or quantization tool to use.
 
     Only pushed when more than one tool is applicable for the model's format.
     Skipped automatically when exactly one tool applies.
@@ -1648,7 +1648,7 @@ class QuantizeToolScreen(DataTableScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Label(
-            f"[bold]Select quantization tool for:[/]  "
+            f"[bold]Select conversion / quantization tool for:[/]  "
             f"{self._model.name}  ·  [dim]{self._model.format_tag}[/]",
             id="screen-title",
         )
@@ -1786,7 +1786,7 @@ class QuantizeOptionScreen(DataTableScreen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Label(
-            f"[bold]Select quantization for:[/]  "
+            f"[bold]Select output format / quantization for:[/]  "
             f"{self._model.name}  ·  [dim]{self._model.format_tag}[/]"
             f"  →  [dim]{self._tool.label}[/]",
             id="screen-title",
@@ -1815,7 +1815,7 @@ class QuantizeOptionScreen(DataTableScreen):
 # ---------------------------------------------------------------------------
 
 class QuantizeDestScreen(ButtonMenuScreen):
-    """Select which local storage mount to write the quantized output to."""
+    """Select which local storage mount to write the generated output to."""
 
     BINDINGS: ClassVar = [
         Binding("q",             "quit_app",       "Quit"),
@@ -1869,9 +1869,42 @@ class QuantizeDestScreen(ButtonMenuScreen):
         elif bid.startswith("btn-dest-"):
             priority = int(bid.rsplit("-", 1)[-1])
             mount = next(m for m in CACHE_MOUNTS if m.priority == priority)
-            self.app.push_screen(
-                QuantizeGpuScreen(self._model, self._tool, self._quant_option, mount)
-            )
+            if self._tool.uses_cuda:
+                self.app.push_screen(
+                    QuantizeGpuScreen(self._model, self._tool, self._quant_option, mount)
+                )
+            else:
+                _push_quantize_confirmation(
+                    self.app, self._model, self._tool, self._quant_option, mount, None,
+                )
+
+
+def _push_quantize_confirmation(
+    app: App,
+    model: AIModel,
+    tool: QuantizationTool,
+    quant_option: str,
+    dest: CacheMount,
+    cuda_devices: str | None,
+) -> None:
+    try:
+        cmd, output_path = launcher.build_quantize_cmd(
+            tool, model, quant_option, dest, cuda_devices,
+        )
+    except (ValueError, OSError) as e:
+        app.notify(str(e), severity="error", timeout=5)
+        return
+    app.push_screen(
+        ConfirmQuantize(
+            launcher.format_cmd(cmd),
+            lambda t=tool, m=model, q=quant_option, d=dest, devices=cuda_devices:
+                launcher.quantize(t, m, q, d, devices),
+            model,
+            tool,
+            quant_option,
+            output_path,
+        )
+    )
 
 
 class QuantizeGpuScreen(GpuSelectionScreen):
@@ -1892,28 +1925,13 @@ class QuantizeGpuScreen(GpuSelectionScreen):
             self.notify("Select at least one GPU", severity="warning", timeout=3)
             return
         cuda_devices = ",".join(str(i) for i in selected)
-        try:
-            cmd, output_path = launcher.build_quantize_cmd(
-                self._tool, self._model, self._quant_option, self._dest, cuda_devices,
-            )
-        except (ValueError, OSError) as e:
-            self.notify(str(e), severity="error", timeout=5)
-            return
-        self.app.push_screen(
-            ConfirmQuantize(
-                launcher.format_cmd(cmd),
-                lambda t=self._tool, m=self._model, q=self._quant_option, d=self._dest:
-                    launcher.quantize(t, m, q, d, cuda_devices),
-                self._model,
-                self._tool,
-                self._quant_option,
-                output_path,
-            )
+        _push_quantize_confirmation(
+            self.app, self._model, self._tool, self._quant_option, self._dest, cuda_devices,
         )
 
 
 # ---------------------------------------------------------------------------
-# Quantize — Screen 5: confirm and launch the quantization job
+# Quantize — Screen 5: confirm and launch the conversion / quantization job
 # ---------------------------------------------------------------------------
 
 class ConfirmQuantize(ButtonMenuScreen):
@@ -1922,7 +1940,7 @@ class ConfirmQuantize(ButtonMenuScreen):
     BINDINGS: ClassVar = [
         Binding("q",             "quit_app",       "Quit"),
         Binding("escape,b,left", "cancel",         "Back",     key_display="esc/←"),
-        Binding("enter,right",   "press_focused",  "Quantize", key_display="↵/→/Space"),
+        Binding("enter,right",   "press_focused",  "Run",      key_display="↵/→/Space"),
     ]
 
     def __init__(
@@ -1943,16 +1961,17 @@ class ConfirmQuantize(ButtonMenuScreen):
         self._output_path  = output_path
 
     def compose(self) -> ComposeResult:
+        action_label = "Convert" if self._model.format != self._tool.output_format else "Quantize"
         yield Header()
         yield Vertical(
             Static(
-                f"[bold]Ready to quantize:[/]\n"
+                f"[bold]Ready to {action_label.lower()}:[/]\n"
                 f"[dim]Output:[/]  {self._output_path}\n\n"
                 f"{self._description}",
                 id="confirm-text",
             ),
             Horizontal(
-                Button("Quantize", variant="success", id="btn-launch"),
+                Button(action_label, variant="success", id="btn-launch"),
                 Button("Back",     variant="default", id="btn-back"),
                 id="confirm-buttons",
             ),
@@ -1993,7 +2012,7 @@ class ModelSelectScreen(DataTableScreen):
         Binding("f",             "mark_favorite",     "Favorite"),
         Binding("f",             "unmark_favorite",   "Unfavorite"),
         Binding("l",             "set_ctx_override",  "Context / YaRN"),
-        Binding("z",             "quantize_selected", "Quantize"),
+        Binding("z",             "quantize_selected", "Convert / quantize"),
         Binding("f5",            "dt_select",         "Select", key_display="↵/→/dbl-click"),
     ]
 
@@ -2550,8 +2569,8 @@ class ModelManageScreen(ModelSelectScreen):
     """
 
     # Drop set_ctx_override (text-gen concept, ctx=0 for all image-gen models) and
-    # quantize_selected (exl2-convert matches BF16/FP16 formats but produces text-gen
-    # EXL2 output — not applicable to diffusion models).
+    # quantize_selected (offline conversion tools produce text-gen artifacts,
+    # not diffusion models).
     # Textual merges BINDINGS across the full MRO, so filtering the list has no effect.
     # check_action is the correct mechanism to hide bindings inherited from the parent.
     _MANAGE_HIDDEN: ClassVar[frozenset[str]] = frozenset(

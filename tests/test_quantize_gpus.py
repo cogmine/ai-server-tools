@@ -1,6 +1,7 @@
 import dataclasses
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,12 +13,13 @@ from launcher import launch, screens
 from launcher.data import QUANTIZATION_TOOLS, SERVERS
 from launcher.environments import NativeEnvironment
 from launcher.gpu import GpuRow
-from launcher.models import AIModel, AIType, CacheMount, ModelFormat
+from launcher.models import AIModel, AIType, CacheMount, ModelFormat, tools_for_model
 
 
 def model_for(fmt: ModelFormat) -> AIModel:
     return AIModel(
-        id="test-model", name="Test model", path="/models/test.Q8_0.gguf",
+        id="test-model", name="Test model",
+        path="/models/test.Q8_0.gguf" if fmt == ModelFormat.GGUF else "/models/test-model",
         format=fmt, ai_types=frozenset({AIType.TEXT_GEN}),
     )
 
@@ -42,10 +44,14 @@ class PickerApp(App):
 
 
 class QuantizeCommandTests(unittest.TestCase):
-    def test_device_and_cuda_environment_for_both_tools(self) -> None:
+    def test_cuda_environment_matches_tool_requirements(self) -> None:
         env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
         dest = CacheMount("test", Path("/cache"), 0)
-        with patch.object(launch, "_tool_env", return_value=env):
+        builders = {tool.id: lambda *_: ["quant-tool"] for tool in QUANTIZATION_TOOLS}
+        with (
+            patch.object(launch, "_tool_env", return_value=env),
+            patch.dict(launch._QUANT_BUILDERS, builders),
+        ):
             for registered in QUANTIZATION_TOOLS:
                 tool = dataclasses.replace(registered, cuda_home="/cuda toolkit")
                 model = model_for(next(iter(tool.input_formats)))
@@ -53,15 +59,99 @@ class QuantizeCommandTests(unittest.TestCase):
                     cmd, _ = launch.build_quantize_cmd(
                         tool, model, tool.quant_options[0], dest, "2,7",
                     )
-                    self.assertEqual(cmd[:3], [
-                        "env", "CUDA_VISIBLE_DEVICES=2,7", "CUDA_HOME=/cuda toolkit",
-                    ])
+                    if tool.uses_cuda:
+                        self.assertEqual(cmd[:3], [
+                            "env", "CUDA_VISIBLE_DEVICES=2,7", "CUDA_HOME=/cuda toolkit",
+                        ])
+                    else:
+                        self.assertEqual(cmd, ["quant-tool"])
                     cmd, _ = launch.build_quantize_cmd(
                         tool, model, tool.quant_options[0], dest,
                     )
-                    self.assertEqual(
-                        cmd[1], f"CUDA_VISIBLE_DEVICES={launch.CONFIG.resolved_cuda_devices}",
-                    )
+                    if tool.uses_cuda:
+                        self.assertEqual(
+                            cmd[1], f"CUDA_VISIBLE_DEVICES={launch.CONFIG.resolved_cuda_devices}",
+                        )
+                    else:
+                        self.assertEqual(cmd, ["quant-tool"])
+
+    def test_hf_to_gguf_builds_cpu_converter_command(self) -> None:
+        tool = next(tool for tool in QUANTIZATION_TOOLS if tool.id == "llama-hf-to-gguf")
+        dest = CacheMount("test", Path("/cache"), 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "llama.cpp"
+            (root / "build" / "bin").mkdir(parents=True)
+            source = root / "hf-model"
+            source.mkdir()
+            script = root / "convert_hf_to_gguf.py"
+            script.touch()
+            model = AIModel(
+                id="hf-model", name="HF model", path=str(source),
+                format=ModelFormat.SAFETENSORS_BF16,
+                ai_types=frozenset({AIType.TEXT_GEN}),
+            )
+            env = NativeEnvironment(
+                server_id="llamacpp", name="test", bin_dir=str(root / "build" / "bin"),
+            )
+            with patch.object(launch, "_tool_env", return_value=env):
+                cmd, output_dir = launch.build_quantize_cmd(tool, model, "BF16", dest)
+
+            output_file = output_dir / "hf-model.BF16.gguf"
+            self.assertEqual(output_dir, Path("/cache/text-generation/hf-model-GGUF-BF16"))
+            self.assertEqual(cmd, [
+                tool.python_executable, str(script),
+                "--outfile", str(output_file), "--outtype", "bf16", str(source),
+            ])
+
+    def test_hf_to_gguf_is_not_offered_for_vision_models(self) -> None:
+        tool = next(tool for tool in QUANTIZATION_TOOLS if tool.id == "llama-hf-to-gguf")
+        model = dataclasses.replace(model_for(ModelFormat.SAFETENSORS_BF16), vision=True)
+        self.assertNotIn(tool, tools_for_model(QUANTIZATION_TOOLS, model))
+
+    def test_finalize_gguf_registers_the_output_file(self) -> None:
+        from launcher import ingest
+
+        tool = next(tool for tool in QUANTIZATION_TOOLS if tool.id == "llama-hf-to-gguf")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            output_dir = root / "converted-GGUF-F16"
+            output_dir.mkdir()
+            output_file = output_dir / "converted.F16.gguf"
+            output_file.touch()
+            model = AIModel(
+                id="source", name="Source model", path=str(source),
+                format=ModelFormat.SAFETENSORS_BF16,
+                ai_types=frozenset({AIType.TEXT_GEN}),
+            )
+            entry = {
+                "id": "converted-gguf-f16",
+                "name": "Source model",
+                "path": str(output_file),
+                "format": ModelFormat.GGUF.value,
+            }
+
+            def unused_factory() -> tuple[subprocess.Popen[bytes], Path, int]:
+                raise AssertionError("finalize_quantization must not start the process")
+
+            job = launch.QuantizeJob(
+                unused_factory, model, tool, "F16", output_dir,
+            )
+            with (
+                patch.object(ingest, "copy_model_metadata") as copy_metadata,
+                patch.object(ingest, "ingest_model", return_value=entry) as ingest_model,
+                patch.object(launch, "AI_MODELS", []),
+            ):
+                result = launch.finalize_quantization(job)
+
+            copy_metadata.assert_called_once_with(source, output_dir)
+            ingest_model.assert_called_once()
+            self.assertEqual(ingest_model.call_args.args[0], output_file)
+            self.assertEqual(ingest_model.call_args.kwargs["fmt"], ModelFormat.GGUF.value)
+            self.assertEqual(ingest_model.call_args.kwargs["entry_overrides"]["quant"], "F16")
+            self.assertEqual(result.path, str(output_file))
 
     def test_spawn_and_log_use_preview_command(self) -> None:
         tool = QUANTIZATION_TOOLS[0]
@@ -144,6 +234,20 @@ class QuantizePickerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sl.selected, [7])
                 await pilot.press("escape")
                 self.assertIs(app.screen, picker)
+
+    async def test_cpu_conversion_skips_gpu_picker(self) -> None:
+        tool = next(tool for tool in QUANTIZATION_TOOLS if tool.id == "llama-hf-to-gguf")
+        model = model_for(ModelFormat.SAFETENSORS_BF16)
+        picker = screens.QuantizeDestScreen(model, tool, "F16")
+        app = PickerApp(picker)
+        with (
+            patch.object(screens, "CACHE_MOUNTS", [self.dest]),
+            patch.object(launch, "cache_disk_info", return_value=(100, 80)),
+            patch.object(launch, "build_quantize_cmd", return_value=(["python", "convert.py"], Path("/cache/out"))),
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.press("enter")
+                self.assertIsInstance(app.screen, screens.ConfirmQuantize)
 
     async def test_missing_gpus_cannot_launch_quantization(self) -> None:
         picker = screens.QuantizeGpuScreen(self.model, self.tool, "Q4_K_M", self.dest)

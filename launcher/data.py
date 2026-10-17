@@ -359,6 +359,33 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
     ),
 
     QuantizationTool(
+        id="llama-hf-to-gguf",
+        label="llama.cpp (HF → GGUF)",
+        input_formats=frozenset({
+            ModelFormat.SAFETENSORS_BF16,
+            ModelFormat.SAFETENSORS_FP16,
+            ModelFormat.PYTORCH_BIN,
+        }),
+        output_format=ModelFormat.GGUF,
+        quant_options=("F16", "BF16"),
+        quant_option_labels={
+            "F16": "F16 — 16-bit floating point",
+            "BF16": "BF16 — brain floating point",
+        },
+        env_server_id="llamacpp",
+        avail_script="convert_hf_to_gguf.py",
+        python_executable=str(CONFIG.llama_convert_python),
+        avail_modules=("torch", "transformers", "numpy"),
+        uses_cuda=False,
+        supports_vision=False,
+        install_note=(
+            "Requires convert_hf_to_gguf.py in the registered llama.cpp source tree and "
+            "a Python interpreter with PyTorch, Transformers, and NumPy. Configure "
+            "llama_convert_python in config.toml."
+        ),
+    ),
+
+    QuantizationTool(
         id="exl2-convert",
         label="ExLlamaV2 (EXL2 convert)",
         input_formats=frozenset({
