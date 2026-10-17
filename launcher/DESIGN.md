@@ -267,9 +267,10 @@ For server launches with a model, `run()` re-opens the menu after Ctrl-C with th
 
 **Root-screen back action**: Textual always keeps a blank `_DefaultScreen` at stack index 0. The root application screen sits at index 1. `action_dt_back()` on root screens (`ModelSelectScreen`, `AITypeScreen`) checks `len(screen_stack) > 2` (not `> 1`) before popping; at the root it calls `app.exit(None)` instead.
 
-**Base screen classes**: Two shared base classes in `screens.py` eliminate boilerplate:
+**Base screen classes**: Shared base classes in `screens.py` eliminate boilerplate:
 - `DataTableScreen(Screen)` — provides three hidden+priority bindings for `left`/`right`/`enter` dispatch (calling `action_dt_back` and `action_dt_select`). The default `action_dt_back` calls `app.pop_screen()`; root screens override it to exit with `app.exit(None)`. Subclasses define `action_dt_select`. All six DataTable/SelectionList screens inherit from this.
 - `ButtonMenuScreen(Screen)` — provides `up`/`down` hidden bindings for focus cycling and the shared `action_press_focused` method. All seven button-based screens inherit from this.
+- `GpuSelectionScreen(DataTableScreen)` — shared GPU polling, VRAM labels, multi-select / radio selection, and select-all controls. `GpuSelectScreen` adds server parallelism, slots, fit estimates, power limits, and launch confirmation; `QuantizeGpuScreen` adds offline quantization confirmation without server-only settings.
 
 **`→` / `Enter` on DataTable and SelectionList**: `priority=True` is required for `→`, `←`, and `enter` on screens backed by a DataTable or SelectionList — these widgets consume those keys before the screen sees them. However, Textual 8.x hoists `priority=True` visible bindings *before* non-priority ones in the footer, which breaks the intended ordering.
 
@@ -310,10 +311,13 @@ ModelSelectScreen → z
     → (>1 tool) QuantizeToolScreen   — choose tool; skipped when exactly one applies
     → QuantizeOptionScreen            — choose quant level / bpw from tool.quant_options
     → QuantizeDestScreen              — choose output destination (CACHE_MOUNTS with free space)
+    → QuantizeGpuScreen               — choose GPUs exposed to the quantization tool
     → ConfirmQuantize                 — show command + output path; runs job outside TUI
 ```
 
   `ConfirmQuantize.action_confirm()` returns a `QuantizeJob` containing the process factory and finalization metadata. After the child exits, `run()` reopens the launcher. Exit code 0 copies standard config/tokenizer files into EXL2 outputs, removes resumable converter work artifacts, adds the output to `models_local.json`, updates the in-memory catalog, and focuses the new model. Failed or interrupted jobs retain their work artifacts and are not catalogued.
+
+`QuantizeGpuScreen` starts with all successfully polled GPUs selected and requires a non-empty selection. Space toggles a GPU, `a` selects all, and Enter / `→` advances. Physical NVML indices are sorted into `CUDA_VISIBLE_DEVICES`; confirmation Back preserves the selection. If polling yields no usable GPUs, quantization is blocked with an error notification rather than silently exposing all GPUs. The server picker's existing configured-device fallback is unchanged.
 
 **Multi-column sort**: `ModelSelectScreen` tracks an ordered list of `(column_key, reverse)` pairs in `_sort_keys`. Index 0 is the primary sort, index 1 secondary, and so on. Clicking a column header:
 - If it is the current primary column → toggles its sort direction.
@@ -451,7 +455,7 @@ The output directory is shown to the user in `ConfirmQuantize` before they confi
 Follows the same PTY + log structure as `launch()`:
 - Log named `logs/{timestamp}_quantize_{tool.id}_{model.id}_{quant_option}.log`
 - Output directory created before spawn
-- `CUDA_HOME` set from `tool.cuda_home` when non-empty, via the same leading `env KEY=VALUE` command prefix as `launch()`
+- `build_quantize_cmd(tool, model, quant_option, dest, cuda_devices=None)` includes an explicit `env CUDA_VISIBLE_DEVICES=…` prefix and `CUDA_HOME` from `tool.cuda_home` when non-empty. The picker passes its selected devices through confirmation to `quantize()`; non-TUI callers default to `CONFIG.resolved_cuda_devices`. Preview, log, and execution use the same builder.
 - Same PTY window-size stamping and bash wrapper
 - On exit code 0, `finalize_quantization()` copies EXL2 metadata, removes converter work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), and registers the explicit output path through `ingest_model()`
 - The launcher then reopens with the generated model focused; failed or interrupted outputs remain on disk for inspection/resume but are not registered

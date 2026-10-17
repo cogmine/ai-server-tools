@@ -775,13 +775,21 @@ def build_quantize_cmd(
     model: AIModel,
     quant_option: str,
     dest: CacheMount,
+    cuda_devices: str | None = None,
 ) -> tuple[list[str], Path]:
-    """Return (argv, output_path) for the given quantization job."""
+    """Return (argv, output_path), including the job's explicit CUDA environment."""
     output_path = compute_quant_output_path(tool, model, quant_option, dest)
     builder = _QUANT_BUILDERS.get(tool.id)
     if builder is None:
         raise ValueError(f"No command builder registered for quantization tool: {tool.id!r}")
-    return builder(tool, _tool_env(tool), model, quant_option, output_path), output_path
+    cmd = builder(tool, _tool_env(tool), model, quant_option, output_path)
+    env_cmd = [
+        "env",
+        f"CUDA_VISIBLE_DEVICES={cuda_devices if cuda_devices is not None else CONFIG.resolved_cuda_devices}",
+    ]
+    if tool.cuda_home:
+        env_cmd.append(f"CUDA_HOME={tool.cuda_home}")
+    return [*env_cmd, *cmd], output_path
 
 
 # ---------------------------------------------------------------------------
@@ -1050,6 +1058,7 @@ def quantize(
     model: AIModel,
     quant_option: str,
     dest: CacheMount,
+    cuda_devices: str | None = None,
 ) -> tuple[subprocess.Popen[bytes], Path, int]:
     """Build the quantization command and spawn the process.
 
@@ -1057,11 +1066,7 @@ def quantize(
     the same tee / SIGWINCH / exit-footer machinery in app.py.
     Returns (proc, log_path, master_fd).
     """
-    cmd, output_path = build_quantize_cmd(tool, model, quant_option, dest)
-    if tool.cuda_home:
-        # Pass CUDA_HOME as a leading `env KEY=VALUE` so the logged command reproduces
-        # by copy/paste (same rationale as launch()).
-        cmd = ["env", f"CUDA_HOME={tool.cuda_home}", *cmd]
+    cmd, output_path = build_quantize_cmd(tool, model, quant_option, dest, cuda_devices)
 
     # output_path is always a directory — create it before the process starts.
     output_path.mkdir(parents=True, exist_ok=True)

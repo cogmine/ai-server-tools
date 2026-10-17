@@ -1200,7 +1200,92 @@ class QuantSelectScreen(DataTableScreen):
 # Level 3c — GPU selection (always shown before ConfirmLaunch)
 # ---------------------------------------------------------------------------
 
-class GpuSelectScreen(DataTableScreen):
+class GpuSelectionScreen(DataTableScreen):
+    """Shared GPU list, selection controls, and device validation."""
+
+    BINDINGS: ClassVar = [
+        Binding("q",        "quit_app",       "Quit"),
+        Binding("escape,b", "app.pop_screen", "Back", key_display="esc/←"),
+        Binding("a",        "select_all",     "All GPUs"),
+        Binding("f5",       "dt_select",      "Confirm", key_display="↵/→"),
+    ]
+
+    def __init__(self, title: str, max_gpus: int = 0) -> None:
+        super().__init__()
+        self._gpu_title = title
+        self._max_gpus = max_gpus
+        self._valid_rows: list[GpuRow] = []
+
+    def compose(self) -> ComposeResult:
+        mode_note = "  [dim](single GPU only)[/]" if self._max_gpus == 1 else ""
+        yield Header()
+        yield Label(f"[bold]Select GPUs for:[/]  {self._gpu_title}{mode_note}", id="screen-title")
+        yield SelectionList(id="gpu-list")
+        yield Label("", id="gpu-status")
+        yield Label("", id="gpu-fit", classes="-empty")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._valid_rows = [r for r in poll_gpus() if not r.error]
+        if not self._valid_rows:
+            self.app.call_later(self._skip_to_confirm)
+            return
+        pre_select = self._initial_gpu_count()
+        sl = self.query_one(SelectionList)
+        for i, row in enumerate(self._valid_rows):
+            sl.add_option((self._gpu_label(row), row.index, i < pre_select))
+        sl.highlighted = 0
+        self._refresh_status()
+
+    def _initial_gpu_count(self) -> int:
+        return 1 if self._max_gpus == 1 else len(self._valid_rows)
+
+    @staticmethod
+    def _gpu_label(row: GpuRow) -> str:
+        free_gb = (row.mem_total_mib - row.mem_used_mib) / 1024
+        free_ratio = free_gb / max(row.mem_total_gb, 1)
+        free_color = "bright_green" if free_ratio > 0.8 else ("yellow" if free_ratio > 0.3 else "red")
+        used_label = f"[{free_color}]{row.mem_used_gb:.1f}[/] / {row.mem_total_gb:.0f} GB"
+        return f"GPU {row.index}  ·  {row.short_uuid}  ·  {used_label}"
+
+    def _skip_to_confirm(self) -> None:
+        self.notify(
+            "GPU polling unavailable; cannot select GPUs. Go back and retry once GPU polling is available.",
+            severity="error", timeout=8,
+        )
+
+    @on(SelectionList.SelectionToggled)
+    def on_selection_toggled(self, event: SelectionList.SelectionToggled) -> None:
+        if self._max_gpus == 1:
+            sl = self.query_one(SelectionList)
+            if event.selection_index < len(self._valid_rows):
+                toggled_gpu = self._valid_rows[event.selection_index].index
+                if toggled_gpu in sl.selected:
+                    for v in list(sl.selected):
+                        if v != toggled_gpu:
+                            sl.deselect(v)
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        selected = sorted(self.query_one(SelectionList).selected)
+        if selected:
+            devices = ",".join(str(i) for i in selected)
+            text = f"[dim]CUDA_VISIBLE_DEVICES=[/][bold]{devices}[/]  ({len(selected)} GPUs)"
+        else:
+            text = "[red]No GPUs selected — select at least one before confirming.[/]"
+        self.query_one("#gpu-status", Label).update(text)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "select_all":
+            return self._max_gpus != 1
+        return True
+
+    def action_select_all(self) -> None:
+        self.query_one(SelectionList).select_all()
+        self._refresh_status()
+
+
+class GpuSelectScreen(GpuSelectionScreen):
     """Select which GPUs to expose to the server via CUDA_VISIBLE_DEVICES.
 
     Shown between server/quant selection and ConfirmLaunch for every server launch.
@@ -1242,13 +1327,12 @@ class GpuSelectScreen(DataTableScreen):
         model: "AIModel | None",
         runtime_quant: "RuntimeQuant | None" = None,
     ) -> None:
-        super().__init__()
+        model_part = f"  ·  {model.name}" if model else ""
+        super().__init__(f"{server.label}  ·  {env.name}{model_part}", server.max_gpus)
         self._server       = server
         self._env          = env
         self._model        = model
         self._runtime_quant = runtime_quant
-        # Non-error rows only — maps SelectionList index → GpuRow.
-        self._valid_rows: list = []  # list[GpuRow]
         # Parallelism plan for TP/PP servers (vLLM, SGLang); recomputed on
         # every selection change so the status bar stays current.
         self._plan: launcher.ParallelismPlan | None = None
@@ -1261,50 +1345,18 @@ class GpuSelectScreen(DataTableScreen):
         self._fit_generation = 0
         self._fit: FitEstimate | None = None
 
-    def compose(self) -> ComposeResult:
-        model_part = f"  ·  {self._model.name}" if self._model else ""
-        mode_note  = "  [dim](single GPU only)[/]" if self._server.max_gpus == 1 else ""
-        yield Header()
-        yield Label(
-            f"[bold]Select GPUs for:[/]  {self._server.label}  ·  {self._env.name}{model_part}{mode_note}",
-            id="screen-title",
-        )
-        yield SelectionList(id="gpu-list")
-        yield Label("", id="gpu-status")
-        yield Label("", id="gpu-fit")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        rows = poll_gpus()
-        self._valid_rows = [r for r in rows if not r.error]
-        if not self._valid_rows:
-            # GPU polling unavailable — skip straight to ConfirmLaunch with default devices.
-            self.app.call_later(self._skip_to_confirm)
-            return
-        # Pre-compute parallelism to determine how many GPUs to pre-select.
+    def _initial_gpu_count(self) -> int:
         n_available = len(self._valid_rows)
         if self._server.gpu_count_param == "pipeline_parallel" and self._model:
             plan = launcher.compute_parallelism(n_available, self._model)
-            pre_select = plan.gpu_count
-        elif self._server.max_gpus == 1:
-            pre_select = 1
-        else:
-            pre_select = n_available
-        sl = self.query_one(SelectionList)
-        for i, row in enumerate(self._valid_rows):
-            sl.add_option((self._gpu_label(row), row.index, i < pre_select))
-        sl.highlighted = 0
-        self._refresh_status()
+            return plan.gpu_count
+        return super()._initial_gpu_count()
 
     @staticmethod
     def _gpu_label(row: GpuRow) -> str:
-        free_gb = (row.mem_total_mib - row.mem_used_mib) / 1024
-        free_ratio = free_gb / max(row.mem_total_gb, 1)
-        free_color = "bright_green" if free_ratio > 0.8 else ("yellow" if free_ratio > 0.3 else "red")
-        used_label = f"[{free_color}]{row.mem_used_gb:.1f}[/] / {row.mem_total_gb:.0f} GB"
         power = fmt_power_limit(row)
         power_label = f"  ·  {power}" if power else ""
-        return f"GPU {row.index}  ·  {row.short_uuid}  ·  {used_label}{power_label}"
+        return GpuSelectionScreen._gpu_label(row) + power_label
 
     def _skip_to_confirm(self) -> None:
         """Fall back to ConfirmLaunch with the default CUDA_VISIBLE_DEVICES when no GPUs found."""
@@ -1315,20 +1367,6 @@ class GpuSelectScreen(DataTableScreen):
         self.app.push_screen(
             ConfirmLaunch(command, factory, model, server, env)
         )
-
-    @on(SelectionList.SelectionToggled)
-    def on_selection_toggled(self, event: SelectionList.SelectionToggled) -> None:
-        if self._server.max_gpus == 1:
-            sl = self.query_one(SelectionList)
-            # Identify the physical index of the toggled item via our parallel list.
-            if event.selection_index < len(self._valid_rows):
-                toggled_gpu = self._valid_rows[event.selection_index].index
-                # If just selected, deselect all others (radio button behaviour).
-                if toggled_gpu in sl.selected:
-                    for v in list(sl.selected):
-                        if v != toggled_gpu:
-                            sl.deselect(v)
-        self._refresh_status()
 
     def _refresh_status(self) -> None:
         self._render_status()
@@ -1509,15 +1547,9 @@ class GpuSelectScreen(DataTableScreen):
             self._refresh_fit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action == "select_all":
-            return self._server.max_gpus != 1
         if action == "slots":
             return self._slots is not None
-        return True
-
-    def action_select_all(self) -> None:
-        self.query_one(SelectionList).select_all()
-        self._refresh_status()
+        return super().check_action(action, parameters)
 
     def action_dt_select(self) -> None:
         settings = self._launch_settings()
@@ -1837,25 +1869,51 @@ class QuantizeDestScreen(ButtonMenuScreen):
         elif bid.startswith("btn-dest-"):
             priority = int(bid.rsplit("-", 1)[-1])
             mount = next(m for m in CACHE_MOUNTS if m.priority == priority)
-            cmd, output_path = launcher.build_quantize_cmd(
-                self._tool, self._model, self._quant_option, mount,
-            )
-            desc = launcher.format_cmd(cmd)
             self.app.push_screen(
-                ConfirmQuantize(
-                    desc,
-                    lambda t=self._tool, m=self._model, q=self._quant_option, d=mount:
-                        launcher.quantize(t, m, q, d),
-                    self._model,
-                    self._tool,
-                    self._quant_option,
-                    output_path,
-                )
+                QuantizeGpuScreen(self._model, self._tool, self._quant_option, mount)
             )
+
+
+class QuantizeGpuScreen(GpuSelectionScreen):
+    """Choose devices for an offline quantization job before confirmation."""
+
+    def __init__(
+        self, model: AIModel, tool: QuantizationTool, quant_option: str, dest: CacheMount,
+    ) -> None:
+        super().__init__(f"{tool.label}  ·  {model.name}")
+        self._model = model
+        self._tool = tool
+        self._quant_option = quant_option
+        self._dest = dest
+
+    def action_dt_select(self) -> None:
+        selected = sorted(self.query_one(SelectionList).selected)
+        if not selected:
+            self.notify("Select at least one GPU", severity="warning", timeout=3)
+            return
+        cuda_devices = ",".join(str(i) for i in selected)
+        try:
+            cmd, output_path = launcher.build_quantize_cmd(
+                self._tool, self._model, self._quant_option, self._dest, cuda_devices,
+            )
+        except (ValueError, OSError) as e:
+            self.notify(str(e), severity="error", timeout=5)
+            return
+        self.app.push_screen(
+            ConfirmQuantize(
+                launcher.format_cmd(cmd),
+                lambda t=self._tool, m=self._model, q=self._quant_option, d=self._dest:
+                    launcher.quantize(t, m, q, d, cuda_devices),
+                self._model,
+                self._tool,
+                self._quant_option,
+                output_path,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
-# Quantize — Screen 4: confirm and launch the quantization job
+# Quantize — Screen 5: confirm and launch the quantization job
 # ---------------------------------------------------------------------------
 
 class ConfirmQuantize(ButtonMenuScreen):

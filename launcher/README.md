@@ -317,7 +317,8 @@ Press `z` on any model in the model list to start a quantization job.  Only mode
 1. If more than one tool supports the model's format, pick a tool. Otherwise this step is skipped.
 2. Pick a target quant level (e.g. Q4_K_M for GGUF, or 4.0 bpw for EXL2).
 3. Pick an output destination — one of the configured `[[cache_mounts]]`, with current free space shown.
-4. Review the full command and output path, then confirm.
+4. Choose the GPUs to expose to the tool. The list shows current VRAM usage; all available GPUs start selected. Use Space to toggle a GPU, `a` to select all, and Enter / `→` to continue. At least one GPU must be selected; if GPU polling is unavailable, return and retry after restoring it.
+5. Review the full command (including `CUDA_VISIBLE_DEVICES`) and output path, then confirm. Back returns to the GPU picker with your selection intact.
 
 The TUI temporarily exits while the conversion runs in your terminal with live output, and the log is written to `logs/`. Outputs are placed under the AI-type subdirectory of the chosen cache mount (for example, `~/fast_models/text-generation/`). After a successful conversion, the launcher copies required EXL2 config/tokenizer metadata, removes resumable conversion work files, adds the generated model to `user_data/models_local.json`, and reopens with that model focused. Failed or interrupted outputs retain their work files and are not added to the catalog.
 
@@ -333,4 +334,3 @@ The TUI temporarily exits while the conversion runs in your terminal with live o
 1. Add a `QuantizationTool(...)` entry to `QUANTIZATION_TOOLS` in `data.py`.
 2. Write `_build_<id>(tool, env, model, quant_option, output_path) → list[str]` in `launch.py` (`env` is the default environment of the tool's `env_server_id`).
 3. Register it in `_QUANT_BUILDERS`.
-
