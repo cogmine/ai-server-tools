@@ -224,6 +224,7 @@ Override server defaults per model with a `server_params` key:
 | `u` | Uncache focused model (model list) |
 | `l` | Context settings for focused model (model list): YaRN factor to extend the context (e.g. `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF) and/or a context-length override |
 | `f` | Toggle favorite pin for focused model (model list) |
+| `t` | Chat template patches for focused model (model list): shows the fixes that apply to its chat template and turns each on/off (see [Chat template patches](#chat-template-patches)) |
 | `z` | Convert / quantize focused model — opens tool/output/destination picker (model list) |
 | `g` / `x` / `?` | Mark the launch as good / bad / unknown — on the deepest screen for that server (server list, environment picker, or quantization picker) |
 | `e` | Manage environments for the focused server (server list, environment picker) |
@@ -248,6 +249,18 @@ At very long contexts (e.g. YaRN 1M × several slots) compute buffers can outwei
 Memory already used by other processes counts against the fit. Vision projectors (`--mmproj`), MTP draft heads, and `extra_flags` are not included in the estimate.
 
 llama.cpp launches also default to a q8_0 KV cache (half the memory of f16, negligible quality loss; set `"kv_cache_type": "f16"` in a model's `server_params.llamacpp` to opt out) and to a host-RAM prompt cache sized by `[memory] host_cache_ram`, which lets returning conversations skip re-processing their prompt when there are more of them than slots.
+
+## Chat template patches
+
+Some chat templates reject requests the model itself handles fine. Qwen 3.5 / 3.6 / 3.8 templates (official and Unsloth GGUF) fail any request with a system message after the start of the conversation — `System message must be at the beginning.` — whereas Qwen2.5 / Qwen3 templates rendered such messages in place.
+
+The launcher detects these templates and fixes them automatically at launch: it reads the model's template (GGUF header, `chat_template.jinja`, or `tokenizer_config.json`), applies the matching patches, writes the result to `user_data/chat_templates/<model id>.jinja`, and passes it to the server (`--chat-template-file` for llama.cpp and ooba, `--chat-template` for vLLM and SGLang, `--prompt-template` for tabbyAPI). Model files — source or cached — are never modified. The flag appears in the launch command, and the session log header names the applied patches (`# tmpl: …`).
+
+Patches:
+
+- `system_anywhere` — renders later system messages in place as ChatML system turns (`<|im_start|>system … <|im_end|>`) instead of failing. Requests with only a leading system message render exactly as before.
+
+Press `t` on the model list to see which patches apply to the focused model and to switch individual patches off (stored as `disabled_template_patches` in the catalog).
 
 ## GPU power limits
 
@@ -282,6 +295,7 @@ launcher/
   environments.py      Server environments (conda envs / native builds) + registry
   environments.json.example  Template for user_data/environments.json
   launch.py            Command builders and subprocess launcher
+  chat_template.py     Chat template reading + launch-time patches (e.g. Qwen system messages)
   fit.py               Pre-launch memory-fit estimates (llama.cpp: llama-fit-params)
   gpu.py               NVML polling (pynvml) + GpuRow helpers (shared with gpu_monitor)
   gpu_power.py         Per-GPU power limits — remembered choices + launch-command step
@@ -290,6 +304,7 @@ launcher/
   config.py            Config loader — reads user_data/config.toml at import time
   config.toml.example  Documented template (copy to user_data/config.toml)
   user_data/           ← gitignored; machine-specific and personal data
+    chat_templates/      patched chat templates (written at launch)
     config.toml          machine paths, GPU counts, host RAM budget
     environments.json    registered environments per server
     gpu_power.json       chosen GPU power limits (written by the GPU screen)

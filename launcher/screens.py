@@ -18,6 +18,7 @@ ChoiceScreen and CommandRunScreen dialogs.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import functools
 import re
@@ -74,6 +75,7 @@ from launcher.models import (
     uses_hub_flow,
 )
 from launcher.data import AI_MODELS, CACHE_MOUNTS, QUANTIZATION_TOOLS, SERVERS
+from launcher.chat_template import available_patches
 from launcher.environments import ENVIRONMENTS, Environment, env_kind
 from launcher.fit import FitEstimate, estimate_fit, fit_probe_for
 import launcher.launch as launcher
@@ -2012,6 +2014,7 @@ class ModelSelectScreen(DataTableScreen):
         Binding("f",             "mark_favorite",     "Favorite"),
         Binding("f",             "unmark_favorite",   "Unfavorite"),
         Binding("l",             "set_ctx_override",  "Context / YaRN"),
+        Binding("t",             "template_patches",  "Chat template"),
         Binding("z",             "quantize_selected", "Convert / quantize"),
         Binding("f5",            "dt_select",         "Select", key_display="↵/→/dbl-click"),
     ]
@@ -2286,9 +2289,9 @@ class ModelSelectScreen(DataTableScreen):
         self._populate()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Enable cache/uncache/favorite/quantize only when a model is focused and state matches."""
+        """Enable cache/uncache/favorite/quantize/template actions only when a model is focused and state matches."""
         if action in ("cache_selected", "uncache_selected", "mark_favorite", "unmark_favorite",
-                      "quantize_selected"):
+                      "quantize_selected", "template_patches"):
             model = self._focused_model()
             if model is None:
                 return False
@@ -2297,6 +2300,8 @@ class ModelSelectScreen(DataTableScreen):
             if action == "mark_favorite":     return not model.favorite
             if action == "unmark_favorite":   return model.favorite
             if action == "quantize_selected": return bool(tools_for_model(QUANTIZATION_TOOLS, model))
+            if action == "template_patches":
+                return any(s.chat_template_flag for s in servers_for_model(SERVERS, model))
         return True
 
     def on_screen_resume(self) -> None:
@@ -2368,6 +2373,41 @@ class ModelSelectScreen(DataTableScreen):
     def _open_model(self, model: AIModel) -> None:
         """Navigate to the next screen for the selected model. Override in subclasses."""
         self.app.push_screen(ServerSelectScreen(model))
+
+    @work(exclusive=True)
+    async def action_template_patches(self) -> None:
+        """Show the chat template patches matching the focused model and toggle its opt-outs."""
+        model = self._focused_model()
+        if model is None:
+            return
+        patches = await asyncio.to_thread(available_patches, model)  # GGUF header may be on the NAS
+        if not patches:
+            self.notify(f"No chat template patches apply to {model.name}", timeout=3)
+            return
+        while True:
+            lines: list[str] = []
+            choices: list[tuple[str, str, str]] = []
+            for patch in patches:
+                enabled = patch.id not in model.disabled_template_patches
+                state = "[green]● on[/]" if enabled else "[dim]○ off[/]"
+                lines.append(f"{state}  [bold]{escape(patch.label)}[/]\n[dim]{escape(patch.description)}[/]")
+                verb = "Disable" if enabled else "Enable"
+                choices.append((patch.id, f"{verb}: {patch.label}", "warning" if enabled else "success"))
+            choices.append(("", "Done", "default"))
+            message = "\n\n".join(lines) + (
+                "\n\n[dim]Enabled patches are applied at launch to a copy of the template in "
+                "launcher/user_data/chat_templates/ — model files are never modified.[/]"
+            )
+            choice = await self.app.push_screen_wait(
+                ChoiceScreen(f"Chat template patches — {escape(model.name)}", message, choices)
+            )
+            if not choice:
+                return
+            try:
+                launcher.save_template_patch_enabled(model, choice, choice in model.disabled_template_patches)
+            except Exception as e:
+                self.notify(str(e), severity="error", timeout=5)
+                return
 
     def action_dt_select(self) -> None:
         model = self._focused_model()
@@ -2568,13 +2608,13 @@ class ModelManageScreen(ModelSelectScreen):
     Catalog management bindings (c/f/g/x/?) work; l/z are suppressed (text-gen only).
     """
 
-    # Drop set_ctx_override (text-gen concept, ctx=0 for all image-gen models) and
+    # Drop set_ctx_override (text-gen concept, ctx=0 for all image-gen models),
     # quantize_selected (offline conversion tools produce text-gen artifacts,
-    # not diffusion models).
+    # not diffusion models) and template_patches (chat templates are text-gen only).
     # Textual merges BINDINGS across the full MRO, so filtering the list has no effect.
     # check_action is the correct mechanism to hide bindings inherited from the parent.
     _MANAGE_HIDDEN: ClassVar[frozenset[str]] = frozenset(
-        {"set_ctx_override", "quantize_selected"}
+        {"set_ctx_override", "quantize_selected", "template_patches"}
     )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:

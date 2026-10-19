@@ -24,6 +24,7 @@ environments.py             Server runtime environments — Environment kinds (c
 environments.json.example   Tracked template — environment registry (copy to user_data/environments.json)
 models_local.json.example   Tracked template — schema reference + 3 sample entries
 launch.py                   Command builders + process spawner + cache manager
+chat_template.py            Chat template reader + launch-time patches (TEMPLATE_PATCHES) → user_data/chat_templates/
 fit.py                      Pre-launch memory-fit estimates (FitProbe per server — llama.cpp: llama-fit-params)
 screens.py                  All Textual screens
 app.py                      Top-level App class, entry to screen stack
@@ -32,6 +33,7 @@ gpu_power.py                Per-GPU power limits — PowerLimitStore (per-card c
 scripts/gpu-power-limit     Idempotent applier: sudo nvidia-smi -pl only for GPUs whose limit differs
 ingest.py                   CLI tool — scans a directory for new models and appends entries to models_local.json
 user_data/                  Gitignored — all machine-specific and personal data
+    chat_templates/           Patched chat templates, <model.id>.jinja (written at launch; regenerable)
     config.toml               Machine-specific paths and GPU counts
     environments.json         Registered environments per server (written by the TUI)
     gpu_power.json            Chosen GPU power limits keyed by GPU UUID (written by GpuSelectScreen; absent = all defaults)
@@ -108,6 +110,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `mtp_path` | Absolute path to the companion `mtp-*.gguf` multi-token-prediction draft head. Set automatically by `ingest`/`refresh`. llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <resolve_mtp_path()>` unless the `mtp` server param is `false`. Cached alongside the model. Omitted from JSON when empty. |
 | `mtp_embedded` | `True` when the GGUF itself carries MTP (NextN) layers — `<arch>.nextn_predict_layers > 0` in its header, read by `gguf_header.py` during `ingest`/`refresh`. Used (`--spec-type draft-mtp`, no draft file) only when the `mtp` server param is `true`, since many GGUFs keep NextN layers that a llama.cpp build cannot run for their architecture (e.g. GLM5-Next: "NextN graph not implemented yet"). Omitted from JSON when false. |
 | `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. |
+| `disabled_template_patches` | frozenset of `ChatTemplatePatch.id`s the model opts out of; every other patch matching its chat template is applied at launch (see *Chat Template Patches*). Toggled with `t` on the model list via `save_template_patch_enabled()`. Omitted from JSON when empty. |
 | `cached_path` | Optional absolute path to a faster local copy. Set by the TUI cache action; cleared on uncache. `resolve_path()` returns this when non-empty and present on disk, otherwise returns `path`. Multiple entries may share the same `cached_path` when they point to the same source directory — `save_cached_path()` fans out to all of them. |
 | `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
 | `server_params` | Per-server overrides merged on top of server defaults at launch time |
@@ -151,6 +154,7 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 | `extra_env` | `dict[str, str]` | Extra `KEY=VALUE` pairs merged into the command's `env` prefix |
 | `rope_scaling_formats` | `frozenset[ModelFormat]` | Formats for which the builder applies a model's `rope_scaling`. Empty = unsupported; `launch_ctx()` then caps a scaled model at its native `ctx` |
 | `rope_scaling_env` | `dict[str, str]` | Env vars added only when `rope_scaling` is applied (vLLM `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`, SGLang `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`) |
+| `chat_template_flag` | `str` | Flag taking a chat template file that replaces the model's own (llama.cpp / ooba `--chat-template-file`, vLLM / SGLang `--chat-template`, tabbyAPI `--prompt-template`). `""` = no override; chat template patches are then not applied |
 | `uses_staging_dir` | `bool` | Create symlinks under `model_dir` before launch |
 | `stage_all_models` | `bool` | When `True`, stage every compatible catalog model (ComfyUI — model is chosen per API request, not at launch) |
 | `staging_format_suffixes` | `dict[ModelFormat, str]` | Maps format → file extension suffix for the staging symlink (e.g. `{GGUF: ".gguf"}`; empty = no suffix) |
@@ -263,7 +267,7 @@ For server launches with a model, `run()` re-opens the menu after Ctrl-C with th
 
 **`ImageGenHubScreen`**: Two-button menu. "Launch Server" pushes `ServerSelectScreen(model=None, ai_type=...)` which filters servers by type (via `servers_for_type()`), skips path validation, and suppresses g/x/? status marking. "Manage Models" pushes `ModelManageScreen` — all catalog management bindings work identically to `ModelSelectScreen`; `→`/`Enter` open `CacheActionScreen` for the focused model (cache/uncache) rather than advancing toward a server launch. Both buttons use `variant="primary"`.
 
-**`ModelManageScreen`**: Subclass of `ModelSelectScreen` — overrides `_open_model()` (the template method called by both `action_dt_select` and `on_data_table_row_selected`) to push `CacheActionScreen` instead of `ServerSelectScreen`, and overrides `_title_text()` to show "manage models" in the title. `set_ctx_override` and `quantize_selected` are hidden via `_MANAGE_HIDDEN` in `check_action` (text-gen-only concepts irrelevant for diffusion models). The template method pattern is necessary because Textual calls all MRO classes' message handlers — both `@on` decorator and auto-named handlers — so standard Python MRO shadowing does not work for Textual message dispatch; only plain method calls (like `_open_model()`) respect the most-derived override.
+**`ModelManageScreen`**: Subclass of `ModelSelectScreen` — overrides `_open_model()` (the template method called by both `action_dt_select` and `on_data_table_row_selected`) to push `CacheActionScreen` instead of `ServerSelectScreen`, and overrides `_title_text()` to show "manage models" in the title. `set_ctx_override`, `quantize_selected` and `template_patches` are hidden via `_MANAGE_HIDDEN` in `check_action` (text-gen-only concepts irrelevant for diffusion models). The template method pattern is necessary because Textual calls all MRO classes' message handlers — both `@on` decorator and auto-named handlers — so standard Python MRO shadowing does not work for Textual message dispatch; only plain method calls (like `_open_model()`) respect the most-derived override.
 
 **Root-screen back action**: Textual always keeps a blank `_DefaultScreen` at stack index 0. The root application screen sits at index 1. `action_dt_back()` on root screens (`ModelSelectScreen`, `AITypeScreen`) checks `len(screen_stack) > 2` (not `> 1`) before popping; at the root it calls `app.exit(None)` instead.
 
@@ -385,6 +389,7 @@ ServerSoftware.default_params
     + AIModel.server_params[server.id]   (merged at build time; skipped when model=None)
     + param_overrides                    (from GpuSelectScreen — e.g. pipeline_parallel = N, parallel slots)
     + AIModel.resolve_path() → injected as _model_path  (skipped when model=None)
+    + patched_template(model) → injected as _chat_template (path, or "" when no patch applies)
     → _build_<server_id>(server, env, model, merged_params) → list[str]
 ```
 
@@ -416,6 +421,19 @@ Builders take the interpreter / binaries from `env` (`env.python`, `env.executab
 - `uses_staging_dir=True` (tabbyAPI, ooba, ComfyUI): creates symlinks under `model_dir`; `staging_format_suffixes` maps `ModelFormat` → file extension suffix; `stage_all_models=True` (ComfyUI) stages every compatible catalog model rather than only the selected one; `staging_subdir_attr="comfyui_subdir"` (ComfyUI) routes each model to `model_dir/<model.comfyui_subdir>/` — `launch.py` reads `getattr(model, staging_subdir_attr)` generically with no branching on `server.id`
 - `launch_cwd` (vLLM → `/tmp`, ooba → install dir): emits a leading `cd <dir> &&` in the command; vLLM avoids any `vllm/` directory on `sys.path`; ooba needs CWD at its install root because Gradio resolves `allowed_paths` relative to CWD
 - GPU power limits (any server, from `GpuSelectScreen`): a `PowerLimitStep` emits a leading `scripts/gpu-power-limit … &&` before everything else (see GPU Selection → Power limits)
+
+---
+
+## Chat Template Patches
+
+Some chat templates reject conversations the model handles fine. Qwen 3.5 / 3.6 / 3.8 templates (official HF and Unsloth GGUF variants) raise `System message must be at the beginning.` for any system message after the leading one, whereas Qwen2.5 / Qwen3 templates rendered such messages in place as ChatML system turns. `chat_template.py` fixes these at launch without touching model files.
+
+- **`ChatTemplatePatch`** (frozen dataclass): `id` (persisted key), `label` / `description` (UI), `pattern` (regex locating the faulty construct), `replacement` (inserted verbatim — no backreference processing, so Jinja `\n` escapes survive), `requires` (further regexes that must all match, guarding against templates where the replacement would be invalid). `TEMPLATE_PATCHES` is the registry.
+- **`system_anywhere`** replaces the `raise_exception('System message must be at the beginning.')` statement with `{{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}`. In both template variants the statement is reached only for system messages not already rendered as the leading system block, and `content` is the message loop's rendered content (a `requires` guard), so leading-system-only prompts render byte-identically. Verified with Python Jinja2 (vLLM / SGLang / ooba / tabby) and llama.cpp's own engine (`test-chat-template`).
+- **Reading** (`read_chat_template(model)`): from `model.resolve_path()` — a GGUF's `tokenizer.chat_template` header key (via `gguf_header.py`), else `chat_template.jinja` → `chat_template.json` → `tokenizer_config.json` (transformers' precedence; for a list of named templates, the `"default"` one). Reads are LRU-cached per (file, mtime), so the per-build lookup is cheap even over the NAS.
+- **Application**: `patched_template(model)` applies every matching patch not in `model.disabled_template_patches` and returns a `PatchedChatTemplate` (`None` when nothing applies). `launch_params()` injects its path as `_chat_template` for servers with a `chat_template_flag`; each builder emits `_chat_template_args()` just before `extra_flags` (so a hand-written override in `extra_flags` still wins). Like staging, the file is written by `launch()` — `user_data/chat_templates/<model.id>.jinja`, rewritten only when the content changed — and the log header gets a `# tmpl:` line naming the applied patches.
+- **Why a sidecar file rather than patching the model?** Every text-gen server accepts a template override, so source copies (often on the read-only NAS) and caches stay pristine and the patch also works for uncached models. Rewriting a GGUF's embedded template would change its header size, forcing a rewrite of the whole multi-GB file.
+- **Opt-out**: automatic by default; `t` on the model list runs `available_patches()` in a thread (the GGUF header may be on the NAS) and shows a `ChoiceScreen` toggling each matching patch, persisted via `save_template_patch_enabled()`.
 
 ---
 
@@ -483,6 +501,7 @@ After the TUI exits, `launch()` in `launch.py` creates a log file and spawns the
    # server: <server_id>
    # env:    <env name>  (<kind>, <version_label>)
    # path:   <resolved_path>
+   # tmpl:   <patched chat template path>  (patched: <patch ids>)   — only when patches apply
    #
    # command:
    <paste-ready command, one arg per line with backslash continuation>
@@ -658,6 +677,8 @@ Possible extension: newer builds add `--kv-unified-per-slot N` (one shared KV po
 6. Optional: set `concurrency_param` if it serves several requests concurrently, and register a `FitProbe` subclass in `fit._PROBES` if it has a cheap way to predict memory use.
 
 **Add an environment**: `e` on the server or environment list → `a`. No code changes needed.
+
+**Add a chat template patch**: append a `ChatTemplatePatch` to `chat_template.TEMPLATE_PATCHES` (pattern, verbatim replacement, `requires` guards). Detection, launch flags, the `t` toggle and opt-out persistence pick it up automatically. A new server type sets `chat_template_flag` to take part.
 
 **Add an environment kind** (e.g. a venv or container image): subclass `Environment` in `environments.py`, implement `location` / `bin_dir` / `exists()` and whichever lifecycle hooks apply, declare `extra_fields`, and register it in `_ENV_KINDS`.
 

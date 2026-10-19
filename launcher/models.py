@@ -342,6 +342,9 @@ class AIModel:
     # When set, builders emit --enable-auto-tool-choice / --tool-call-parser flags.
     # Uses vLLM parser names as canonical; SGLang names are translated automatically.
     tool_call_parser: str = ""
+    # Chat template patches (chat_template.TEMPLATE_PATCHES ids) NOT to apply at launch;
+    # every other patch matching the model's template is applied automatically.
+    disabled_template_patches: frozenset[str] = frozenset()
     # For image_gen models: which ComfyUI models/ subdirectory to stage into.
     # 'checkpoints' for standard SD/SDXL files; 'diffusion_models' for FLUX UNets.
     comfyui_subdir: str = "checkpoints"
@@ -389,6 +392,7 @@ class AIModel:
             min_sm=int(d.get("min_sm", 0)),
             hw_note=d.get("hw_note", ""),
             tool_call_parser=d.get("tool_call_parser", ""),
+            disabled_template_patches=frozenset(d.get("disabled_template_patches", [])),
             comfyui_subdir=d.get("comfyui_subdir", "checkpoints"),
             server_status=d.get("server_status", {}),
             server_params=d.get("server_params", {}),
@@ -684,6 +688,9 @@ class ServerSoftware:
     rope_scaling_formats: frozenset[ModelFormat] = field(default_factory=frozenset)
     # Env vars set when rope_scaling is applied (e.g. vLLM's long-context permission).
     rope_scaling_env: dict[str, str] = field(default_factory=dict)
+    # Flag taking a chat template file that replaces the model's own (e.g. llama.cpp
+    # "--chat-template-file").  "" = no override: chat template patches are not applied.
+    chat_template_flag: str = ""
 
     def applies_rope_scaling(self, model: AIModel) -> bool:
         return model.rope_scaling is not None and model.format in self.rope_scaling_formats

@@ -111,6 +111,7 @@ SERVERS: list[ServerSoftware] = [
         # config's own limit unless explicitly allowed.
         rope_scaling_formats=_HF_CONFIG_FORMATS,
         rope_scaling_env={"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
+        chat_template_flag="--chat-template",
     ),
 
     ServerSoftware(
@@ -160,6 +161,7 @@ SERVERS: list[ServerSoftware] = [
         ),
         concurrency_param="parallel",
         rope_scaling_formats=frozenset({ModelFormat.GGUF}),
+        chat_template_flag="--chat-template-file",
     ),
 
     ServerSoftware(
@@ -186,6 +188,8 @@ SERVERS: list[ServerSoftware] = [
         version_packages=("exllamav2", "exllamav3"),
         # flash-attn was built against cuda-12.5; CUDA_HOME ensures nvcc resolution.
         cuda_home=CONFIG.cuda_home_tabby,
+        # Absolute paths work: tabby resolves the name against its templates/ dir.
+        chat_template_flag="--prompt-template",
     ),
 
     ServerSoftware(
@@ -234,6 +238,7 @@ SERVERS: list[ServerSoftware] = [
         staging_format_suffixes={ModelFormat.GGUF: ".gguf"},
         # Only its llama.cpp loader can apply RoPE scaling (forwarded via --extra-flags).
         rope_scaling_formats=frozenset({ModelFormat.GGUF}),
+        chat_template_flag="--chat-template-file",
     ),
 
     ServerSoftware(
@@ -298,6 +303,7 @@ SERVERS: list[ServerSoftware] = [
         # RoPE scaling via --json-model-override-args (HF-config checkpoints only).
         rope_scaling_formats=_HF_CONFIG_FORMATS,
         rope_scaling_env={"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"},
+        chat_template_flag="--chat-template",
     ),
 
 ]

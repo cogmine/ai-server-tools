@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from launcher.data import AI_MODELS, CACHE_MOUNTS
+from launcher.chat_template import patched_template
 from launcher.environments import ENVIRONMENTS, Environment
 from launcher.gpu_power import PowerLimitStep
 from launcher.models import (
@@ -341,6 +342,11 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
 # Per-server command builders
 # ---------------------------------------------------------------------------
 
+def _chat_template_args(server: ServerSoftware, p: dict) -> list[str]:
+    """Override flag for the patched chat template (see chat_template.py), if any."""
+    return [server.chat_template_flag, p["_chat_template"]] if p.get("_chat_template") else []
+
+
 def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     cmd = [
         str(env.python), "-m", "vllm.entrypoints.openai.api_server",
@@ -382,6 +388,7 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd += ["--enable-auto-tool-choice", "--tool-call-parser", model.tool_call_parser]
     if server.applies_rope_scaling(model):
         cmd += ["--hf-overrides", json.dumps(_hf_rope_override(model))]
+    cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -444,6 +451,7 @@ def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p:
     if model.mmproj_path:
         cmd += ["--mmproj", model.resolve_mmproj_path()]
     cmd += _mtp_args(model, p)
+    cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -501,6 +509,7 @@ def _build_tabby(server: ServerSoftware, env: Environment, model: AIModel, p: di
         "--port",         str(p["port"]),
         "--disable-auth", str(p["disable_auth"]),
     ]
+    cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -546,6 +555,7 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd.append("--load-in-8bit")
     elif rq == RuntimeQuant.BNB_NF4:
         cmd.append("--load-in-4bit")
+    cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -577,6 +587,7 @@ def _build_sglang(server: ServerSoftware, env: Environment, model: AIModel, p: d
         cmd += ["--tool-call-parser", sglang_name]
     if server.applies_rope_scaling(model):
         cmd += ["--json-model-override-args", json.dumps(_hf_rope_override(model))]
+    cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
 
@@ -836,11 +847,13 @@ def launch_params(
     runtime_quant: "RuntimeQuant | None" = None,
     param_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resolved builder params: merged defaults/overrides plus the injected _model_path / _runtime_quant."""
+    """Resolved builder params: merged defaults/overrides plus the injected _model_path / _runtime_quant / _chat_template."""
     p = _merged(server, model, param_overrides)
     if model is not None:
         p["_model_path"] = model.resolve_path()  # fastest available copy
     p["_runtime_quant"] = runtime_quant
+    template = patched_template(model) if model is not None and server.chat_template_flag else None
+    p["_chat_template"] = str(template.path) if template is not None else ""  # written by launch()
     return p
 
 
@@ -1048,6 +1061,10 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
                 staging = staging_base
             _stage_model(server, m, staging)
 
+    template = patched_template(model) if model is not None and server.chat_template_flag else None
+    if template is not None:
+        template.write()  # referenced by the command's chat_template_flag
+
     _LOGS_DIR.mkdir(exist_ok=True)
     model_slug = model.id if model is not None else "no-model"
     log_path = _LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{server.id}_{model_slug}.log"
@@ -1070,6 +1087,10 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
         path_line  = ""
     versions = server.env_version_label(env)
     env_detail = f"{env.kind_label}, {versions}" if versions else env.kind_label
+    template_line = (
+        f"# tmpl:   {template.path}  (patched: {', '.join(p.id for p in template.patches)})\n"
+        if template is not None else ""
+    )
     header = (
         f"# launcher session log\n"
         f"# date:   {datetime.now().isoformat(timespec='seconds')}\n"
@@ -1077,6 +1098,7 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
         f"# server: {server.id}\n"
         f"# env:    {env.name}  ({env_detail})\n"
         f"{path_line}"
+        f"{template_line}"
         f"#\n"
         f"# command:\n"
         f"{command}\n"
@@ -1450,3 +1472,25 @@ def save_server_param(model: AIModel, server: ServerSoftware, key: str, value: A
 
     _apply(model.server_params)
     _patch_catalog(model.id, _apply_entry)
+
+
+def save_template_patch_enabled(model: AIModel, patch_id: str, enabled: bool) -> None:
+    """Persist a model's opt-out of one chat template patch (enabled=False opts out).
+
+    Mutates the in-memory model immediately, then updates the JSON catalog; the
+    key is omitted when no patch is disabled.
+    """
+    disabled = set(model.disabled_template_patches)
+    if enabled:
+        disabled.discard(patch_id)
+    else:
+        disabled.add(patch_id)
+    model.disabled_template_patches = frozenset(disabled)
+
+    def _apply(entry: dict) -> None:
+        if disabled:
+            entry["disabled_template_patches"] = sorted(disabled)
+        else:
+            entry.pop("disabled_template_patches", None)
+
+    _patch_catalog(model.id, _apply)
