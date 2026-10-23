@@ -281,7 +281,7 @@ class RopeScaling:
 # stay usable by any re-quantization of that GGUF.
 _DERIVED_FIELDS: tuple[str, ...] = (
     "family", "ctx", "params_m", "arch", "moe_experts", "moe_active", "vision",
-    "mmproj_path", "mtp_path", "tool_call_parser",
+    "mmproj_path", "mtp_path", "tool_call_parser", "reasoning_parser",
 )
 
 
@@ -336,6 +336,10 @@ class AIModel:
     # When set, builders emit --enable-auto-tool-choice / --tool-call-parser flags.
     # Uses vLLM parser names as canonical; SGLang names are translated automatically.
     tool_call_parser: str = ""
+    # vLLM/SGLang reasoning parser name (e.g. "qwen3", "deepseek_r1"): separates the
+    # model's thinking into reasoning_content.  vLLM names are canonical; SGLang names
+    # are translated automatically.
+    reasoning_parser: str = ""
     # Chat template patches (chat_template.TEMPLATE_PATCHES ids) NOT to apply at launch;
     # every other patch matching the model's template is applied automatically.
     disabled_template_patches: frozenset[str] = frozenset()
@@ -386,6 +390,7 @@ class AIModel:
             min_sm=int(d.get("min_sm", 0)),
             hw_note=d.get("hw_note", ""),
             tool_call_parser=d.get("tool_call_parser", ""),
+            reasoning_parser=d.get("reasoning_parser", ""),
             disabled_template_patches=frozenset(d.get("disabled_template_patches", [])),
             comfyui_subdir=d.get("comfyui_subdir", "checkpoints"),
             server_status=d.get("server_status", {}),
@@ -573,6 +578,11 @@ MODEL_FIELDS: tuple[ParamSpec, ...] = (
         key="tool_call_parser", label="Tool-call parser", default="", empty_label="none",
         help="vLLM parser name (e.g. qwen3_coder, hermes, openai) — enables tool calling on "
              "vLLM and SGLang (translated to SGLang's names)",
+    ),
+    TextParam(
+        key="reasoning_parser", label="Reasoning parser", default="", empty_label="none",
+        help="vLLM parser name (e.g. qwen3, deepseek_r1, glm45, openai_gptoss) — returns the model's "
+             "thinking separately as reasoning_content on vLLM and SGLang (translated to SGLang's names)",
     ),
     BoolParam(
         key="trust_remote_code", label="Trust remote code", default=False,

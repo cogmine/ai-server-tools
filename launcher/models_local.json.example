@@ -29,6 +29,7 @@
     "server_params": "(optional) Per-server parameter overrides merged on top of server defaults at launch time — editable on the model settings page, which lists every parameter with its help. Auto parameters (e.g. vllm expert_parallel) are omitted (or null) to stay auto.",
     "comfyui_subdir": "(optional, image_gen only) ComfyUI models/ subdirectory to stage into. Default: 'checkpoints'. Use 'diffusion_models' for FLUX UNets.",
     "tool_call_parser": "(optional) vLLM tool-call parser name (e.g. 'openai', 'hermes', 'llama3_json'). When set, servers emit tool-calling flags automatically. Translated for SGLang.",
+    "reasoning_parser": "(optional) vLLM reasoning parser name (e.g. 'qwen3', 'deepseek_r1', 'glm45'). When set, vLLM and SGLang return the model's thinking separately as reasoning_content (names translated for SGLang).",
     "disabled_template_patches": "(optional) Chat template patch ids NOT to apply at launch (e.g. ['system_anywhere']). Every other patch matching the model's chat template is applied automatically via a patched copy. Toggled by the TUI t key."
   },
   "models": [

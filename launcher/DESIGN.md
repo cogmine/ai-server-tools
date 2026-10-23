@@ -113,6 +113,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `mtp_path` | Absolute path to the companion `mtp-*.gguf` multi-token-prediction draft head. Set automatically by `ingest`/`refresh`. llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <mtp_path>` unless the `mtp` server param is `false`. Cached alongside the model. Omitted from JSON when empty. |
 | `mtp_embedded` | `True` when the model carries its own MTP (NextN) layers. GGUF: `<arch>.nextn_predict_layers > 0` in its header (`gguf_header.py`). HF checkpoint: `config.json` declares `mtp_num_hidden_layers` / `num_nextn_predict_layers` > 0 **and** the weights include them (`mtp.*` tensors, or a layer index past `num_hidden_layers`) — quantized/abliterated copies often keep the keys but drop the weights. Set by `ingest`/`refresh`. llama.cpp / ooba use it (`--spec-type draft-mtp`, no draft file) only when their `mtp` param is `on` (many GGUFs keep NextN layers a llama.cpp build cannot run, e.g. GLM5-Next); vLLM uses it for `--speculative-config` when its `mtp` param is on (opt-in). Omitted from JSON when false. |
 | `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. Editable on the model properties page (a `MODEL_FIELDS` entry, as are `trust_remote_code` and `note`). |
+| `reasoning_parser` | vLLM reasoning parser name (e.g. `"qwen3"`, `"deepseek_r1"`, `"glm45"`). When set, `_build_vllm` emits `--reasoning-parser <name>` and `_build_sglang` `--reasoning-parser <translated_name>` (via `_SGLANG_REASONING_PARSER_MAP`), so the model's thinking is returned separately as `reasoning_content`. Inherited by quantizations/conversions (`_DERIVED_FIELDS`). Omitted from JSON when empty; a `MODEL_FIELDS` entry. |
 | `disabled_template_patches` | frozenset of `ChatTemplatePatch.id`s the model opts out of; every other patch matching its chat template is applied at launch (see *Chat Template Patches*). Toggled on the model properties page via `save_template_patch_enabled()`. Omitted from JSON when empty. |
 | `family` | Shared by an original model and every copy, conversion and quantization of it (ingest assigns the slug of the model's name; `register_copy()` and `finalize_quantization()` carry it over). Groups related entries without a per-model link chain, so deleting an intermediate (e.g. an F16 GGUF used to make a Q8_0) loses nothing. |
 | `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
@@ -192,7 +193,7 @@ Current auto parameters:
 - vLLM `expert_parallel` → `hf_config.expert_parallel_needed(model, tp)`: on when the expert width (`moe_intermediate_size`) does not divide by TP, or a TP shard does not align to the checkpoint's `weight_block_size` (Qwen3.8-Flash-Next FP8: 640 / 8 = 80 vs 128). Off at TP=1 (no effect there) and for dense models.
 - llama.cpp / ooba `mtp` → on only for a sidecar `mtp_path` head; an embedded head needs an explicit on.
 
-`MODEL_FIELDS` (`models.py`) reuses the same kinds for the simple user-editable `AIModel` fields (`tool_call_parser`, `trust_remote_code`, `note`), persisted with `save_model_field()`.
+`MODEL_FIELDS` (`models.py`) reuses the same kinds for the simple user-editable `AIModel` fields (`tool_call_parser`, `reasoning_parser`, `trust_remote_code`, `note`), persisted with `save_model_field()`.
 
 ---
 
@@ -655,7 +656,8 @@ Always-on flags: `--model`, `--served-model-name`, `--tensor-parallel-size`,
 `--pipeline-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`
 (`model.effective_ctx`, or `-1` when `auto_fit_ctx`), `--host`, `--port`. `--trust-remote-code` is emitted only when
 the model's `trust_remote_code` field is True. `--enable-auto-tool-choice
---tool-call-parser <name>` is emitted when the model's `tool_call_parser` is set.
+--tool-call-parser <name>` is emitted when the model's `tool_call_parser` is set, and
+`--reasoning-parser <name>` when its `reasoning_parser` is set (SGLang: names translated via `_SGLANG_REASONING_PARSER_MAP`).
 
 Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
 "gpu_mem_util": 0.8}`) and are merged over these defaults at launch time.
@@ -738,6 +740,7 @@ python -m launcher.ingest ingest --path <path> [--ai-type text_gen|image_gen] [-
 python -m launcher.ingest refresh [--path <path>] [--dry-run]
 python -m launcher.ingest copy-configs <scan_root> [--dry-run]
 python -m launcher.ingest copy-mmproj <scan_root> [--dry-run]
+python -m launcher.ingest sync-copies [--path <path>] [--dry-run]
 ```
 
 Scans a given `scan_root` directory for model paths not already in `models_local.json` and appends new entries. Without `--all`, stops after the first new model (useful for testing detection); with `--all`, ingests every uncatalogued model in one pass.
@@ -752,6 +755,7 @@ Every entry is built by `build_entry()`: a path at the same relative position (a
 | `refresh` | Re-detect auto-derived fields for existing entries without touching user-curated fields |
 | `copy-configs` | Copy HF config/tokenizer files from original model dirs into GGUF bundle directories |
 | `copy-mmproj` | Copy mmproj-*.gguf vision encoder files from original model dirs into GGUF bundle directories |
+| `sync-copies` | Fill files missing from a model's copies from its other copies (never overwrites or deletes) |
 
 ### Scanning order
 
@@ -803,9 +807,10 @@ With `--ai-type image_gen`, each `.safetensors` file in the scan directory becom
 
 ### refresh subcommand
 
-`refresh` re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, `moe_experts`, `moe_active`, `vision`, `mmproj_path`, `mtp_path`, `mtp_embedded`) for existing catalog entries. User-curated fields (`id`, `name`, `format`, `path`, `family`, `ctx_override`, `favorite`, `server_status`, `server_params`, `min_sm`, `hw_note`, `comfyui_subdir`, `quant`, `trust_remote_code`, `note`) are never touched.
+`refresh` re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, `moe_experts`, `moe_active`, `vision`, `mmproj_path`, `mtp_path`, `mtp_embedded`) for existing catalog entries. User-curated fields (`id`, `name`, `format`, `path`, `family`, `ctx_override`, `favorite`, `server_status`, `server_params`, `min_sm`, `hw_note`, `comfyui_subdir`, `quant`, `trust_remote_code`, `tool_call_parser`, `reasoning_parser`, `note`) are never touched.
 
 - `--path <path>` limits refresh to a single entry; otherwise all entries are refreshed.
+- Updated entries are written back by catalog position, never by `id` — copies of a model share its id.
 - Size recompute uses the stored (user-curated) format, not the freshly-detected one — if a format has been manually corrected, the size reflects the corrected format's weight files.
 - Zero-valued detections for `ctx` and `params_m` are treated as "unknown" and preserve the existing value rather than overwriting manually-set data.
 
@@ -818,6 +823,10 @@ Both commands search `scan_root` plus the same leaf directory under every other 
 The copied set (`_CONFIG_FILES`) covers `config.json`, the tokenizer files, `generation_config.json`, and `chat_template.jinja` / `chat_template.json` — transformers ≥ 4.55 ships the chat template as a standalone file instead of embedding it in `tokenizer_config.json`.
 
 `copy-configs` skips any bundle that already has a `config.json`, so bundles processed before a new filename was added to `_CONFIG_FILES` are not backfilled automatically; call `copy_model_metadata(src, dst)` directly for those.
+
+### sync-copies
+
+Copies drift: copies made before metadata travelled with a model lack its config/tokenizer files (so `refresh` cannot re-detect e.g. `arch` on them), and running `copy-configs` on one location leaves the others behind. `sync-copies` compares every model with its copies (same `id` and `format`) on the online locations — `storage.missing_copy_files()` over each copy's `model_files()`, mapped through `mirrored_path()` — and copies each missing file from the first copy that has it with `storage.fill_missing()`: never overwriting or deleting, and writing via a `.partial` name renamed into place, so an interrupted copy never leaves a truncated file that looks complete. Files that exist in both copies but differ (e.g. a hand-edited chat template) are not touched. `--path` limits it to one copy; follow up with `refresh --path` so fields the new files describe are re-detected.
 
 Fields left for manual review: `ctx` for new GGUF bundles without config.json, `server_params`.
 

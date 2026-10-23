@@ -80,6 +80,17 @@ _SGLANG_TOOL_PARSER_MAP: dict[str, str] = {
     "minimax_m2":   "minimax-m2",
 }
 
+# Translation from canonical (vLLM) reasoning parser names to SGLang names; matching
+# names (qwen3, glm45, kimi_k2, step3, step3p5) pass through unchanged.
+_SGLANG_REASONING_PARSER_MAP: dict[str, str] = {
+    "deepseek_r1":             "deepseek-r1",
+    "deepseek_v3":             "deepseek-v3",
+    "openai_gptoss":           "gpt-oss",
+    "minimax_m2":              "minimax",
+    "minimax_m2_append_think": "minimax-append-think",
+    "nemotron_v3":             "nano_v3",
+}
+
 
 @dataclass(frozen=True)
 class LaunchJob:
@@ -370,6 +381,8 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd += ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"]
     if model.tool_call_parser:
         cmd += ["--enable-auto-tool-choice", "--tool-call-parser", model.tool_call_parser]
+    if model.reasoning_parser:
+        cmd += ["--reasoning-parser", model.reasoning_parser]
     if server.applies_rope_scaling(model):
         cmd += ["--hf-overrides", json.dumps(_hf_rope_override(model))]
     cmd += _chat_template_args(server, p)
@@ -569,6 +582,9 @@ def _build_sglang(server: ServerSoftware, env: Environment, model: AIModel, p: d
     if model.tool_call_parser:
         sglang_name = _SGLANG_TOOL_PARSER_MAP.get(model.tool_call_parser, model.tool_call_parser)
         cmd += ["--tool-call-parser", sglang_name]
+    if model.reasoning_parser:
+        sglang_name = _SGLANG_REASONING_PARSER_MAP.get(model.reasoning_parser, model.reasoning_parser)
+        cmd += ["--reasoning-parser", sglang_name]
     if server.applies_rope_scaling(model):
         cmd += ["--json-model-override-args", json.dumps(_hf_rope_override(model))]
     cmd += _chat_template_args(server, p)

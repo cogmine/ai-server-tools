@@ -261,6 +261,7 @@ QSA kernels would hit the same Triton fp8e4nv limitation. Loading from the NAS t
 - `--max-num-seqs` — omitted by default (vLLM default 256); set per-model to cap concurrency for tight-memory models.
 - `--trust-remote-code` — emitted only when the model's `trust_remote_code` field is `true` (check `auto_map` in `config.json`).
 - `--enable-auto-tool-choice --tool-call-parser <name>` — emitted when the model's `tool_call_parser` field is set.
+- `--reasoning-parser <name>` — emitted when the model's `reasoning_parser` field is set (e.g. `qwen3`; SGLang names translated via `_SGLANG_REASONING_PARSER_MAP`).
 - `cd /tmp` before launching — prevents `~/vllm/` source tree from shadowing the installed package
 - **Port**: all scripts default to **5000**
 
@@ -288,6 +289,7 @@ Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted
 `mtp_path` field: absolute path to a companion `mtp-*.gguf` multi-token-prediction draft head (auto-detected by `ingest`/`refresh`; quant-matching file preferred). llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <path>` unless server param `mtp` is `false`; copied alongside the model like the mmproj.
 `mtp_embedded` field: `true` when the model carries MTP/NextN layers — GGUF `<arch>.nextn_predict_layers` (`launcher/gguf_header.py`), or an HF checkpoint whose config declares `mtp_num_hidden_layers`/`num_nextn_predict_layers` and ships the weights (`ingest._detect_hf_mtp`). llama.cpp/ooba: `--spec-type draft-mtp` (no draft file) only when their `mtp` param is on — auto uses sidecar heads only, because llama.cpp may not implement MTP for the architecture (GLM5-Next does not yet). vLLM: `--speculative-config` when its `mtp` param is on (opt-in).
 `tool_call_parser` field: vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, vLLM emits `--enable-auto-tool-choice --tool-call-parser <name>` and SGLang emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP` in `launch.py`). Omitted from JSON when empty.
+`reasoning_parser` field: vLLM reasoning parser name (e.g. `"qwen3"`, `"deepseek_r1"`). When set, vLLM and SGLang emit `--reasoning-parser <name>` (SGLang names translated via `_SGLANG_REASONING_PARSER_MAP` in `launch.py`). Edited on the model properties page; inherited by quantizations. Omitted from JSON when empty.
 Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. Default order: `fav → status → name`. Clicking a header promotes it to primary (ascending); clicking the primary toggles direction. `_STATUS_RANK` maps composite status symbols (✓, ✓?, ✓✗, ✗?, ✗, ?) to integers 0–5 for sort.
 
 **Log files**: `logs/{timestamp}_{server}_{model}.log`. Header contains metadata + a paste-ready command block (no `#` prefix on the command lines). Exit footer: `# exit: code N` or `# exit: killed by SIGSEGV (11)`. Captured via PTY so ANSI colours are preserved. SIGWINCH is forwarded to the PTY so progress bars resize live.
@@ -306,11 +308,12 @@ Path validation before GpuSelectScreen; missing files show a toast notification.
 `ModelManageScreen` overrides `_open_model()` (template method in `ModelSelectScreen`) to push `CopyModelScreen`. The template method pattern is necessary because Textual calls all MRO classes' message handlers regardless of override — only plain method calls respect the most-derived class.
 `CopyProgressScreen`: `rsync -ahR --info=progress2` (sources anchored `<root>/./<rel>` so the layout is mirrored); stdout read via `select.select()` in a `@work(thread=True)` worker; `(\d+)%` regex drives a `ProgressBar` widget + speed/ETA detail label; `proc.wait()` called after stdout EOF before reading `returncode`; on success `launch.register_copy()` adds the copy's catalog entries.
 
-**Catalog ingest**: `python -m launcher.ingest <subcommand>` — four subcommands:
+**Catalog ingest**: `python -m launcher.ingest <subcommand>` — five subcommands:
 - `ingest <scan_root> [--all] [--ai-type text_gen|image_gen] [--dry-run]` — scans a directory for models not in the catalog and appends entries. `--path <path>` targets a specific model. `--ai-type image_gen` for diffusion checkpoints/FLUX.
 - `refresh [--path <path>] [--dry-run]` — re-detects auto-derived fields (ctx, size_gb, params_m, arch, moe, vision, mmproj_path) for existing entries without touching user-curated fields.
 - `copy-configs <scan_root> [--dry-run]` — copies HF config/tokenizer files into GGUF bundle directories before ingesting.
 - `copy-mmproj <scan_root> [--dry-run]` — copies mmproj vision encoder files into GGUF bundle directories before ingesting/refreshing.
+- `sync-copies [--path <path>] [--dry-run]` — fills files missing from a model's copies (same id + format on other locations) from its other copies; never overwrites/deletes; follow with `refresh --path`.
 
 **Catalog anomaly log**: `user_data/model_audit.md` — records format misclassifications, size corrections,
 and open items found during catalog audits. Gitignored (personal/local).

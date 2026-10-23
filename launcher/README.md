@@ -126,6 +126,7 @@ The ingest tool (`python -m launcher.ingest`) scans directories for models and m
 | `refresh` | Re-detect auto-derived fields for existing catalog entries |
 | `copy-configs` | Copy HF config/tokenizer files from original model dirs into GGUF bundle dirs |
 | `copy-mmproj` | Copy mmproj vision encoder files from original model dirs into GGUF bundle dirs |
+| `sync-copies` | Copy files that another copy of a model has but this copy lacks |
 
 #### ingest
 
@@ -175,6 +176,19 @@ python -m launcher.ingest copy-mmproj /path/to/models [--dry-run]
 
 Both commands search for the matching original (non-GGUF) model directory across the scan root and the same directory under every other storage location.
 
+#### sync-copies
+
+Completes copies of a model that lack files another copy has — for example config/tokenizer files of copies made before those travelled with the model, without which `refresh` cannot read the model's architecture. It only adds missing files: nothing is overwritten or deleted, and files that differ between copies are left alone.
+
+```bash
+# Every model with copies (offline locations are skipped)
+python -m launcher.ingest sync-copies [--dry-run]
+
+# One copy, then re-detect the fields the new files describe
+python -m launcher.ingest sync-copies --path /path/to/copy [--dry-run]
+python -m launcher.ingest refresh --path /path/to/copy [--dry-run]
+```
+
 Ingesting a model found at the same relative path as a catalogued model on another location (e.g. a copy made outside the launcher) adds it as a copy of that model — same id, family and settings. Any other new model starts a new **family**, named after the model.
 
 ### Manual entry
@@ -215,7 +229,7 @@ Override server defaults per model with a `server_params` key (or edit them on t
 Choosing a model opens its settings page before the server list (Enter continues straight on). The top shows what the model is — size, MoE, architecture, vision, MTP, and which storage locations hold copies. Below is every setting with its effective value and where it comes from:
 
 - *default* — the server's default; *this model* — overridden for this model; *auto* — decided at launch (shown with the reason); *GPU screen* — set when you pick GPUs (tensor / pipeline parallel are previewed for all GPUs).
-- **Model**: context / YaRN (e.g. YaRN factor `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF, and/or a context-length override), [chat template patches](#chat-template-patches), tool-call parser, trust remote code, note.
+- **Model**: context / YaRN (e.g. YaRN factor `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF, and/or a context-length override), [chat template patches](#chat-template-patches), tool-call parser, reasoning parser (vLLM / SGLang return the model's thinking separately as `reasoning_content`; e.g. `qwen3`), trust remote code, note.
 - **One section per compatible server** with its launch parameters, each with a description in the help line. Model-specific ones appear only where they apply — expert parallel for MoE models, MTP for models with an MTP head.
 
 `e` edits the focused setting (a picker or a validated text prompt), `Space` toggles on/off and cycles auto/on/off settings, `r` resets an override to the default. Changes are saved immediately to this catalog entry. Copies of a model at other locations are separate entries and keep their own settings (the page tells you which copies exist).

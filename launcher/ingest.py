@@ -27,12 +27,18 @@ Subcommands:
   ingest --path <path> [--ai-type text_gen|image_gen] [--dry-run]
       Add a single specific model by absolute path.
 
+  sync-copies [--path <path>] [--dry-run]
+      For models stored on several locations, copy files that another copy has
+      but this one lacks (e.g. config/tokenizer files of copies made before
+      metadata travelled with the model).  Never overwrites or deletes.
+
 Usage:
     python -m launcher.ingest copy-configs /mnt/models/text-generation [--dry-run]
     python -m launcher.ingest copy-mmproj /mnt/models/text-generation [--dry-run]
     python -m launcher.ingest ingest /mnt/models/text-generation [--dry-run]
     python -m launcher.ingest ingest /mnt/models/text-generation --all [--dry-run]
     python -m launcher.ingest ingest --path /mnt/models/text-generation/MyModel [--dry-run]
+    python -m launcher.ingest sync-copies [--path /mnt/models/text-generation/MyModel] [--dry-run]
     python -m launcher.ingest ingest /mnt/models/text-to-image/checkpoints --ai-type image_gen --all
     python -m launcher.ingest ingest /mnt/models/text-to-image/flux --ai-type image_gen --all
 """
@@ -48,8 +54,11 @@ from pathlib import Path
 from typing import Any
 
 from launcher.gguf_header import arch_int, embedded_mtp_layers, read_gguf_metadata
-from launcher.models import GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info
-from launcher.storage import LOCATIONS, METADATA_FILES, location_of, model_metadata_dir, relocated_entry
+from launcher.models import AIModel, GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info
+from launcher.storage import (
+    LOCATIONS, METADATA_FILES, fill_missing, location_of, missing_copy_files, model_metadata_dir,
+    relocated_entry,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1414,14 +1423,14 @@ def cmd_refresh(args: "argparse.Namespace") -> None:
 
     if args.path:
         target_path = str(Path(args.path))
-        to_refresh = [e for e in models if e["path"] == target_path]
+        to_refresh = [i for i, e in enumerate(models) if e["path"] == target_path]
         if not to_refresh:
             print(f"[refresh] No catalog entry found for path: {target_path}", file=sys.stderr)
             sys.exit(1)
     else:
-        to_refresh = models
+        to_refresh = list(range(len(models)))
 
-    index_by_id = {e["id"]: i for i, e in enumerate(models)}
+    # Positions, not ids: copies of a model share its id.
     updated_models = list(models)
     total_changed = 0
 
@@ -1431,12 +1440,12 @@ def cmd_refresh(args: "argparse.Namespace") -> None:
         file=sys.stderr,
     )
 
-    for entry in to_refresh:
-        updated_entry, changed = _refresh_one(entry, dry_run=False)
+    for index in to_refresh:
+        updated_entry, changed = _refresh_one(models[index], dry_run=False)
         if changed:
             total_changed += 1
             if not args.dry_run:
-                updated_models[index_by_id[entry["id"]]] = updated_entry
+                updated_models[index] = updated_entry
 
     print()
     if args.dry_run:
@@ -1447,6 +1456,45 @@ def cmd_refresh(args: "argparse.Namespace") -> None:
         print(f"[refresh] Updated {total_changed} entr(ies).", file=sys.stderr)
     else:
         print("[refresh] All entries are up-to-date.", file=sys.stderr)
+
+
+def cmd_sync_copies(args: "argparse.Namespace") -> None:
+    """Subcommand: fill files missing from a model's copies from its other copies."""
+    models = [AIModel.from_dict(e) for e in _load_catalog(_CATALOG_PATH).get("models", [])]
+    targets = [m for m in models if not args.path or m.path == str(Path(args.path))]
+    if args.path and not targets:
+        print(f"[sync-copies] No catalog entry found for path: {args.path}", file=sys.stderr)
+        sys.exit(1)
+
+    synced: list[AIModel] = []
+    copied = failed = 0
+    for model in targets:
+        copies = [c for c in models if c.is_copy_of(model)]
+        missing = missing_copy_files(model, copies) if copies else {}
+        if not missing:
+            continue
+        synced.append(model)
+        size_gb = sum(src.stat().st_size for src in missing.values()) / 1024**3
+        print(f"[sync-copies] {model.id}  {model.path}: {len(missing)} missing file(s), {size_gb:.2f} GiB")
+        for target, source in sorted(missing.items()):
+            print(f"    {target}  ← {source}")
+            if args.dry_run:
+                continue
+            try:
+                fill_missing(target, source)
+                copied += 1
+            except OSError as exc:
+                failed += 1
+                print(f"      failed: {exc}", file=sys.stderr)
+
+    if not synced:
+        print("[sync-copies] All copies are complete (offline locations not checked).")
+    elif args.dry_run:
+        print(f"\n[sync-copies] --dry-run: {len(synced)} cop(ies) would be completed.")
+    else:
+        print(f"\n[sync-copies] Copied {copied} file(s){f', {failed} failed' if failed else ''}.")
+        print("[sync-copies] Run 'refresh --path <path>' for these entries to re-detect fields "
+              "the new files describe (e.g. arch from config.json).")
 
 
 def _add_dry_run_arg(p: "argparse.ArgumentParser") -> None:
@@ -1532,6 +1580,8 @@ def main() -> None:
             "  ingest         Add uncatalogued models (scan or specific path)\n"
             "  copy-configs   Copy HF config files into GGUF bundle directories\n"
             "  copy-mmproj    Copy mmproj files into GGUF bundle directories\n"
+            "  refresh        Re-detect auto-derived fields for existing entries\n"
+            "  sync-copies    Fill files missing from a model's copies from its other copies\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", metavar="SUBCOMMAND")
@@ -1621,10 +1671,31 @@ def main() -> None:
     )
     _add_dry_run_arg(mmproj_p)
 
+    sync_p = subparsers.add_parser(
+        "sync-copies",
+        help="Copy files that another copy of a model has but this copy lacks.",
+        description=(
+            "For every model stored on several locations, copy files that another\n"
+            "copy has but this one lacks (never overwrites or deletes).  Offline\n"
+            "locations are skipped."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sync_p.add_argument(
+        "--path",
+        metavar="PATH",
+        help="Complete only the copy at this exact model path (default: every copy).",
+    )
+    _add_dry_run_arg(sync_p)
+
     args = parser.parse_args()
 
     if args.command == "refresh":
         cmd_refresh(args)
+        return
+
+    if args.command == "sync-copies":
+        cmd_sync_copies(args)
         return
 
     if args.command == "copy-configs":

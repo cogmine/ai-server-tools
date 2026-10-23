@@ -6,12 +6,13 @@ A model's catalog entry has exactly one path; copies of a model are separate
 entries (same id and family) at the same path *relative to* another location's
 root, so the layout under every root mirrors the others.
 
-copy_model() and DeletionPlan are the only operations that write or delete model
-files; catalog bookkeeping for them lives in launch.py.
+copy_model(), fill_missing() and DeletionPlan are the only operations that write or
+delete model files; catalog bookkeeping for them lives in launch.py.
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -150,6 +151,50 @@ def model_size_gb(model: AIModel) -> float:
         elif p.is_file():
             total += p.stat().st_size
     return total / 1024**3
+
+
+def _files_in(path: Path) -> list[Path]:
+    """*path* itself when a file; every file under it (excluding .git) when a directory."""
+    if path.is_dir():
+        return [f for f in path.rglob("*") if f.is_file() and ".git" not in f.parts]
+    return [path] if path.is_file() else []
+
+
+def missing_copy_files(model: AIModel, copies: Iterable[AIModel]) -> dict[Path, Path]:
+    """Files another copy of *model* has that *model*'s own copy lacks: {missing path: source}.
+
+    Copies drift when files are added to one location only (e.g. copy-configs, or
+    copies made before metadata files were copied with the model).  Only online
+    locations are compared; the first copy holding a file is its source.
+    """
+    dest = location_of(model.path)
+    if dest is None or not dest.online:
+        return {}
+    missing: dict[Path, Path] = {}
+    for copy in copies:
+        src = location_of(copy.path)
+        if src is None or not src.online or src.root == dest.root:
+            continue
+        for f in (f for p in model_files(copy) for f in _files_in(p)):
+            if src.contains(f):
+                target = mirrored_path(f, dest)
+                if target not in missing and not target.exists():
+                    missing[target] = f
+    return missing
+
+
+def fill_missing(target: Path, source: Path) -> None:
+    """Copy *source* to the absent *target*, never overwriting.
+
+    Written to a temporary name and renamed into place, so an interrupted copy never
+    leaves a truncated file that would look complete.
+    """
+    if target.exists():
+        raise FileExistsError(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(target.name + ".partial")
+    shutil.copy2(source, partial)
+    os.replace(partial, target)
 
 
 def copy_model(model: AIModel, dest: Location) -> "subprocess.Popen[bytes]":
