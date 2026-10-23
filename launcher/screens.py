@@ -30,7 +30,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, ClassVar
 
+from rich.console import RenderableType
 from rich.markup import escape
+from rich.padding import Padding
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -2493,6 +2495,7 @@ class _PropRow:
     label = ""
     help = ""
     editable = False
+    heading = False   # section heading: drawn as a bar, skipped by the cursor
 
     def value(self, screen: "ModelPropertiesScreen") -> str:
         return ""
@@ -2517,8 +2520,10 @@ class _PropRow:
 
 
 class _SectionRow(_PropRow):
+    heading = True
+
     def __init__(self, title: str) -> None:
-        self.label = f"[bold]{escape(title)}[/]"
+        self.label = escape(title)
 
 
 def _source_cell(overridden: bool) -> str:
@@ -2671,6 +2676,10 @@ class ModelPropertiesScreen(DataTableScreen):
     Enter continues to the server list.
     """
 
+    # Section heading rows (styled in model_launcher.tcss).  DataTable has no per-row
+    # styling, so heading cells render with this style and fill their whole width.
+    COMPONENT_CLASSES: ClassVar[set[str]] = {"props--section"}
+
     BINDINGS: ClassVar = [
         Binding("q",        "quit_app",       "Quit"),
         Binding("escape,b", "app.pop_screen", "Back", key_display="esc/←"),
@@ -2685,6 +2694,7 @@ class ModelPropertiesScreen(DataTableScreen):
         self.model = model
         self.gpu_count = CONFIG.pipeline_parallel
         self.template_patches: list | None = None   # filled by a worker (may read the NAS)
+        self._cursor_row = 0   # last settled cursor row — gives the direction to skip headings
         self._servers = servers_for_model(SERVERS, model)
         self._rows: list[_PropRow] = [_SectionRow("Model"), _ContextRow()]
         if any(s.chat_template_flag for s in self._servers):
@@ -2704,7 +2714,8 @@ class ModelPropertiesScreen(DataTableScreen):
         yield Label(f"[bold]Model settings:[/]  {escape(self.model.name)}  ·  {self.model.format_tag}",
                     id="screen-title")
         yield Static(self._info_text(), id="props-info")
-        table = DataTable(id="props-table", cursor_type="row")
+        # Cells pad themselves (see _cells), so heading bars run unbroken across columns.
+        table = DataTable(id="props-table", cursor_type="row", cell_padding=0)
         table.add_column("Setting", key="label")
         table.add_column("Value", key="value")
         table.add_column("Source", key="source")
@@ -2754,12 +2765,20 @@ class ModelPropertiesScreen(DataTableScreen):
         first = next(i for i, row in enumerate(self._rows) if not isinstance(row, _SectionRow))
         self.query_one("#props-table", DataTable).move_cursor(row=first)
 
+    def _cells(self, row: _PropRow) -> list[RenderableType]:
+        """The row's label / value / source cells, each padded by one column."""
+        values = (row.label, row.value(self), row.source(self))
+        if row.heading:
+            style = self.get_component_rich_style("props--section")
+            return [Padding(Text.from_markup(v), (0, 1), style=style, expand=True) for v in values]
+        return [Padding(Text.from_markup(v), (0, 1)) for v in values]
+
     def _populate(self) -> None:
         table = self.query_one("#props-table", DataTable)
         saved_row = table.cursor_row
         table.clear()
         for i, row in enumerate(self._rows):
-            table.add_row(row.label, row.value(self), row.source(self), key=str(i))
+            table.add_row(*self._cells(row), key=str(i))
         table.move_cursor(row=min(saved_row, len(self._rows) - 1))
         self._update_help()
 
@@ -2777,6 +2796,18 @@ class ModelPropertiesScreen(DataTableScreen):
 
     @on(DataTable.RowHighlighted)
     def on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        index = event.data_table.cursor_row   # current, not the (possibly stale) event's row
+        if 0 <= index < len(self._rows) and self._rows[index].heading:
+            # Step past the heading in the direction of travel (or back, at either end).
+            step = 1 if index >= self._cursor_row else -1
+            target = next(
+                (i for i in range(index + step, len(self._rows) if step > 0 else -1, step)
+                 if not self._rows[i].heading),
+                self._cursor_row,
+            )
+            event.data_table.move_cursor(row=target)
+            return
+        self._cursor_row = index
         self._update_help()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:

@@ -85,6 +85,16 @@ GpuTable DataTable {
 #props-table {
     margin: 0 1;
     height: 1fr;
+    /* As wide as its columns, so section heading bars span the whole table. */
+    width: auto;
+    max-width: 100%;
+}
+
+/* Section heading rows (Model, vLLM, llama.cpp, …) — a component class of the screen. */
+ModelPropertiesScreen > .props--section {
+    background: $primary-darken-2;
+    color: $text;
+    text-style: bold;
 }
 
 #props-help {
