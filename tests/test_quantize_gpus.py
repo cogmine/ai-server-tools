@@ -49,16 +49,13 @@ class QuantizeCommandTests(unittest.TestCase):
         env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
         dest = Location("test", Path("/cache"))
         builders = {tool.id: lambda *_: ["quant-tool"] for tool in QUANTIZATION_TOOLS}
-        with (
-            patch.object(launch, "_tool_env", return_value=env),
-            patch.dict(launch._QUANT_BUILDERS, builders),
-        ):
+        with patch.dict(launch._QUANT_BUILDERS, builders):
             for registered in QUANTIZATION_TOOLS:
                 tool = dataclasses.replace(registered, cuda_home="/cuda toolkit")
                 model = model_for(next(iter(tool.input_formats)))
                 with self.subTest(tool=tool.id):
                     cmd, _ = launch.build_quantize_cmd(
-                        tool, model, tool.quant_options[0], dest, "2,7",
+                        tool, env, model, tool.quant_options[0], dest, "2,7",
                     )
                     if tool.uses_cuda:
                         self.assertEqual(cmd[:3], [
@@ -67,7 +64,7 @@ class QuantizeCommandTests(unittest.TestCase):
                     else:
                         self.assertEqual(cmd, ["quant-tool"])
                     cmd, _ = launch.build_quantize_cmd(
-                        tool, model, tool.quant_options[0], dest,
+                        tool, env, model, tool.quant_options[0], dest,
                     )
                     if tool.uses_cuda:
                         self.assertEqual(
@@ -95,8 +92,7 @@ class QuantizeCommandTests(unittest.TestCase):
             env = NativeEnvironment(
                 server_id="llamacpp", name="test", bin_dir=str(root / "build" / "bin"),
             )
-            with patch.object(launch, "_tool_env", return_value=env):
-                cmd, output_dir = launch.build_quantize_cmd(tool, model, "BF16", dest)
+            cmd, output_dir = launch.build_quantize_cmd(tool, env, model, "BF16", dest)
 
             output_file = output_dir / "hf-model.BF16.gguf"
             self.assertEqual(output_dir, Path("/cache/text-generation/hf-model-GGUF-BF16"))
@@ -162,13 +158,12 @@ class QuantizeCommandTests(unittest.TestCase):
             root = Path(tmp)
             dest = Location("test", root / "output")
             with (
-                patch.object(launch, "_tool_env", return_value=env),
                 patch.object(launch, "_LOGS_DIR", root / "logs"),
                 patch.object(launch, "_spawn_with_pty") as spawn,
             ):
                 spawn.return_value = (None, -1)
-                cmd, output = launch.build_quantize_cmd(tool, model, "Q4_K_M", dest, "2,7")
-                _, log, _ = launch.quantize(tool, model, "Q4_K_M", dest, "2,7")
+                cmd, output = launch.build_quantize_cmd(tool, env, model, "Q4_K_M", dest, "2,7")
+                _, log, _ = launch.quantize(tool, env, model, "Q4_K_M", dest, "2,7")
                 self.assertTrue(output.is_dir())
                 command = launch.format_cmd(cmd)
                 self.assertEqual(spawn.call_args.args[0], command)
@@ -180,13 +175,12 @@ class QuantizeCommandTests(unittest.TestCase):
         env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
         dest = Location("test", Path("/cache"))
         with (
-            patch.object(launch, "_tool_env", return_value=env),
             patch.dict(launch._QUANT_BUILDERS, {
                 tool.id: lambda *_: ["/bin/sh", "-c", 'printf %s "$CUDA_VISIBLE_DEVICES"'],
             }),
             patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1"}),
         ):
-            cmd, _ = launch.build_quantize_cmd(tool, model, "Q4_K_M", dest, "2,7")
+            cmd, _ = launch.build_quantize_cmd(tool, env, model, "Q4_K_M", dest, "2,7")
             result = launch.subprocess.run(cmd, check=True, capture_output=True, text=True)
             self.assertEqual(result.stdout, "2,7")
 
@@ -199,7 +193,7 @@ class QuantizePickerTests(unittest.IsolatedAsyncioTestCase):
         self.env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
 
     async def test_destination_picker_confirmation_and_back(self) -> None:
-        picker = screens.QuantizeDestScreen(self.model, self.tool, "Q4_K_M")
+        picker = screens.QuantizeDestScreen(self.model, self.tool, self.env, "Q4_K_M")
         app = PickerApp(picker)
         with (
             patch.object(screens, "LOCATIONS", [self.dest]),
@@ -208,7 +202,6 @@ class QuantizePickerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(screens, "poll_gpus", return_value=[
                 gpu_row(2), gpu_row(4, "unavailable"), gpu_row(7),
             ]),
-            patch.object(launch, "_tool_env", return_value=self.env),
             patch.object(launch, "quantize") as quantize,
         ):
             async with app.run_test(size=(120, 40)) as pilot:
@@ -230,17 +223,34 @@ class QuantizePickerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(confirm, screens.ConfirmQuantize)
                 self.assertIn("CUDA_VISIBLE_DEVICES=7", confirm._description)
                 confirm._proc_factory()
-                quantize.assert_called_once_with(self.tool, self.model, "Q4_K_M", self.dest, "7")
+                quantize.assert_called_once_with(self.tool, self.env, self.model, "Q4_K_M", self.dest, "7")
                 await pilot.press("escape")
                 self.assertIsInstance(app.screen, screens.QuantizeGpuScreen)
                 self.assertEqual(sl.selected, [7])
                 await pilot.press("escape")
                 self.assertIs(app.screen, picker)
 
+    async def test_environment_picker_passes_chosen_environment(self) -> None:
+        stable = NativeEnvironment(server_id="llamacpp", name="stable", bin_dir="/stable", default=True)
+        newer = NativeEnvironment(server_id="llamacpp", name="newer", bin_dir="/newer")
+        picker = screens.QuantizeEnvScreen(self.model, self.tool)
+        app = PickerApp(picker)
+        with (
+            patch.object(launch, "quant_tool_envs", return_value=[newer, stable]),
+            patch.object(screens.ENVIRONMENTS, "default_for", return_value=stable),
+            patch.object(launch, "quant_tool_available", return_value=True),
+            patch.object(NativeEnvironment, "exists", return_value=True),
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                self.assertEqual(picker.query_one("#env-list").cursor_row, 1)
+                await pilot.press("up", "enter")
+                self.assertIsInstance(app.screen, screens.QuantizeOptionScreen)
+                self.assertIs(app.screen._env, newer)
+
     async def test_cpu_conversion_skips_gpu_picker(self) -> None:
         tool = next(tool for tool in QUANTIZATION_TOOLS if tool.id == "llama-hf-to-gguf")
         model = model_for(ModelFormat.SAFETENSORS_BF16)
-        picker = screens.QuantizeDestScreen(model, tool, "F16")
+        picker = screens.QuantizeDestScreen(model, tool, self.env, "F16")
         app = PickerApp(picker)
         with (
             patch.object(screens, "LOCATIONS", [self.dest]),
@@ -253,7 +263,7 @@ class QuantizePickerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(app.screen, screens.ConfirmQuantize)
 
     async def test_missing_gpus_cannot_launch_quantization(self) -> None:
-        picker = screens.QuantizeGpuScreen(self.model, self.tool, "Q4_K_M", self.dest)
+        picker = screens.QuantizeGpuScreen(self.model, self.tool, self.env, "Q4_K_M", self.dest)
         app = PickerApp(picker)
         with patch.object(screens, "poll_gpus", return_value=[gpu_row(4, "unavailable")]):
             async with app.run_test() as pilot:

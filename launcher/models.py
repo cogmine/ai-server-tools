@@ -794,8 +794,9 @@ class QuantizationTool:
     SERVERS.  Only tool-agnostic logic belongs here.
 
     Dependency management fields (populated in data.py):
-      env_server_id     — ServerSoftware.id whose *default* Environment the tool runs from
-                          (e.g. "llamacpp" for llama-quantize, "tabby" for exllamav2).
+      env_server_id     — ServerSoftware.id whose registered Environments can run the tool
+                          (e.g. "llamacpp" for llama-quantize, "tabby" for exllamav2);
+                          the user picks one when several are registered.
       avail_executable  — executable name that must exist in that environment's bin dir.
       avail_script      — script name under the source root above that environment's bin dir.
       avail_module(s)   — Python module(s) that must be importable in the selected interpreter.
@@ -811,7 +812,7 @@ class QuantizationTool:
     output_format: ModelFormat               # the format it produces
     quant_options: tuple[str, ...]           # ordered list of option identifiers
     quant_option_labels: dict[str, str]      # human-readable label per option identifier
-    env_server_id: str = ""                  # server whose default environment provides the tool
+    env_server_id: str = ""                  # server whose environments provide the tool
     cuda_home: str = ""                      # CUDA_HOME override injected at run time (if non-empty)
     avail_executable: str = ""               # executable in the env's bin dir; must exist
     avail_module: str = ""                   # module importable in the env's python

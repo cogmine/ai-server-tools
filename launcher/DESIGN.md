@@ -134,7 +134,7 @@ Describes an offline conversion/requantization tool.  Instance data lives in `da
 | `quant_options` | `tuple[str, ...]` — ordered option identifiers shown in the quant picker |
 | `quant_option_labels` | `dict[str, str]` — human-readable label per option |
 | `cuda_home` | `CUDA_HOME` override injected at run time (non-empty to set) |
-| `env_server_id` | Server whose **default environment** provides the tool (`"llamacpp"` → llama-quantize binary; `"tabby"` → exllamav2 Python) |
+| `env_server_id` | Server whose **environments** can run the tool (`"llamacpp"` → llama-quantize binary; `"tabby"` → exllamav2 Python); chosen per job, default pre-selected |
 | `avail_executable` | Executable that must exist in that environment's bin dir |
 | `avail_module` | Python module that must be importable in that environment |
 | `pip_package` | Package `pip install`ed into that environment by the auto-install prompt; `""` = not auto-installable |
@@ -343,6 +343,8 @@ The App-level `q → quit_app` binding uses `show=False` to prevent duplication 
 ```
 ModelSelectScreen → z
     → (>1 tool) QuantizeToolScreen   — choose tool; skipped when exactly one applies
+    → (>1 env)  QuantizeEnvScreen    — choose the tool's environment; default pre-selected
+    → [QuantToolInstallScreen]       — when the tool is missing from that env and pip-installable
     → QuantizeOptionScreen            — choose quant level / bpw from tool.quant_options
     → QuantizeDestScreen              — choose output destination (LOCATIONS with free space; offline disabled)
     → QuantizeGpuScreen               — choose GPUs exposed to the quantization tool
@@ -482,7 +484,7 @@ Initial tools:
 | `llama-hf-to-gguf` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `GGUF` (`F16` or `BF16`) | `convert_hf_to_gguf.py` in the registered llama.cpp source tree; Python interpreter configured by `llama_convert_python` |
 | `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | default `tabby` environment's Python: `CONFIG.exl2_convert_script` or `-m exllamav2.conversion.convert_exl2` |
 
-Tools use their `env_server_id`'s default environment (`quant_tool_env(tool)`) for binaries and scripts; builders take `(tool, env, model, quant_option, output_path)`. A tool may use a separate configured Python interpreter and declare the modules needed to run its script. Availability is cached per tool, environment location, and interpreter, so switching the default environment or interpreter re-checks it.
+Tools run from one of their `env_server_id`'s registered environments (`quant_tool_envs(tool)`), chosen on `QuantizeEnvScreen` and passed through the flow to `quant_tool_available(tool, env)`, `install_quant_tool(tool, env)`, `build_quantize_cmd(tool, env, …)` and `quantize(tool, env, …)`; builders take `(tool, env, model, quant_option, output_path)`. This lets a newer build (e.g. `llama.cpp-next-patched`) convert architectures the default build lacks. A tool may use a separate configured Python interpreter and declare the modules needed to run its script. Availability is cached per tool, environment location, and interpreter.
 
 Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matching `_build_<id>` builder in `launch.py` registered in `_QUANT_BUILDERS`.
 
@@ -505,7 +507,7 @@ The output directory is shown to the user in `ConfirmQuantize` before they confi
 Follows the same PTY + log structure as `launch()`:
 - Log named `logs/{timestamp}_quantize_{tool.id}_{model.id}_{quant_option}.log`
 - Output directory created before spawn
-- `build_quantize_cmd(tool, model, quant_option, dest, cuda_devices=None)` includes an explicit `env CUDA_VISIBLE_DEVICES=…` prefix and `CUDA_HOME` from `tool.cuda_home` when non-empty. The picker passes its selected devices through confirmation to `quantize()`; non-TUI callers default to `CONFIG.resolved_cuda_devices`. Preview, log, and execution use the same builder.
+- `build_quantize_cmd(tool, env, model, quant_option, dest, cuda_devices=None)` includes an explicit `env CUDA_VISIBLE_DEVICES=…` prefix and `CUDA_HOME` from `tool.cuda_home` when non-empty. The picker passes its selected devices through confirmation to `quantize()`; non-TUI callers default to `CONFIG.resolved_cuda_devices`. Preview, log, and execution use the same builder.
 - Same PTY window-size stamping and bash wrapper
 - On exit code 0, `finalize_quantization()` copies the source's config/tokenizer files (from `ingest.model_metadata_dir()` — the HF directory itself, or the directory beside / one level above a GGUF) into the output, removes EXL2 work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), resolves the first shard of GGUF outputs, and registers the generated model through `ingest_model()`. The entry overrides start from `AIModel.derived_entry_fields()` — model-intrinsic facts and behaviour settings (`_DERIVED_FIELDS` in `models.py` plus `rope_scaling` and `disabled_template_patches`) — so values ingest cannot re-detect (e.g. a GGUF source without `config.json`) or that the user curated survive. Format-, size- and launch-specific fields (note, favorite, status, server params, ctx override, hardware requirements) are not inherited.
 - The launcher then reopens with the generated model focused; failed or interrupted outputs remain on disk for inspection/resume but are not registered

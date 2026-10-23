@@ -623,25 +623,17 @@ _BUILDERS = {
 _tool_avail_cache: dict[tuple[str, ...], bool] = {}
 
 
-def quant_tool_env(tool: QuantizationTool) -> Environment | None:
-    """The environment a quantization tool runs from: its server's default environment."""
-    return ENVIRONMENTS.default_for(tool.env_server_id)
+def quant_tool_envs(tool: QuantizationTool) -> list[Environment]:
+    """The environments a quantization tool can run from: those registered for its server."""
+    return ENVIRONMENTS.for_server(tool.env_server_id)
 
 
-def _tool_env(tool: QuantizationTool) -> Environment:
-    env = quant_tool_env(tool)
-    if env is None:
-        raise ValueError(f"No environment registered for server {tool.env_server_id!r} (needed by {tool.label})")
-    return env
-
-
-def quant_tool_available(tool: QuantizationTool) -> bool:
-    """Return True if the tool's required binary or Python package is present.
+def quant_tool_available(tool: QuantizationTool, env: Environment) -> bool:
+    """Return True if the tool's required binary or Python package is present in *env*.
 
     Result is cached after the first call — safe to call in hot paths.
     """
-    env = quant_tool_env(tool)
-    if env is None or not env.exists():
+    if not env.exists():
         return False
     key = (tool.id, str(env.location), tool.python_executable)
     if key not in _tool_avail_cache:
@@ -673,8 +665,8 @@ def _check_tool_available(tool: QuantizationTool, env: Environment) -> bool:
     return True
 
 
-def install_quant_tool(tool: QuantizationTool) -> tuple[bool, str]:
-    """pip-install the tool's package into its environment and return (success, log_path).
+def install_quant_tool(tool: QuantizationTool, env: Environment) -> tuple[bool, str]:
+    """pip-install the tool's package into *env* and return (success, log_path).
 
     Logs stdout/stderr to /tmp/launcher_install_<id>.log.
     Updates the availability cache on success.
@@ -682,7 +674,6 @@ def install_quant_tool(tool: QuantizationTool) -> tuple[bool, str]:
     """
     if not tool.pip_package:
         return False, ""
-    env = _tool_env(tool)
     log_path = f"/tmp/launcher_install_{tool.id}.log"
     with open(log_path, "w") as f:
         result = subprocess.run(
@@ -815,6 +806,7 @@ _QUANT_BUILDERS: dict[str, Any] = {
 
 def build_quantize_cmd(
     tool: QuantizationTool,
+    env: Environment,
     model: AIModel,
     quant_option: str,
     dest: Location,
@@ -825,7 +817,7 @@ def build_quantize_cmd(
     builder = _QUANT_BUILDERS.get(tool.id)
     if builder is None:
         raise ValueError(f"No command builder registered for quantization tool: {tool.id!r}")
-    cmd = builder(tool, _tool_env(tool), model, quant_option, output_path)
+    cmd = builder(tool, env, model, quant_option, output_path)
     if not tool.uses_cuda:
         return cmd, output_path
     env_cmd = [
@@ -1162,6 +1154,7 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
 
 def quantize(
     tool: QuantizationTool,
+    env: Environment,
     model: AIModel,
     quant_option: str,
     dest: Location,
@@ -1173,12 +1166,12 @@ def quantize(
     the same tee / SIGWINCH / exit-footer machinery in app.py.
     Returns (proc, log_path, master_fd).
     """
-    cmd, output_path = build_quantize_cmd(tool, model, quant_option, dest, cuda_devices)
+    cmd, output_path = build_quantize_cmd(tool, env, model, quant_option, dest, cuda_devices)
 
     # output_path is always a directory — create it before the process starts.
     output_path.mkdir(parents=True, exist_ok=True)
 
-    env = os.environ.copy()
+    proc_env = os.environ.copy()
 
     _LOGS_DIR.mkdir(exist_ok=True)
     safe_quant = quant_option.replace("/", "-")
@@ -1191,6 +1184,7 @@ def quantize(
         f"# date:    {datetime.now().isoformat(timespec='seconds')}\n"
         f"# model:   {model.id}  ({model.format.value}, {model.size_gb} GB)\n"
         f"# tool:    {tool.id}\n"
+        f"# env:     {env.name}  ({env.location})\n"
         f"# option:  {quant_option}\n"
         f"# source:  {model.path}\n"
         f"# output:  {output_path}\n"
@@ -1200,7 +1194,7 @@ def quantize(
         f"# {'─' * 72}\n"
     )
     log_path.write_text(header, encoding="utf-8")
-    proc, master_fd = _spawn_with_pty(format_cmd(cmd), env)
+    proc, master_fd = _spawn_with_pty(format_cmd(cmd), proc_env)
     return proc, log_path, master_fd
 
 

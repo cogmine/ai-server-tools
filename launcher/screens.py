@@ -1642,6 +1642,31 @@ def _fit_markup(estimate: FitEstimate | None, slots: int | None) -> str:
 # Quantize — Screen 1 (optional): choose the quantization tool
 # ---------------------------------------------------------------------------
 
+def _open_quant_tool(screen: Screen, model: AIModel, tool: QuantizationTool) -> None:
+    """Advance the quantize flow once a tool is chosen: [environment] → option."""
+    envs = launcher.quant_tool_envs(tool)
+    if not envs:
+        screen.notify(
+            f"{tool.label} needs a registered {tool.env_server_id} environment",
+            severity="warning", timeout=5,
+        )
+        return
+    if len(envs) > 1:
+        screen.app.push_screen(QuantizeEnvScreen(model, tool))
+        return
+    _continue_quantize(screen, model, tool, envs[0])
+
+
+def _continue_quantize(screen: Screen, model: AIModel, tool: QuantizationTool, env: Environment) -> None:
+    """Advance the quantize flow once tool + environment are chosen: [install] → option."""
+    if launcher.quant_tool_available(tool, env):
+        screen.app.push_screen(QuantizeOptionScreen(model, tool, env))
+    elif tool.pip_package and env.exists():
+        screen.app.push_screen(QuantToolInstallScreen(model, tool, env))
+    else:
+        screen.notify(tool.install_note or f"{tool.label} is not available in {env.name}.", timeout=8)
+
+
 class QuantizeToolScreen(DataTableScreen):
     """Select which conversion or quantization tool to use.
 
@@ -1670,23 +1695,100 @@ class QuantizeToolScreen(DataTableScreen):
         table = DataTable(id="tool-list", cursor_type="row", show_header=False)
         table.add_column("Tool", key="label")
         for t in self._tools:
-            label = t.label if launcher.quant_tool_available(t) else f"{t.label}  [dim](not installed)[/]"
+            installed = any(launcher.quant_tool_available(t, e) for e in launcher.quant_tool_envs(t))
+            label = t.label if installed else f"{t.label}  [dim](not installed)[/]"
             table.add_row(label)
         yield table
         yield Footer()
 
     def action_dt_select(self) -> None:
         idx = self.query_one("#tool-list", DataTable).cursor_row
-        if not (0 <= idx < len(self._tools)):
-            return
-        tool = self._tools[idx]
-        if not launcher.quant_tool_available(tool):
-            if tool.pip_package:
-                self.app.push_screen(QuantToolInstallScreen(self._model, tool))
-            else:
-                self.notify(tool.install_note or f"{tool.label} is not available.", timeout=8)
-            return
-        self.app.push_screen(QuantizeOptionScreen(self._model, tool))
+        if 0 <= idx < len(self._tools):
+            _open_quant_tool(self, self._model, self._tools[idx])
+
+    @on(DataTable.RowSelected)
+    def on_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.action_dt_select()
+
+
+# ---------------------------------------------------------------------------
+# Quantize — Screen 1b (optional): choose the tool's environment
+# ---------------------------------------------------------------------------
+
+class QuantizeEnvScreen(DataTableScreen):
+    """Choose which registered environment (build / conda env) runs the tool.
+
+    Only pushed when the tool's server has more than one environment, so a newer
+    build can convert architectures the default one does not support yet.
+    The cursor starts on the default environment.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("q",             "quit_app",       "Quit"),
+        Binding("escape,b",      "app.pop_screen", "Back",   key_display="esc/←"),
+        Binding("e",             "manage_envs",    "Environments"),
+        Binding("f5",            "dt_select",      "Select", key_display="↵/→/dbl-click"),
+    ]
+
+    def __init__(self, model: AIModel, tool: QuantizationTool) -> None:
+        super().__init__()
+        self._model = model
+        self._tool  = tool
+        self._server = next((s for s in SERVERS if s.id == tool.env_server_id), None)
+        self._envs: list[Environment] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Label(
+            f"[bold]Select environment for:[/]  {self._tool.label}  ·  {self._model.name}",
+            id="screen-title",
+        )
+        table = DataTable(id="env-list", cursor_type="row", show_header=False)
+        table.add_column("", key="default")
+        table.add_column("Environment", key="env")
+        table.add_column("", key="avail")
+        table.add_column("Note", key="note")
+        yield table
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._populate()
+        default = ENVIRONMENTS.default_for(self._tool.env_server_id)
+        idx = next((i for i, e in enumerate(self._envs) if e is default), 0)
+        self.query_one("#env-list", DataTable).move_cursor(row=idx)
+
+    def on_screen_resume(self) -> None:
+        self._populate()
+
+    def _populate(self) -> None:
+        table = self.query_one("#env-list", DataTable)
+        saved_row = table.cursor_row
+        table.clear()
+        self._envs = launcher.quant_tool_envs(self._tool)
+        for env in self._envs:
+            available = launcher.quant_tool_available(self._tool, env)
+            table.add_row(
+                "[yellow]★[/]" if env.default else "",
+                _env_brief(self._server, env) if self._server else env.name,
+                "" if available or not env.exists() else "[dim](tool not installed)[/]",
+                f"[dim]{env.note}[/]",
+                key=env.name,
+            )
+        table.move_cursor(row=min(saved_row, max(0, len(self._envs) - 1)))
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "manage_envs":
+            return self._server is not None
+        return True
+
+    def action_manage_envs(self) -> None:
+        if self._server is not None:
+            self.app.push_screen(EnvManageScreen(self._server))
+
+    def action_dt_select(self) -> None:
+        idx = self.query_one("#env-list", DataTable).cursor_row
+        if 0 <= idx < len(self._envs):
+            _continue_quantize(self, self._model, self._tool, self._envs[idx])
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -1701,7 +1803,7 @@ class QuantToolInstallScreen(ButtonMenuScreen):
     """Offer to auto-install a missing quantization tool dependency.
 
     Used when a tool declares a pip_package (e.g. exllamav2), installed into the
-    tool's environment (the default environment of tool.env_server_id).
+    chosen environment.
     The install runs in a background thread so the TUI remains responsive.
     On success the screen pops itself and pushes QuantizeOptionScreen.
     """
@@ -1712,16 +1814,16 @@ class QuantToolInstallScreen(ButtonMenuScreen):
         Binding("enter,right",   "press_focused",   "Install", key_display="↵/→/Space"),
     ]
 
-    def __init__(self, model: AIModel, tool: QuantizationTool) -> None:
+    def __init__(self, model: AIModel, tool: QuantizationTool, env: Environment) -> None:
         super().__init__()
         self._model = model
         self._tool  = tool
+        self._env   = env
         self._installing = False
 
     def compose(self) -> ComposeResult:
         pkg = self._tool.pip_package or "(unknown)"
-        env = launcher.quant_tool_env(self._tool)
-        env_name = env.name if env is not None else f"(no {self._tool.env_server_id} environment)"
+        env_name = self._env.name
         yield Header()
         yield Vertical(
             Static(
@@ -1763,14 +1865,14 @@ class QuantToolInstallScreen(ButtonMenuScreen):
 
     @work(thread=True)
     def _run_install(self) -> None:
-        success, log_path = launcher.install_quant_tool(self._tool)
+        success, log_path = launcher.install_quant_tool(self._tool, self._env)
         self.call_from_thread(self._on_install_done, success, log_path)  # type: ignore[attr-defined]
 
     def _on_install_done(self, success: bool, log_path: str) -> None:
         self._installing = False
         if success:
-            self.app.pop_screen()  # back to QuantizeToolScreen
-            self.app.push_screen(QuantizeOptionScreen(self._model, self._tool))
+            self.app.pop_screen()
+            self.app.push_screen(QuantizeOptionScreen(self._model, self._tool, self._env))
         else:
             self.query_one("#install-text", Static).update(
                 "[red bold]Installation failed.[/]\n"
@@ -1793,17 +1895,18 @@ class QuantizeOptionScreen(DataTableScreen):
         Binding("f5",            "dt_select",      "Select", key_display="↵/→/dbl-click"),
     ]
 
-    def __init__(self, model: AIModel, tool: QuantizationTool) -> None:
+    def __init__(self, model: AIModel, tool: QuantizationTool, env: Environment) -> None:
         super().__init__()
         self._model = model
         self._tool  = tool
+        self._env   = env
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Label(
             f"[bold]Select output format / quantization for:[/]  "
             f"{self._model.name}  ·  [dim]{self._model.format_tag}[/]"
-            f"  →  [dim]{self._tool.label}[/]",
+            f"  →  [dim]{self._tool.label} ({self._env.name})[/]",
             id="screen-title",
         )
         table = DataTable(id="option-list", cursor_type="row", show_header=False)
@@ -1818,7 +1921,7 @@ class QuantizeOptionScreen(DataTableScreen):
         if not (0 <= idx < len(self._tool.quant_options)):
             return
         quant_option = self._tool.quant_options[idx]
-        self.app.push_screen(QuantizeDestScreen(self._model, self._tool, quant_option))
+        self.app.push_screen(QuantizeDestScreen(self._model, self._tool, self._env, quant_option))
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -1862,10 +1965,13 @@ class QuantizeDestScreen(ButtonMenuScreen):
         Binding("enter,right",   "press_focused",  "Select", key_display="↵/→/Space"),
     ]
 
-    def __init__(self, model: AIModel, tool: QuantizationTool, quant_option: str) -> None:
+    def __init__(
+        self, model: AIModel, tool: QuantizationTool, env: Environment, quant_option: str,
+    ) -> None:
         super().__init__()
         self._model        = model
         self._tool         = tool
+        self._env          = env
         self._quant_option = quant_option
 
     def compose(self) -> ComposeResult:
@@ -1902,11 +2008,11 @@ class QuantizeDestScreen(ButtonMenuScreen):
             mount = LOCATIONS[int(bid.rsplit("-", 1)[-1])]
             if self._tool.uses_cuda:
                 self.app.push_screen(
-                    QuantizeGpuScreen(self._model, self._tool, self._quant_option, mount)
+                    QuantizeGpuScreen(self._model, self._tool, self._env, self._quant_option, mount)
                 )
             else:
                 _push_quantize_confirmation(
-                    self.app, self._model, self._tool, self._quant_option, mount, None,
+                    self.app, self._model, self._tool, self._env, self._quant_option, mount, None,
                 )
 
 
@@ -1914,13 +2020,14 @@ def _push_quantize_confirmation(
     app: App,
     model: AIModel,
     tool: QuantizationTool,
+    env: Environment,
     quant_option: str,
     dest: Location,
     cuda_devices: str | None,
 ) -> None:
     try:
         cmd, output_path = launcher.build_quantize_cmd(
-            tool, model, quant_option, dest, cuda_devices,
+            tool, env, model, quant_option, dest, cuda_devices,
         )
     except (ValueError, OSError) as e:
         app.notify(str(e), severity="error", timeout=5)
@@ -1928,8 +2035,8 @@ def _push_quantize_confirmation(
     app.push_screen(
         ConfirmQuantize(
             launcher.format_cmd(cmd),
-            lambda t=tool, m=model, q=quant_option, d=dest, devices=cuda_devices:
-                launcher.quantize(t, m, q, d, devices),
+            lambda t=tool, e=env, m=model, q=quant_option, d=dest, devices=cuda_devices:
+                launcher.quantize(t, e, m, q, d, devices),
             model,
             tool,
             quant_option,
@@ -1942,11 +2049,13 @@ class QuantizeGpuScreen(GpuSelectionScreen):
     """Choose devices for an offline quantization job before confirmation."""
 
     def __init__(
-        self, model: AIModel, tool: QuantizationTool, quant_option: str, dest: Location,
+        self, model: AIModel, tool: QuantizationTool, env: Environment,
+        quant_option: str, dest: Location,
     ) -> None:
         super().__init__(f"{tool.label}  ·  {model.name}")
         self._model = model
         self._tool = tool
+        self._env = env
         self._quant_option = quant_option
         self._dest = dest
 
@@ -1957,7 +2066,7 @@ class QuantizeGpuScreen(GpuSelectionScreen):
             return
         cuda_devices = ",".join(str(i) for i in selected)
         _push_quantize_confirmation(
-            self.app, self._model, self._tool, self._quant_option, self._dest, cuda_devices,
+            self.app, self._model, self._tool, self._env, self._quant_option, self._dest, cuda_devices,
         )
 
 
@@ -2402,14 +2511,7 @@ class ModelSelectScreen(DataTableScreen):
             self.notify("No quantization tools available for this format", timeout=3)
             return
         if len(applicable) == 1:
-            tool = applicable[0]
-            if not launcher.quant_tool_available(tool):
-                if tool.pip_package:
-                    self.app.push_screen(QuantToolInstallScreen(model, tool))
-                else:
-                    self.notify(tool.install_note or f"{tool.label} is not available.", timeout=8)
-                return
-            self.app.push_screen(QuantizeOptionScreen(model, tool))
+            _open_quant_tool(self, model, applicable[0])
         else:
             self.app.push_screen(QuantizeToolScreen(model, applicable))
 

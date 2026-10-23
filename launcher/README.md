@@ -105,7 +105,7 @@ Press `e` on the server list or the environment picker to **manage environments*
 | `c` | Create the focused environment when it is missing on disk |
 | `r` | Rename — renames the conda env itself (`conda rename`) and carries its test results over |
 | `d` | Unregister — optionally also deletes the conda env (`conda env remove`); its test results are removed |
-| `s` | Make the focused environment the default (pre-selected at launch; used by quantization tools) |
+| `s` | Make the focused environment the default (pre-selected at launch and for quantization tools) |
 | `n` | Edit the note shown beside the environment |
 
 Conda operations run in the TUI with live output. Upgrading packages inside an environment is done by hand (e.g. `conda activate vllm-next && pip install -U vllm`); the launcher picks up the new version automatically. For vLLM, a pip-bundled CUDA toolkit (`nvidia/cu13/`) is detected per environment and wired into `CUDA_HOME` / library paths at launch.
@@ -375,10 +375,11 @@ Press `z` on any model in the model list to start a conversion or quantization j
 
 **Flow:**
 1. If more than one tool supports the model's format, pick a tool. Otherwise this step is skipped.
-2. Pick a target quant level (e.g. Q4_K_M for GGUF re-quantization, F16/BF16 for HF-to-GGUF conversion, or 4.0 bpw for EXL2).
-3. Pick an output destination — one of the configured `[[locations]]`, with current free space shown (offline locations are disabled).
-4. For CUDA quantizers, choose the GPUs to expose to the tool. The list shows current VRAM usage; all available GPUs start selected. Use Space to toggle a GPU, `a` to select all, and Enter / `→` to continue. At least one GPU must be selected; if GPU polling is unavailable, return and retry after restoring it. CPU-only converters skip this step.
-5. Review the full command and output path, then confirm. For CUDA tools, the command includes `CUDA_VISIBLE_DEVICES`; Back returns to the GPU picker with your selection intact.
+2. If the tool's server has more than one registered environment, pick the one to run it from (the default is pre-selected; `e` manages environments). Use a newer llama.cpp build to convert architectures the default build does not support yet.
+3. Pick a target quant level (e.g. Q4_K_M for GGUF re-quantization, F16/BF16 for HF-to-GGUF conversion, or 4.0 bpw for EXL2).
+4. Pick an output destination — one of the configured `[[locations]]`, with current free space shown (offline locations are disabled).
+5. For CUDA quantizers, choose the GPUs to expose to the tool. The list shows current VRAM usage; all available GPUs start selected. Use Space to toggle a GPU, `a` to select all, and Enter / `→` to continue. At least one GPU must be selected; if GPU polling is unavailable, return and retry after restoring it. CPU-only converters skip this step.
+6. Review the full command and output path, then confirm. For CUDA tools, the command includes `CUDA_VISIBLE_DEVICES`; Back returns to the GPU picker with your selection intact.
 
 The TUI temporarily exits while the conversion runs in your terminal with live output, and the log is written to `logs/`. Outputs are placed under the AI-type subdirectory of the chosen location (for example, `~/fast_models/text-generation/`). After a successful conversion, the launcher copies the source's config/tokenizer files beside the output, removes EXL2 resumable work files, adds the generated model to `user_data/models_local.json`, and reopens with that model focused. The new entry joins the source's family and inherits its model facts and behaviour settings — context, parameter count, architecture, MoE layout, vision companion (`mmproj`) and MTP head, tool-call parser, YaRN scaling and disabled chat-template patches — but not its note, favorite pin, test results, server parameters or context override, which depend on the format and size. Failed or interrupted outputs retain their work files and are not added to the catalog.
 
@@ -386,12 +387,12 @@ The TUI temporarily exits while the conversion runs in your terminal with live o
 
 | Tool | Converts | Prerequisite | Auto-install? |
 |---|---|---|---|
-| `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level) | llama.cpp built binary — co-located with `llama-server` in the default llama.cpp environment. No extra install if llama.cpp is set up. | No (requires building llama.cpp with CUDA) |
+| `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level) | llama.cpp built binary — co-located with `llama-server` in the chosen llama.cpp environment. No extra install if llama.cpp is set up. | No (requires building llama.cpp with CUDA) |
 | `llama-hf-to-gguf` | BF16 / FP16 safetensors or PyTorch `.bin` → F16 / BF16 GGUF | `convert_hf_to_gguf.py` in the registered llama.cpp source tree and `llama_convert_python` with PyTorch, Transformers, and NumPy. Conversion runs on CPU; it does not need GPUs. Only architectures supported by that llama.cpp converter work; vision models are excluded because their separate projector is not converted by this workflow. | No |
-| `exl2-convert` | BF16 / FP16 / BIN safetensors → EXL2 | `exllamav2` Python package in the default tabbyAPI environment. Already present if tabbyAPI is set up. If missing, the launcher offers to `pip install exllamav2` automatically (uses JIT CUDA compilation — no CUDA toolkit needed at install time). | **Yes** — press Enter in the install prompt |
+| `exl2-convert` | BF16 / FP16 / BIN safetensors → EXL2 | `exllamav2` Python package in the chosen tabbyAPI environment. Already present if tabbyAPI is set up. If missing, the launcher offers to `pip install exllamav2` automatically (uses JIT CUDA compilation — no CUDA toolkit needed at install time). | **Yes** — press Enter in the install prompt |
 
 ### Adding a quantization tool
 
 1. Add a `QuantizationTool(...)` entry to `QUANTIZATION_TOOLS` in `data.py`.
-2. Write `_build_<id>(tool, env, model, quant_option, output_path) → list[str]` in `launch.py` (`env` is the default environment of the tool's `env_server_id`).
+2. Write `_build_<id>(tool, env, model, quant_option, output_path) → list[str]` in `launch.py` (`env` is the environment chosen for the tool's `env_server_id`).
 3. Register it in `_QUANT_BUILDERS`.

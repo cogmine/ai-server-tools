@@ -460,12 +460,12 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             GGUFQuant.Q8_0.value:   "Q8_0   (~8.5 bpw) ← reference",
         },
         # llama-quantize is a binary co-located with llama-server (same llama.cpp build).
-        # No separate installation is needed — it runs from the default llamacpp
+        # No separate installation is needed — it runs from a registered llamacpp
         # environment, so if llama.cpp is set up this tool is available.
         env_server_id="llamacpp",
         avail_executable="llama-quantize",
         install_note=(
-            "llama-quantize not found in the default llama.cpp environment. "
+            "llama-quantize not found in the llama.cpp environment. "
             "Build llama.cpp with CUDA support and register its bin/ directory as a "
             "llama.cpp environment — llama-quantize is built alongside llama-server."
         ),

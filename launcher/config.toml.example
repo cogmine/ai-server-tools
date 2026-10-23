@@ -39,6 +39,8 @@ exl2_convert_script = "~/exllamav2/convert.py"
 
 # Python interpreter with PyTorch and Transformers for llama.cpp's
 # convert_hf_to_gguf.py. Defaults to the Python running the launcher.
+# A dedicated env keeps server envs' pins out of the way: new architectures
+# often need a newer Transformers than a server env can take.
 llama_convert_python = ""
 
 # CUDA_HOME injected when launching tabbyAPI (needed for flash-attn)
