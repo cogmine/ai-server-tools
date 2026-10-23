@@ -2,7 +2,7 @@
 
 Subcommands:
   copy-configs <scan_root> [--dry-run]
-      Scan scan_root (and configured cache mount subdirs) for GGUF bundle
+      Scan scan_root (and the same directory under other storage locations) for GGUF bundle
       directories that lack a config.json.  For each, search for a matching
       original (non-GGUF) model and copy its config/tokenizer files across.
       Run this before ingesting a new GGUF bundle so that 'ingest' can read
@@ -47,9 +47,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from launcher.config import CONFIG
-from launcher.gguf_header import embedded_mtp_layers, read_gguf_metadata
+from launcher.gguf_header import arch_int, embedded_mtp_layers, read_gguf_metadata
 from launcher.models import GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info
+from launcher.storage import LOCATIONS, METADATA_FILES, location_of, model_metadata_dir, relocated_entry
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -57,21 +57,6 @@ from launcher.models import GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_sp
 
 _CATALOG_PATH = Path(__file__).parent / "user_data" / "models_local.json"
 
-# Config / tokenizer files to copy from an original model dir to its GGUF bundle dir
-_CONFIG_FILES = [
-    "config.json",
-    "tokenizer_config.json",
-    "tokenizer.json",
-    "tokenizer.model",
-    "special_tokens_map.json",
-    "generation_config.json",
-    "vocab.json",
-    "merges.txt",
-    # transformers >= 4.55 ships the chat template as a standalone file rather
-    # than embedding it in tokenizer_config.json; .json is the older multimodal form.
-    "chat_template.jinja",
-    "chat_template.json",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -721,19 +706,19 @@ def _ctx_from_gguf_siblings(gguf_path: Path, catalog: dict[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 
 def _all_roots(scan_root: Path) -> list[Path]:
-    """Return scan_root plus cache mount subdirs mirroring the same leaf directory.
+    """Return scan_root plus the same leaf directory under every other storage location.
 
     For example, if scan_root is /mnt/nas/ai_models/text-generation, also
     includes ~/fast_models/text-generation, /mnt/sda1/models/text-generation,
-    etc. from configured cache mounts.
+    etc. from the configured locations.
     """
     roots: list[Path] = []
     if scan_root.exists():
         roots.append(scan_root)
     subdir = scan_root.name  # e.g. "text-generation"
-    for mount in CONFIG.cache_mounts:
-        candidate = Path(mount.root) / subdir
-        if candidate.exists():
+    for loc in LOCATIONS:
+        candidate = loc.root / subdir
+        if candidate.exists() and candidate not in roots:
             roots.append(candidate)
     return roots
 
@@ -834,7 +819,7 @@ def _copy_missing_configs(src_dir: Path, dst_dir: Path, dry_run: bool) -> list[s
     Returns a list of filenames that were (or would be, in dry-run) copied.
     """
     copied: list[str] = []
-    for filename in _CONFIG_FILES:
+    for filename in METADATA_FILES:
         src = src_dir / filename
         dst = dst_dir / filename
         if src.exists() and not dst.exists():
@@ -855,7 +840,7 @@ def copy_model_metadata(src_dir: Path, dst_dir: Path) -> list[str]:
 def do_copy_configs(scan_root: Path, dry_run: bool) -> None:
     """Copy config files from original model dirs into their GGUF bundle directories.
 
-    Scans scan_root and all cache mount subdirs mirroring the same leaf directory.
+    Scans scan_root and the same leaf directory under every other storage location.
     For each directory that contains .gguf files and lacks a config.json, derives
     the original model name, locates it in any root, and copies the recognised
     config/tokenizer files.
@@ -930,7 +915,7 @@ def _find_mtp(bundle_root: Path, quant: str) -> Path | None:
 def do_copy_mmproj(scan_root: Path, dry_run: bool) -> None:
     """Copy mmproj files from original model dirs into their GGUF bundle directories.
 
-    Scans scan_root and cache mount subdirs for GGUF bundle directories that
+    Scans scan_root and the same directory under other storage locations for GGUF bundle directories that
     lack an mmproj-*.gguf file.  For each, searches for a matching original
     model directory and copies its mmproj file into the bundle root.
     """
@@ -1003,8 +988,9 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
 
     If the parent directory contains a config.json (e.g. copied from the
     original model by the copy-configs subcommand), it is used to populate
-    ctx and note accurately.  Otherwise ctx falls back to borrowing from a
-    sibling entry already in the catalog.
+    ctx and note accurately.  Otherwise ctx and MoE counts come from the GGUF
+    header (ctx falling back to a sibling catalog entry), and vision is inferred
+    from an mmproj file in the bundle.
     """
     quant = _extract_gguf_quant(gguf_path.name)
 
@@ -1037,13 +1023,14 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     if entry_id in _id_to_path and _id_to_path[entry_id] != str(gguf_path):
         entry_id = f"{entry_id}-gguf"
 
-    # Use config.json from the GGUF bundle dir if available (placed by copy-configs).
-    # For per-quant-subdir layout (bundle_root/QUANTNAME/file.gguf), parent is the quant
-    # subdir and config.json lives in the bundle root — walk up one extra level if needed.
-    cfg = _read_hf_config(parent)
-    if not cfg:
-        # parent may be a quant subdir; try bundle root one level up
-        cfg = _read_hf_config(parent.parent)
+    try:
+        header = read_gguf_metadata(gguf_path)
+    except (OSError, ValueError) as exc:
+        print(f"[ingest] Warning: could not read GGUF header: {exc}", file=sys.stderr)
+        header = {}
+
+    # Use config.json from the GGUF bundle (placed by copy-configs or a conversion).
+    cfg = _read_hf_config(model_metadata_dir(gguf_path))
     if cfg:
         ctx           = _detect_ctx(cfg)
         params_m      = _detect_params_m(cfg, gguf_path.stem)
@@ -1052,22 +1039,21 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
         vision        = _detect_vision(cfg)
         trust_rc      = _detect_trust_remote_code(cfg)
     else:
-        ctx           = _ctx_from_gguf_siblings(gguf_path, catalog)
+        # Without config.json the GGUF header is the best source; arch stays empty because
+        # the catalog records HF architecture class names, which GGUF does not carry.
+        ctx           = arch_int(header, "context_length") or _ctx_from_gguf_siblings(gguf_path, catalog)
         params_m      = _detect_params_m({}, gguf_path.stem)
         arch          = ""
-        moe_experts   = moe_active = 0
-        vision        = False
+        moe_experts   = arch_int(header, "expert_count")
+        moe_active    = arch_int(header, "expert_used_count")
+        vision        = _find_mmproj(parent) is not None
         trust_rc      = False
 
     # Only search for an mmproj file when this is a vision model — non-vision GGUFs
     # never have one, and glob() on slow storage is expensive at catalog-refresh scale.
     mmproj_path = (_find_mmproj(parent) or _find_mmproj(parent.parent)) if vision else None
     mtp_path = _find_mtp(parent, quant) or _find_mtp(parent.parent, quant)
-    try:
-        mtp_embedded = embedded_mtp_layers(read_gguf_metadata(gguf_path)) > 0
-    except (OSError, ValueError) as exc:
-        print(f"[ingest] Warning: could not read GGUF header: {exc}", file=sys.stderr)
-        mtp_embedded = False
+    mtp_embedded = embedded_mtp_layers(header) > 0
 
     entry: dict[str, Any] = {
         "id": entry_id,
@@ -1237,11 +1223,53 @@ def detect_image_gen(path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Entry construction
+# ---------------------------------------------------------------------------
+
+def _copy_source(path: Path, fmt: str | None, catalog: dict[str, Any]) -> dict[str, Any] | None:
+    """The catalog entry *path* is a copy of: same relative path (and format) at another location."""
+    loc = location_of(path)
+    if loc is None:
+        return None
+    rel = path.relative_to(loc.root)
+    for entry in catalog.get("models", []):
+        other = location_of(entry["path"])
+        if other is None or other.root == loc.root:
+            continue
+        if Path(entry["path"]).relative_to(other.root) == rel and fmt in (None, entry["format"]):
+            return entry
+    return None
+
+
+def build_entry(
+    path: Path, catalog: dict[str, Any], ai_type: str = "text_gen", fmt: str | None = None,
+) -> dict[str, Any]:
+    """Catalog entry for the model at *path*.
+
+    A copy of a catalogued model (same relative path at another location) becomes
+    a snapshot of that entry, sharing its id and family.  Anything else is detected
+    from disk and starts a new family named after it.  Raises ValueError when
+    detection fails.
+    """
+    original = _copy_source(path, fmt, catalog)
+    if original is not None:
+        loc = location_of(path)
+        assert loc is not None
+        return relocated_entry(original, loc)
+    if ai_type == "image_gen":
+        entry = detect_image_gen(path, catalog)
+    else:
+        entry = detect_text_gen(path, catalog, fmt=fmt)
+    entry["family"] = _slugify(entry["name"])
+    return entry
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 # Fields that refresh can update — all are auto-detected from disk / config.json.
-# User-curated fields (note, name, format, id, path, cached_path, ctx_override,
+# User-curated fields (note, name, format, id, path, family, ctx_override,
 # favorite, server_status, server_params, min_sm, hw_note, comfyui_subdir,
 # quant, trust_remote_code) are never touched by refresh.
 _REFRESHABLE_FIELDS: frozenset[str] = frozenset({
@@ -1396,10 +1424,7 @@ def _ingest_one(
     GGUF files and image-gen entries.
     """
     try:
-        if ai_type == "image_gen":
-            entry = detect_image_gen(path, catalog)
-        else:
-            entry = detect_text_gen(path, catalog, fmt=fmt)
+        entry = build_entry(path, catalog, ai_type, fmt)
     except ValueError as exc:
         print(f"[ingest] Skipping {path}: {exc}", file=sys.stderr)
         return False
@@ -1436,10 +1461,7 @@ def ingest_model(
             if entry.get("path") == str(path) and entry.get("format") == fmt:
                 return entry
 
-    if ai_type == "image_gen":
-        entry = detect_image_gen(path, catalog)
-    else:
-        entry = detect_text_gen(path, catalog, fmt=fmt)
+    entry = build_entry(path, catalog, ai_type, fmt)
     if entry_overrides:
         entry.update(entry_overrides)
 
@@ -1513,7 +1535,7 @@ def main() -> None:
         help="Re-detect auto-derived fields (ctx, size_gb, params_m, arch, moe, vision) for existing entries.",
         description=(
             "Re-runs detection on catalogued model paths and updates auto-derived fields\n"
-            "without touching user-curated fields (id, name, format, cached_path,\n"
+            "without touching user-curated fields (id, name, format, family,\n"
             "ctx_override, favorite, server_status, server_params, min_sm, hw_note, etc.)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

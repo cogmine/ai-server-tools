@@ -99,8 +99,8 @@ def _read_template(path: str, mtime_ns: int) -> str | None:
 
 
 def read_chat_template(model: AIModel) -> str | None:
-    """The chat template the server would use for *model* (fastest copy), or None if absent/unreadable."""
-    root = Path(model.resolve_path())
+    """The chat template the server would use for *model*, or None if absent/unreadable."""
+    root = Path(model.path)
     if root.is_file():
         candidates = [root] if root.suffix == ".gguf" else []
     else:

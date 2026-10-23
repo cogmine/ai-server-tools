@@ -10,6 +10,6 @@ applyTo: "**"
 - **CUDA**: version (PyTorch); any nvcc version notes
 - **GPU compute**: sm_XX — any capability notes
 - **RAM**: NNN GB
-- **Storage**: describe your storage layout; all paths configured in `user_data/config.toml`
-   - /path/to/fast/models/    Fast storage — active working set; preferred cache
-   - /path/to/slow/models/    Slow storage — secondary cache or master copy
+- **Storage**: describe your storage locations; all configured as `[[locations]]` in `user_data/config.toml`
+   - /path/to/fast/models/    Fast storage — active working set
+   - /path/to/slow/models/    Slow / network storage — large library

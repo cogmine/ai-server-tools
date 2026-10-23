@@ -56,7 +56,6 @@ from launcher.models import (
     AIModel,
     AIType,
     AI_TYPE_LABELS,
-    CacheMount,
     FORMAT_SHORT,
     ModelFormat,
     QuantizationTool,
@@ -74,11 +73,13 @@ from launcher.models import (
     tools_for_model,
     uses_hub_flow,
 )
-from launcher.data import AI_MODELS, CACHE_MOUNTS, QUANTIZATION_TOOLS, SERVERS
+from launcher.data import AI_MODELS, QUANTIZATION_TOOLS, SERVERS
 from launcher.chat_template import available_patches
 from launcher.environments import ENVIRONMENTS, Environment, env_kind
 from launcher.fit import FitEstimate, estimate_fit, fit_probe_for
 import launcher.launch as launcher
+from launcher.storage import LOCATIONS, Location, location_of, model_size_gb, plan_deletion
+import launcher.storage as storage
 
 
 STATUS_COLOR: dict[str, str] = {
@@ -123,14 +124,23 @@ _STATUS_RANK: dict[str, int] = {
 #   • Scalars (size, params, ctx, moe): ascending = smallest first.
 #   • Boolean flags (fav, vision, trc):  expressed as `0 if flag else 1` so
 #       ascending (the default) puts flagged/"interesting" rows at the top.
-#   • Cache: tuple (priority, label) — cached rows (0, ...) before uncached
-#       (1, ""); cached entries sub-sorted A–Z by mount label.
+#   • Location: index in [[locations]] order; paths outside every location last.
 #   • Text (name, format, note): lower-cased string, A–Z ascending.
 #
 # "warn" is intentionally absent: it is a derived visual icon whose
 # underlying signals (model size vs VRAM, min_sm) are already captured by
 # the "size" and "format" columns.
 # ---------------------------------------------------------------------------
+def _location_rank(model: "AIModel") -> int:
+    loc = location_of(model.path)
+    return LOCATIONS.index(loc) if loc is not None else len(LOCATIONS)
+
+
+def _row_key(model: "AIModel") -> str:
+    """DataTable row key: the catalog key (ids are shared by copies)."""
+    return "\0".join(model.key)
+
+
 _SORT_KEY: dict[str, Callable[["AIModel"], Any]] = {
     "fav":    lambda m: 0 if m.favorite          else 1,
     "name":   lambda m: m.name.lower(),
@@ -145,7 +155,7 @@ _SORT_KEY: dict[str, Callable[["AIModel"], Any]] = {
     "vision": lambda m: 0 if m.vision            else 1,
     "trc":    lambda m: 0 if m.trust_remote_code else 1,
     "tool":   lambda m: 0 if m.tool_call_parser    else 1,
-    "cache":  lambda m: (0, c.label) if (c := m.cached_in(CACHE_MOUNTS)) is not None else (1, ""),
+    "location": lambda m: _location_rank(m),
     "note":   lambda m: m.note.lower(),
 }
 
@@ -449,7 +459,7 @@ class ServerSelectScreen(DataTableScreen):
 
         if model is not None:
             # Validate model path exists before trying to launch
-            eff_path = model.resolve_path()
+            eff_path = model.path
             p = Path(eff_path)
             exists = p.is_file() if model.format == ModelFormat.GGUF else p.is_dir()
             if not exists:
@@ -1813,11 +1823,35 @@ class QuantizeOptionScreen(DataTableScreen):
 
 
 # ---------------------------------------------------------------------------
-# Quantize — Screen 3: choose output destination (cache mount)
+# Quantize — Screen 3: choose output destination (storage location)
 # ---------------------------------------------------------------------------
 
+def _location_button(loc: Location, button_id: str, need_gb: float, detail: str = "") -> Button:
+    """A destination button for *loc* showing free space; disabled while offline."""
+    if not loc.online:
+        return Button(f"{loc.title}  [dim](offline)[/]", id=button_id, disabled=True)
+    total, free = loc.disk_info()
+    fits = need_gb <= free if need_gb else True
+    fit_color = "green" if fits else "red"
+    need = f"need {need_gb:.0f} GB  ·  " if need_gb else ""
+    prefix = f"{detail}  ·  " if detail else ""
+    return Button(
+        f"{loc.title}  [dim]({prefix}{need}[{fit_color}]{free:.0f} GB free[/]  ·  {total:.0f} GB total)[/]",
+        id=button_id,
+        variant="primary" if fits else "default",
+    )
+
+
+def _focus_first_enabled(screen: Screen, selector: str) -> None:
+    def _focus() -> None:
+        enabled = [b for b in screen.query(selector) if not b.disabled]
+        if enabled:
+            enabled[0].focus()
+    screen.call_after_refresh(_focus)
+
+
 class QuantizeDestScreen(ButtonMenuScreen):
-    """Select which local storage mount to write the generated output to."""
+    """Select which storage location to write the generated output to."""
 
     BINDINGS: ClassVar = [
         Binding("q",             "quit_app",       "Quit"),
@@ -1846,22 +1880,15 @@ class QuantizeDestScreen(ButtonMenuScreen):
 
     def _build_buttons(self) -> None:
         ops = self.query_one("#dest-ops", Vertical)
-        for mount in sorted(CACHE_MOUNTS, key=lambda m: m.priority):
-            total, free = launcher.cache_disk_info(mount)
-            fits = self._model.size_gb <= free if self._model.size_gb else True
-            fit_color = "green" if fits else "red"
+        for idx, loc in enumerate(LOCATIONS):
             output_path = launcher.compute_quant_output_path(
-                self._tool, self._model, self._quant_option, mount,
+                self._tool, self._model, self._quant_option, loc,
             )
-            ops.mount(Button(
-                f"{mount.label}  "
-                f"[dim](output: {output_path.name}  ·  "
-                f"[{fit_color}]{free:.0f} GB free[/]  ·  {total:.0f} GB total)[/]",
-                id=f"btn-dest-{mount.priority}",
-                variant="primary" if fits else "default",
+            ops.mount(_location_button(
+                loc, f"btn-dest-{idx}", self._model.size_gb, f"output: {output_path.name}",
             ))
         ops.mount(Button("Back", id="btn-back", variant="default"))
-        self.call_after_refresh(lambda: self.query("#dest-ops Button").first().focus())
+        _focus_first_enabled(self, "#dest-ops Button")
 
     @on(Button.Pressed)
     def on_btn(self, event: Button.Pressed) -> None:
@@ -1869,8 +1896,7 @@ class QuantizeDestScreen(ButtonMenuScreen):
         if bid == "btn-back":
             self.app.pop_screen()
         elif bid.startswith("btn-dest-"):
-            priority = int(bid.rsplit("-", 1)[-1])
-            mount = next(m for m in CACHE_MOUNTS if m.priority == priority)
+            mount = LOCATIONS[int(bid.rsplit("-", 1)[-1])]
             if self._tool.uses_cuda:
                 self.app.push_screen(
                     QuantizeGpuScreen(self._model, self._tool, self._quant_option, mount)
@@ -1886,7 +1912,7 @@ def _push_quantize_confirmation(
     model: AIModel,
     tool: QuantizationTool,
     quant_option: str,
-    dest: CacheMount,
+    dest: Location,
     cuda_devices: str | None,
 ) -> None:
     try:
@@ -1913,7 +1939,7 @@ class QuantizeGpuScreen(GpuSelectionScreen):
     """Choose devices for an offline quantization job before confirmation."""
 
     def __init__(
-        self, model: AIModel, tool: QuantizationTool, quant_option: str, dest: CacheMount,
+        self, model: AIModel, tool: QuantizationTool, quant_option: str, dest: Location,
     ) -> None:
         super().__init__(f"{tool.label}  ·  {model.name}")
         self._model = model
@@ -2009,8 +2035,8 @@ class ModelSelectScreen(DataTableScreen):
     BINDINGS: ClassVar = [
         Binding("q",             "quit_app",          "Quit"),
         Binding("escape,b",      "dt_back",           "Back",   key_display="esc/←"),
-        Binding("c",             "cache_selected",    "Cache"),
-        Binding("c",             "uncache_selected",  "Uncache"),
+        Binding("c",             "copy_selected",     "Copy"),
+        Binding("delete",        "delete_selected",   "Delete", key_display="Del"),
         Binding("f",             "mark_favorite",     "Favorite"),
         Binding("f",             "unmark_favorite",   "Unfavorite"),
         Binding("l",             "set_ctx_override",  "Context / YaRN"),
@@ -2046,6 +2072,7 @@ class ModelSelectScreen(DataTableScreen):
         )
         table = DataTable(id="model-table", cursor_type="row")
         table.add_column("★",      key="fav")    # ★ — favorite indicator (leftmost)
+        table.add_column("Location", key="location")  # storage location (dim = offline)
         table.add_column("Name",   key="name")
         table.add_column("👍",     key="status")  # composite status symbol
         table.add_column("Format", key="format")
@@ -2059,7 +2086,6 @@ class ModelSelectScreen(DataTableScreen):
         table.add_column("👁",     key="vision")  # vision/multimodal flag
         table.add_column("TRC",    key="trc")    # --trust-remote-code required
         table.add_column("🔧",     key="tool")   # tool-call parser configured
-        table.add_column("Cache",  key="cache")
         table.add_column("Note",   key="note")   # user note (rightmost)
         yield table
         with Horizontal(id="status-bar"):
@@ -2155,12 +2181,12 @@ class ModelSelectScreen(DataTableScreen):
             return f"{m / 1000:g}B"
         return f"{m:g}M"
 
-    def _cache_cell(self, model: AIModel) -> str:
-        """Short label showing first cache mount where model lives, or dim dash."""
-        cached = model.cached_in(CACHE_MOUNTS)
-        if cached is None:
-            return "[dim]—[/]"
-        return f"[bright_green]{cached.label.split()[0]}[/]"
+    def _location_cell(self, model: AIModel) -> str:
+        """Short label of the model's storage location; dim while it is offline."""
+        loc = location_of(model.path)
+        if loc is None:
+            return "[dim]other[/]"
+        return loc.label if loc.online else f"[dim]{loc.label}[/]"
 
     def _focused_model(self) -> "AIModel | None":
         """Return the model at the current DataTable cursor row."""
@@ -2205,6 +2231,7 @@ class ModelSelectScreen(DataTableScreen):
             color, symbol = m.composite_status(SERVERS)
             table.add_row(
                 "\u2605" if m.favorite else "",   # ★ or blank
+                self._location_cell(m),
                 m.name,
                 f"[{color}]{symbol}[/]",
                 FORMAT_SHORT.get(m.format, m.format.value),
@@ -2219,15 +2246,14 @@ class ModelSelectScreen(DataTableScreen):
                 self._vision_cell(m),
                 self._trc_cell(m),
                 self._tool_cell(m),
-                self._cache_cell(m),
                 m.note,
-                key=m.id,
+                key=_row_key(m),
             )
         if not self._models:
             return
         if snap_to is not None:
             try:
-                target = next(i for i, m in enumerate(self._models) if m.id == snap_to.id)
+                target = next(i for i, m in enumerate(self._models) if m.key == snap_to.key)
             except StopIteration:
                 target = min(saved_row, len(self._models) - 1)
         else:
@@ -2289,14 +2315,15 @@ class ModelSelectScreen(DataTableScreen):
         self._populate()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Enable cache/uncache/favorite/quantize/template actions only when a model is focused and state matches."""
-        if action in ("cache_selected", "uncache_selected", "mark_favorite", "unmark_favorite",
+        """Enable copy/delete/favorite/quantize/template actions only when a model is focused and state matches."""
+        if action in ("copy_selected", "delete_selected", "mark_favorite", "unmark_favorite",
                       "quantize_selected", "template_patches"):
             model = self._focused_model()
             if model is None:
                 return False
-            if action == "cache_selected":    return model.cached_in(CACHE_MOUNTS) is None
-            if action == "uncache_selected":  return model.cached_in(CACHE_MOUNTS) is not None
+            if action in ("copy_selected", "delete_selected"):
+                loc = location_of(model.path)
+                return loc is not None and loc.online
             if action == "mark_favorite":     return not model.favorite
             if action == "unmark_favorite":   return model.favorite
             if action == "quantize_selected": return bool(tools_for_model(QUANTIZATION_TOOLS, model))
@@ -2305,36 +2332,32 @@ class ModelSelectScreen(DataTableScreen):
         return True
 
     def on_screen_resume(self) -> None:
-        """Refresh table whenever this screen becomes active again."""
+        """Refresh table whenever this screen becomes active again (copies may have been added)."""
+        self._reload_models()
+
+    def _reload_models(self, snap_to: "AIModel | None" = None) -> None:
+        self._models = models_for_type(AI_MODELS, self._ai_type)
         self._sort_models()
-        self._populate()
+        self._populate(snap_to=snap_to)
 
     @on(DataTable.RowHighlighted)
     def on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self.refresh_bindings()
         self._refresh_note_bar()
 
-    def action_cache_selected(self) -> None:
+    def action_copy_selected(self) -> None:
         model = self._focused_model()
-        if model is None:
-            return
-        self.app.push_screen(CacheActionScreen(model))
+        if model is not None:
+            self.app.push_screen(CopyModelScreen(model))
 
-    def action_uncache_selected(self) -> None:
+    @work(exclusive=True)
+    async def action_delete_selected(self) -> None:
+        """Delete the focused model's files and catalog entries, after confirmation."""
         model = self._focused_model()
         if model is None:
             return
-        cached = model.cached_in(CACHE_MOUNTS)
-        if not cached:
-            self.notify("Not cached locally", severity="warning", timeout=3)
-            return
-        try:
-            launcher.uncache_model(model, cached)
-            launcher.save_cached_path(model, "")
-            self.notify(f"Removed from {cached.label}", timeout=3)
-            self._populate()
-        except Exception as e:
-            self.notify(str(e), severity="error", timeout=5)
+        if await _confirm_delete(self.app, model):
+            self._reload_models()
 
     def action_dt_back(self) -> None:
         if len(self.app.screen_stack) > 2:
@@ -2435,8 +2458,8 @@ class ModelSelectScreen(DataTableScreen):
             self.app.push_screen(QuantizeToolScreen(model, applicable))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        model_id = event.row_key.value
-        model = next((m for m in self._models if m.id == model_id), None)
+        row_key = event.row_key.value
+        model = next((m for m in self._models if _row_key(m) == row_key), None)
         if model is not None:
             self._open_model(model)
 
@@ -2623,7 +2646,7 @@ class ModelManageScreen(ModelSelectScreen):
         return super().check_action(action, parameters)
 
     def _open_model(self, model: AIModel) -> None:
-        self.app.push_screen(CacheActionScreen(model))
+        self.app.push_screen(CopyModelScreen(model))
 
     def _title_text(self) -> str:
         return f"[bold]{AI_TYPE_LABELS[self._ai_type]} \u2014 manage models:[/]"
@@ -2686,7 +2709,7 @@ class ImageGenHubScreen(ButtonMenuScreen):
 
     Separates the two distinct concerns:
     - Launch Server   → ServerSelectScreen (no per-launch model selection)
-    - Manage Models   → ModelManageScreen  (cache/uncache/favorite/status; no launch)
+    - Manage Models   → ModelManageScreen  (copy/delete/favorite/status; no launch)
     """
 
     BINDINGS: ClassVar = [
@@ -2725,186 +2748,198 @@ class ImageGenHubScreen(ButtonMenuScreen):
 
 
 # ---------------------------------------------------------------------------
-# Cache management — per-model cache/uncache actions
+# Copy / delete — per-model storage actions
 # ---------------------------------------------------------------------------
 
-class CacheActionScreen(ButtonMenuScreen):
-    """Cache or uncache a specific model."""
+async def _confirm_delete(app: "App", model: AIModel) -> bool:
+    """Confirm and delete *model* (files + catalog entries).  Returns True once deleted.
+
+    Shows exactly what will be removed with Cancel focused.  Deleting the last copy
+    of a model additionally requires typing its name.
+    """
+    loc = location_of(model.path)
+    if loc is None or not loc.online:
+        app.notify(f"{model.name} is not on an online storage location", severity="warning", timeout=4)
+        return False
+    try:
+        plan = await asyncio.to_thread(plan_deletion, model, AI_MODELS)
+    except (ValueError, OSError) as e:
+        app.notify(str(e), severity="error", timeout=5)
+        return False
+    last = [m for m in plan.entries if not launcher.copies_of(m)]
+    lines = [
+        f"[bold]From:[/]  {escape(loc.title)}",
+        "",
+        "[bold]Catalog entries removed:[/]",
+        *(f"  {escape(m.name)}  ·  {m.format_tag}" for m in plan.entries),
+        "",
+        "[bold]Deleted from disk:[/]",
+        *(f"  {escape(str(d))}/  [dim](directory and all its contents)[/]" for d in plan.dirs),
+        *(f"  {escape(str(f))}" for f in plan.files),
+    ]
+    if last:
+        lines += ["", "[red bold]\u26a0  No other copy exists \u2014 this permanently deletes the model.[/]"]
+    choice = await app.push_screen_wait(ChoiceScreen(
+        f"Delete {escape(model.name)}  \u00b7  {model.format_tag}?",
+        "\n".join(lines),
+        [("cancel", "Cancel", "primary"), ("delete", "Delete", "error")],
+    ))
+    if choice != "delete":
+        return False
+    if last:
+        typed = await app.push_screen_wait(TextPromptScreen(
+            "Delete the last copy",
+            f"Type the model name to confirm: {escape(model.name)}",
+            validate=lambda v: None if v == model.name else "The name does not match",
+        ))
+        if typed is None:
+            return False
+    try:
+        await asyncio.to_thread(launcher.delete_model, plan)
+    except OSError as e:
+        app.notify(f"Delete failed: {e}", severity="error", timeout=6)
+        return False
+    app.notify(f"Deleted {model.name} from {loc.label}", timeout=3)
+    return True
+
+
+class CopyModelScreen(ButtonMenuScreen):
+    """Copy a model to another storage location (a new catalog entry at the mirrored path)."""
 
     BINDINGS: ClassVar = [
         Binding("q",             "quit_app",       "Quit"),
-        Binding("escape,b,left", "app.pop_screen", "Back",   key_display="esc/←"),
-        Binding("enter,right",   "press_focused",  "Select", key_display="↵/→/Space"),
+        Binding("escape,b,left", "app.pop_screen", "Back",   key_display="esc/\u2190"),
+        Binding("enter,right",   "press_focused",  "Select", key_display="\u21b5/\u2192/Space"),
     ]
 
     def __init__(self, model: AIModel) -> None:
         super().__init__()
         self._model = model
-        self._source_gb: float | None = None  # actual on-disk size; computed async on mount
+        self._size_gb: float | None = None  # actual on-disk size; computed async on mount
 
     def compose(self) -> ComposeResult:
         color, _sym = self._model.composite_status(SERVERS)
         yield Header()
         yield Label(
-            f"[bold][{color}]{self._model.name}  ·  {self._model.format_tag}[/][/bold]"
-            f"  ·  {self._model.size_gb:.0f} GB  ·  {fmt_ctx(self._model.effective_ctx)} ctx"
-            + (
-                f"[dim]  (native: {fmt_ctx(self._model.ctx)})[/]"
-                if self._model.effective_ctx != self._model.ctx
-                else ""
-            ),
+            f"[bold][{color}]{escape(self._model.name)}  \u00b7  {self._model.format_tag}[/][/bold]"
+            f"  \u00b7  {self._model.size_gb:.0f} GB",
             id="screen-title",
         )
-        cached = self._model.cached_in(CACHE_MOUNTS)
-        if cached:
-            status_txt = f"[dim]Cached in:[/]  [bright_green]{cached.label}[/]"
-        else:
-            status_txt = "[dim]Not cached locally \u2014 would load from source.[/]"
-        yield Label(status_txt, id="cache-status-label")
-        yield Vertical(id="cache-ops")
+        yield Label(self._status_text(), id="copy-status-label")
+        yield Vertical(id="copy-ops")
         yield Footer()
+
+    def _status_text(self) -> str:
+        loc = location_of(self._model.path)
+        here = loc.title if loc is not None else "outside the configured locations"
+        others = sorted({
+            c.label for m in launcher.copies_of(self._model) if (c := location_of(m.path)) is not None
+        })
+        also = f"  [dim]\u00b7  also on:[/] {', '.join(others)}" if others else ""
+        return f"[dim]Copy from:[/]  {escape(here)}{also}"
 
     def on_mount(self) -> None:
         self._build_buttons()
-        self._fetch_source_size()
+        self._fetch_size()
 
     async def on_screen_resume(self) -> None:
-        """Rebuild status and buttons after returning from CacheProgressScreen."""
-        cached = self._model.cached_in(CACHE_MOUNTS)
-        status_txt = (
-            f"[dim]Cached in:[/]  [bright_green]{cached.label}[/]"
-            if cached else
-            "[dim]Not cached locally \u2014 would load from source.[/]"
-        )
-        self.query_one("#cache-status-label", Label).update(status_txt)
-        ops = self.query_one("#cache-ops", Vertical)
-        await ops.remove_children()
-        self._build_buttons()
+        self.query_one("#copy-status-label", Label).update(self._status_text())
+        await self._rebuild_buttons()
 
     @work(thread=True)
-    def _fetch_source_size(self) -> None:
-        """Compute the actual on-disk size of the model source path (may be slow on remote storage)."""
-        size_gb = launcher.cache_source_size_gb(self._model)
-        self.app.call_from_thread(self._on_source_size_ready, size_gb)
+    def _fetch_size(self) -> None:
+        """Compute the actual on-disk size (may be slow on network storage)."""
+        size_gb = model_size_gb(self._model)
+        self.app.call_from_thread(self._on_size_ready, size_gb)
 
-    def _on_source_size_ready(self, source_gb: float) -> None:
-        """Called on main thread when the source size computation finishes."""
-        self._source_gb = source_gb
-        self.call_later(self._rebuild_buttons_with_size)
+    def _on_size_ready(self, size_gb: float) -> None:
+        self._size_gb = size_gb
+        self.call_later(self._rebuild_buttons)
 
-    async def _rebuild_buttons_with_size(self) -> None:
-        ops = self.query_one("#cache-ops", Vertical)
-        await ops.remove_children()
+    async def _rebuild_buttons(self) -> None:
+        await self.query_one("#copy-ops", Vertical).remove_children()
         self._build_buttons()
 
     def _build_buttons(self) -> None:
-        ops = self.query_one("#cache-ops", Vertical)
-        cached = self._model.cached_in(CACHE_MOUNTS)
-        # Use actual on-disk source size if computed; fall back to catalog size_gb.
-        source_gb = self._source_gb if self._source_gb is not None else self._model.size_gb
-        for mount in sorted(CACHE_MOUNTS, key=lambda m: m.priority):
-            total, free = launcher.cache_disk_info(mount)
-            fits = source_gb <= free
-            fit_color = "green" if fits else "red"
-            is_here = cached is not None and cached.root == mount.root
-            if is_here:
-                ops.mount(Button(
-                    f"Remove from {mount.label}",
-                    id=f"btn-uncache-{mount.priority}",
-                    variant="warning",
-                ))
+        ops = self.query_one("#copy-ops", Vertical)
+        here = location_of(self._model.path)
+        held = {location_of(m.path) for m in launcher.copies_of(self._model)}
+        need_gb = self._size_gb if self._size_gb is not None else self._model.size_gb
+        for idx, loc in enumerate(LOCATIONS):
+            if loc == here:
+                continue
+            if loc in held:
+                ops.mount(Button(f"{loc.title}  [dim](already has a copy)[/]", id=f"btn-copy-{idx}", disabled=True))
             else:
-                size_label = f"{source_gb:.0f} GB" if self._source_gb is not None else f"~{source_gb:.0f} GB"
-                ops.mount(Button(
-                    f"Cache to {mount.label}  "
-                    f"[dim](need {size_label}  ·  "
-                    f"[{fit_color}]{free:.0f} GB free[/]  ·  {total:.0f} GB total)[/]",
-                    id=f"btn-cache-{mount.priority}",
-                    variant="primary" if fits else "default",
-                ))
+                ops.mount(_location_button(loc, f"btn-copy-{idx}", need_gb))
         ops.mount(Button("Back", id="btn-back", variant="default"))
-        self.call_after_refresh(lambda: self.query("#cache-ops Button").first().focus())
+        _focus_first_enabled(self, "#copy-ops Button")
 
     @on(Button.Pressed)
     def on_btn(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
         if bid == "btn-back":
             self.app.pop_screen()
-        elif bid.startswith("btn-cache-"):
-            priority = int(bid.rsplit("-", 1)[-1])
-            mount = next(m for m in CACHE_MOUNTS if m.priority == priority)
-            self.app.push_screen(CacheProgressScreen(self._model, mount, source_gb=self._source_gb))
-        elif bid.startswith("btn-uncache-"):
-            priority = int(bid.rsplit("-", 1)[-1])
-            mount = next(m for m in CACHE_MOUNTS if m.priority == priority)
-            try:
-                launcher.uncache_model(self._model, mount)
-                launcher.save_cached_path(self._model, "")
-                self.notify(f"Removed from {mount.label}", timeout=3)
-                self.app.pop_screen()
-            except Exception as e:
-                self.notify(str(e), severity="error", timeout=5)
+        elif bid.startswith("btn-copy-"):
+            dest = LOCATIONS[int(bid.rsplit("-", 1)[-1])]
+            self.app.push_screen(CopyProgressScreen(self._model, dest, self._size_gb))
 
 
-# ---------------------------------------------------------------------------
-# Cache management — Level 3: rsync progress
-# ---------------------------------------------------------------------------
-
-class CacheProgressScreen(Screen):
-    """Shows elapsed time while rsync copies a model to a local cache mount."""
+class CopyProgressScreen(Screen):
+    """Shows rsync progress while a model is copied to another storage location."""
 
     BINDINGS: ClassVar = [
-        Binding("escape,q,b,left", "cancel", "Cancel", key_display="esc/←"),
+        Binding("escape,q,b,left", "cancel", "Cancel", key_display="esc/\u2190"),
     ]
 
-    def __init__(self, model: AIModel, mount: CacheMount, source_gb: float | None = None) -> None:
+    def __init__(self, model: AIModel, dest: Location, size_gb: float | None = None) -> None:
         super().__init__()
         self._model = model
-        self._mount = mount
-        self._source_gb = source_gb
+        self._dest = dest
+        self._size_gb = size_gb
         self._proc: "subprocess.Popen | None" = None  # type: ignore[type-arg]
-        self._dest_path: str = ""
 
     def compose(self) -> ComposeResult:
-        size_str = f"{self._source_gb:.0f} GB" if self._source_gb is not None else f"{self._model.size_gb:.0f} GB"
+        size = self._size_gb if self._size_gb is not None else self._model.size_gb
         yield Header()
         yield Label(
-            f"[bold]Caching:[/]  {self._model.name}  ·  {self._model.format_tag}"
-            f"  ({size_str})  \u2192  {self._mount.label}",
-            id="cache-op-title",
+            f"[bold]Copying:[/]  {escape(self._model.name)}  \u00b7  {self._model.format_tag}"
+            f"  ({size:.0f} GB)  \u2192  {escape(self._dest.title)}",
+            id="copy-op-title",
         )
-        yield ProgressBar(total=100.0, show_eta=False, id="cache-progress-bar")
-        yield Label("", id="cache-progress-detail")
-        yield Label("[dim]Starting rsync\u2026[/]", id="cache-ops-status")
+        yield ProgressBar(total=100.0, show_eta=False, id="copy-progress-bar")
+        yield Label("", id="copy-progress-detail")
+        yield Label("[dim]Starting rsync\u2026[/]", id="copy-ops-status")
         yield Horizontal(
             Button("Cancel", id="btn-cancel", variant="error"),
-            id="cache-op-buttons",
+            id="copy-op-buttons",
         )
         yield Footer()
 
     def on_mount(self) -> None:
-        self._run_cache()
+        self._run_copy()
 
     @work(thread=True)
-    def _run_cache(self) -> None:
-        import os
+    def _run_copy(self) -> None:
         import select
         import time
-        proc, dest_path = launcher.cache_model(self._model, self._mount)
+        try:
+            proc = storage.copy_model(self._model, self._dest)
+        except (ValueError, OSError) as e:
+            self.app.call_from_thread(self._on_done, False, str(e))
+            return
         self._proc = proc
-        self._dest_path = dest_path
+        stdout = proc.stdout
+        assert stdout is not None  # copy_model() always pipes stdout
         buf = b""
         start = time.monotonic()
         while True:
-            rlist, _, _ = select.select([proc.stdout], [], [], 0.5)
+            rlist, _, _ = select.select([stdout], [], [], 0.5)
             elapsed = int(time.monotonic() - start)
             mins, secs = divmod(elapsed, 60)
-            self.app.call_from_thread(
-                self._update_status,
-                f"[dim]{mins}:{secs:02d} elapsed[/]",
-            )
+            self.app.call_from_thread(self._update_status, f"[dim]{mins}:{secs:02d} elapsed[/]")
             if rlist:
-                chunk = proc.stdout.read1(4096)  # type: ignore[union-attr]
+                chunk = stdout.read1(4096)  # type: ignore[attr-defined]
                 if not chunk:  # EOF
                     break
                 buf += chunk
@@ -2921,38 +2956,35 @@ class CacheProgressScreen(Screen):
                 break  # exited, no more data
         # Ensure returncode is populated (returns immediately — process already exited).
         proc.wait()
-        # Read stderr output (safe: process is no longer writing).
-        stderr_text = ""
-        if proc.stderr:
-            stderr_text = proc.stderr.read().decode(errors="replace").strip()
+        stderr_text = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
         self.app.call_from_thread(self._on_done, proc.returncode == 0, stderr_text)
 
     def _update_status(self, text: str) -> None:
-        self.query_one("#cache-ops-status", Label).update(text)
+        self.query_one("#copy-ops-status", Label).update(text)
 
     def _update_progress_line(self, line: str) -> None:
-        import re
         m = re.search(r'(\d+)%\s+([\d.]+\S+/s)\s+([\d:]+)', line)
         if m:
             pct, speed, eta = int(m.group(1)), m.group(2), m.group(3)
-            self.query_one("#cache-progress-bar", ProgressBar).progress = float(pct)
+            self.query_one("#copy-progress-bar", ProgressBar).progress = float(pct)
             detail = f"[dim]{speed}  ETA {eta}[/]" if pct < 100 else f"[dim]{speed}[/]"
-            self.query_one("#cache-progress-detail", Label).update(detail)
+            self.query_one("#copy-progress-detail", Label).update(detail)
 
-    def _on_done(self, success: bool, stderr_text: str = "") -> None:
+    def _on_done(self, success: bool, error_text: str = "") -> None:
+        btn = self.query_one("#btn-cancel", Button)
         if success:
-            launcher.save_cached_path(self._model, self._dest_path)
-            self.query_one("#cache-ops-status", Label).update("[bright_green]\u2713 Complete[/]")
-            btn = self.query_one("#btn-cancel", Button)
+            try:
+                launcher.register_copy(self._model, self._dest)
+            except (ValueError, OSError) as e:
+                success, error_text = False, f"Copied, but cataloguing failed: {e}"
+        if success:
+            self.query_one("#copy-ops-status", Label).update("[bright_green]\u2713 Complete[/]")
             btn.label = "Done"   # type: ignore[assignment]
             btn.variant = "success"
         else:
-            self.query_one("#cache-ops-status", Label).update("[bright_red]\u2717 rsync failed[/]")
-            if stderr_text:
-                self.query_one("#cache-progress-detail", Label).update(
-                    f"[bright_red]{stderr_text}[/]"
-                )
-            btn = self.query_one("#btn-cancel", Button)
+            self.query_one("#copy-ops-status", Label).update("[bright_red]\u2717 Copy failed[/]")
+            if error_text:
+                self.query_one("#copy-progress-detail", Label).update(f"[bright_red]{escape(error_text)}[/]")
             btn.label = "Close"  # type: ignore[assignment]
 
     def action_cancel(self) -> None:

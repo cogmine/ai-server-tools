@@ -27,7 +27,8 @@ ooba_model_dir  = "~/text-generation-webui/user_data/models"
 # ComfyUI — path to main.py and base models directory.
 # The launcher stages symlinks for every catalog image_gen model under comfyui_models_dir,
 # organized by subdirectory (e.g. models/checkpoints/, models/diffusion_models/).
-# resolve_path() is used for each link target, so cached local copies are preferred.
+# A model stored at several locations is staged once, from the first online location in
+# [[locations]] order.
 comfyui_main      = "~/ComfyUI/main.py"
 comfyui_models_dir = "~/ComfyUI/models"
 
@@ -75,29 +76,32 @@ host_cache_ram = "60%"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Local cache mounts
+# Storage locations
 #
-# Each mount is checked in priority order (lowest number first) before
-# falling back to loading directly from the source location.  The directory
-# structure under each mount root must mirror the source tree verbatim.
+# Every place models are stored — network shares and local drives alike.  The
+# model list shows each model's location; copy, convert and quantize can write
+# to any location.  A copy keeps the model's path relative to its location root,
+# so the directory layout under every root mirrors the others.
 #
-# Add or remove [[cache_mounts]] blocks to match your storage layout.
+#   label        short name shown in the model list's Location column
+#   root         directory under which models are stored
+#   description  (optional) longer name shown in destination pickers
 # ─────────────────────────────────────────────────────────────────────────────
 
-[[cache_mounts]]
-label    = "NVMe (fast_models)"
-root     = "~/fast_models"
-priority = 0
+[[locations]]
+label       = "NAS"
+root        = "/mnt/nas/ai_models"
+description = "NAS (ai_models)"
 
-[[cache_mounts]]
-label    = "SATA (sda1)"
-root     = "/mnt/sda1/models"
-priority = 1
+[[locations]]
+label       = "NVMe"
+root        = "~/fast_models"
+description = "NVMe (fast_models)"
 
-[[cache_mounts]]
-label    = "eSATA RAID0 (sda2)"
-root     = "/mnt/sdb2/models"
-priority = 2
+[[locations]]
+label       = "SATA"
+root        = "/mnt/sda1/models"
+description = "SATA SSD (sda1)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

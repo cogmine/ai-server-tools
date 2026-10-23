@@ -77,7 +77,8 @@ cd ~/ai-server-tools
         app.py                      Textual App class + run() entry
         config.py                   SiteConfig loader — reads user_data/config.toml, exposes CONFIG singleton
         config.toml.example         Tracked template — copy to user_data/config.toml and edit
-        data.py                     SERVERS list + CACHE_MOUNTS (config-driven, safe to commit)
+        data.py                     SERVERS list + QUANTIZATION_TOOLS + catalog loading (config-driven, safe to commit)
+        storage.py                  Storage locations ([[locations]]), mirrored paths, model copy + deletion plans
         environments.py             Server environments (conda envs / native builds) + ENVIRONMENTS registry
         environments.json.example   Tracked template — copy to user_data/environments.json
         gpu.py                      NVML poller (pynvml) + GpuRow data + formatting helpers
@@ -85,7 +86,7 @@ cd ~/ai-server-tools
         scripts/gpu-power-limit     Applies power limits via sudo nvidia-smi -pl, only where they differ
         ingest.py                   CLI tool — scans a directory for new models and appends entries to models_local.json
         gguf_header.py              Dependency-free GGUF header (key/value metadata) reader used by ingest
-        launch.py                   Command builders, process spawner, cache manager
+        launch.py                   Command builders, process spawner, catalog persistence (copy/delete bookkeeping)
         fit.py                      Pre-launch memory-fit estimates (FitProbe per server; llama.cpp: llama-fit-params)
         models.py                   Schema — ModelFormat enum, AIModel/ServerSoftware dataclasses
         models_local.json.example   Tracked template — schema reference + 3 sample entries
@@ -165,7 +166,7 @@ Three native environments (registered in the launcher, `kind: native`):
 - **KV cache**: `--cache-mode Q8` (quantized KV, fast on Ampere)
 - **Multi-GPU**: ExLlamaV2 row/column tensor split, not restricted by head count
 - **Model directory approach**: tabbyAPI requires models to be subdirectories inside a `--model-dir`.
-  At launch time `launch.py` automatically creates a symlink `~/tabbyAPI/models/<model.id>` → `model.resolve_path()`
+  At launch time `launch.py` automatically creates a symlink `~/tabbyAPI/models/<model.id>` → `model.path`
   and passes `~/tabbyAPI/models/` as `--model-dir`. No pre-created symlinks or stub dirs are needed.
   The same pattern applies to any future tool that requires a models directory — add a block in `launch.py`.
 
@@ -268,10 +269,10 @@ QSA kernels would hit the same Triton fp8e4nv limitation. Loading from the NAS t
 **Model config**: edit `launcher/user_data/models_local.json` — one JSON object per model in the `"models"` array.
 See `launcher/models_local.json.example` for the full field schema.
 Schema types live in `launcher/models.py` (`ModelFormat` enum, `AIModel.from_dict()` deserialiser).
-Server definitions (SERVERS list, CACHE_MOUNTS) live in `launcher/data.py` (safe to commit).
+Server definitions (SERVERS list) live in `launcher/data.py` (safe to commit). Storage locations (`LOCATIONS`, from `[[locations]]` in `config.toml` — NAS and local drives alike) live in `launcher/storage.py`.
 **Environments**: each server launches from a registered `Environment` (`launcher/environments.py`): `CondaEnvironment` (`<conda_base>/envs/<name>`) or `NativeEnvironment` (`bin_dir`, llama.cpp). Registry `ENVIRONMENTS` ↔ `launcher/user_data/environments.json` (`{"environments": {server_id: [{kind, name, default?, note?, …}]}}`), maintained by `EnvManageScreen` (`e` on the server list / env picker: add — offering conda create/clone when missing — create, rename via `conda rename`, remove with optional `conda env remove`, set default, note). Builders take `env` and use `env.python` / `env.executable(...)`; quantization tools run from their `env_server_id`'s default environment. Several envs per server allow testing upgrades (e.g. `vllm-next`) without breaking the known-good one.
-`path` field: absolute path to the model — any location (NAS, local SSD, etc.). Replaces the old `nas_path` field.
-`cached_path` field: optional faster local copy; written by `save_cached_path()` in `launch.py` after a successful rsync, cleared by passing `""`. `resolve_path()` returns `cached_path` when set and present on disk, else `path`.
+`path` field: absolute path to the model file or directory, inside one of the configured storage locations; one path per entry. The model list shows its location in the Location column (before Name; dim = location offline).
+`family` field: shared by an original model and every copy, conversion and quantization of it (ingest assigns the slug of the name; copy/convert inherit it). Copies of a model at other locations are separate entries with the same `id` (served name) at the mirrored path (same path relative to the location root); the catalog key is `AIModel.key` = `(path, format)` — `_patch_catalog(model, …)` and all `save_*()` functions match on it, never on `id`. There is no cache concept: `c` copies a model to another location (`storage.copy_model()` + `launch.register_copy()`, a settings snapshot), `Del` deletes it (`storage.plan_deletion()` shown for confirmation, typed name for the last copy, then `launch.delete_model()`).
 Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted per `(model, server, environment, quant)` via `save_server_status()` in `launch.py` (JSON roundtrip, no regex). `server_status` in JSON is a nested dict: `{server_id: {env_name: {quant_key: status}}}` where `quant_key` is `"none"` (full/stored precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`). Multiple quant keys may be `"good"`. `status_for(server_id, env_name, quant)`; `env_best_status(server_id, env_name)` = best across quants; `best_status_for(server_id)` = best across envs and quants. Env rename/removal migrates/drops results (`apply_env_rename()` / `apply_env_removal()`). `_quant_key(quant)` maps `RuntimeQuant | None` → string key.
 `ctx_override` field: optional launch override; `0` = use native `ctx` (scaled by `rope_scaling`). Can be higher or lower than `ctx`. Set interactively with `l` on the model list (`ContextSettingsScreen`). Persisted via `save_ctx_override()` — same JSON roundtrip pattern as `save_server_status()`.
 `rope_scaling` field: optional `RopeScaling` (`{"factor": 4.0}`, optional `method` default `yarn`, `original_ctx` default `ctx`); default launch ctx becomes `ctx × factor`. Builders translate it per server when `server.applies_rope_scaling(model)` (llama.cpp `--rope-scaling/--rope-scale/--yarn-orig-ctx`; ooba GGUF via `--extra-flags`; vLLM `--hf-overrides` / SGLang `--json-model-override-args` built from the model's own config.json RoPE block, plus `rope_scaling_env`); other servers get the native ctx via `server.launch_ctx(model)`. Set with `l` (`ContextSettingsScreen`), persisted via `save_rope_scaling()`.
@@ -279,8 +280,8 @@ Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted
 `min_sm` field: integer minimum CUDA compute capability (e.g. `89` for sm_89+); `0` = no constraint. Checked against `system_min_sm()` from `gpu.py` (cached). When `model.hw_compat(system_sm)` is `False`, the warn column shows `⛔` and the note bar below the model table shows `model.hw_note`.
 `hw_note` field: string explaining the hardware requirement — shown in the launcher note bar when incompatible. Omitted from JSON when empty.
 `comfyui_subdir` field: `image_gen` models only — ComfyUI `models/` subdirectory to stage into (e.g. `"checkpoints"` for SDXL, `"diffusion_models"` for FLUX UNets, `"vae"`, `"loras"`). Default `"checkpoints"` — key omitted from JSON for checkpoints. Staging uses the original source filename (`staging_use_source_filename=True` on ComfyUI's `ServerSoftware`) so ComfyUI workflows can reference models by their natural names (e.g. `flux1-dev.safetensors`, `ae.safetensors`).
-`mmproj_path` field: absolute path to the companion `mmproj-*.gguf` vision encoder file; omitted from JSON when empty. Auto-detected by `ingest`/`refresh` when found in the GGUF bundle root (flat layout) or bundle root one level above the quant subdir. Populated via `copy-mmproj` + `refresh` workflow. Passed as `--mmproj` to llama.cpp and ooba at launch time via `resolve_mmproj_path()` (prefers the copy cached beside the model; caching copies the mmproj along with the GGUF).
-`mtp_path` field: absolute path to a companion `mtp-*.gguf` multi-token-prediction draft head (auto-detected by `ingest`/`refresh`; quant-matching file preferred). llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <path>` (via `resolve_mtp_path()`) unless server param `mtp` is `false`; cached alongside the model like the mmproj.
+`mmproj_path` field: absolute path to the companion `mmproj-*.gguf` vision encoder file; omitted from JSON when empty. Auto-detected by `ingest`/`refresh` when found in the GGUF bundle root (flat layout) or bundle root one level above the quant subdir. Populated via `copy-mmproj` + `refresh` workflow. Passed as `--mmproj` to llama.cpp and ooba at launch time; copying a model copies the mmproj along with the GGUF (mirrored path).
+`mtp_path` field: absolute path to a companion `mtp-*.gguf` multi-token-prediction draft head (auto-detected by `ingest`/`refresh`; quant-matching file preferred). llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <path>` unless server param `mtp` is `false`; copied alongside the model like the mmproj.
 `mtp_embedded` field: `true` when the GGUF itself has MTP/NextN layers (`<arch>.nextn_predict_layers`, read by `launcher/gguf_header.py`). Launched with `--spec-type draft-mtp` (no draft file) only when server param `mtp` is `true` — default `None` uses sidecar heads only, because llama.cpp may not implement MTP for the architecture (GLM5-Next does not yet).
 `tool_call_parser` field: vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, vLLM emits `--enable-auto-tool-choice --tool-call-parser <name>` and SGLang emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP` in `launch.py`). Omitted from JSON when empty.
 Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. Default order: `fav → status → name`. Clicking a header promotes it to primary (ascending); clicking the primary toggles direction. `_STATUS_RANK` maps composite status symbols (✓, ✓?, ✓✗, ✗?, ✗, ?) to integers 0–5 for sort.
@@ -296,10 +297,10 @@ The launcher does **not** embed GPU stats — run `gpu_monitor` separately while
 Path validation before GpuSelectScreen; missing files show a toast notification.
 
 **Flow** (image-gen / hub): AITypeScreen → ImageGenHubScreen → "Launch Server" → ServerSelectScreen(model=None) → [EnvSelectScreen] → GpuSelectScreen → ConfirmLaunch → exits TUI.
-"Manage Models" → ModelManageScreen → `→`/`Enter` → CacheActionScreen → CacheProgressScreen (rsync with live ProgressBar) or uncache.
+"Manage Models" → ModelManageScreen → `→`/`Enter` → CopyModelScreen → CopyProgressScreen (rsync with live ProgressBar).
 `uses_hub_flow(servers, ai_type)` returns `True` when every server for that AI type has `stage_all_models=True`.
-`ModelManageScreen` overrides `_open_model()` (template method in `ModelSelectScreen`) to push `CacheActionScreen`. The template method pattern is necessary because Textual calls all MRO classes' message handlers regardless of override — only plain method calls respect the most-derived class.
-`CacheProgressScreen`: rsync launched with `--info=progress2`; stdout read via `select.select()` in a `@work(thread=True)` worker; `(\d+)%` regex drives a `ProgressBar` widget + speed/ETA detail label; `proc.wait()` called after stdout EOF before reading `returncode`. Single-file models detected with `src_p.is_file()` (not extension-based).
+`ModelManageScreen` overrides `_open_model()` (template method in `ModelSelectScreen`) to push `CopyModelScreen`. The template method pattern is necessary because Textual calls all MRO classes' message handlers regardless of override — only plain method calls respect the most-derived class.
+`CopyProgressScreen`: `rsync -ahR --info=progress2` (sources anchored `<root>/./<rel>` so the layout is mirrored); stdout read via `select.select()` in a `@work(thread=True)` worker; `(\d+)%` regex drives a `ProgressBar` widget + speed/ETA detail label; `proc.wait()` called after stdout EOF before reading `returncode`; on success `launch.register_copy()` adds the copy's catalog entries.
 
 **Catalog ingest**: `python -m launcher.ingest <subcommand>` — four subcommands:
 - `ingest <scan_root> [--all] [--ai-type text_gen|image_gen] [--dry-run]` — scans a directory for models not in the catalog and appends entries. `--path <path>` targets a specific model. `--ai-type image_gen` for diffusion checkpoints/FLUX.

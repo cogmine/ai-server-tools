@@ -1,5 +1,5 @@
 """
-data.py — Generic server software registry and cache mount list.
+data.py — Generic server software registry, quantization tools and the model catalog.
 
 Everything here is driven by config.toml and is safe to commit.
 Your personal model inventory lives in models_local.py (gitignored).
@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 
 from launcher.models import (
-    AIModel, AIType, CacheMount, GGUFQuant, ModelFormat,
+    AIModel, AIType, GGUFQuant, ModelFormat,
     QuantizationTool, RuntimeQuant, ServerSoftware, VersionProbe,
 )
 from launcher.config import CONFIG
@@ -183,7 +183,7 @@ SERVERS: list[ServerSoftware] = [
             "extra_flags":  [],
         },
         # tabbyAPI requires a models directory; launch.py creates a symlink named
-        # model.id under model_dir pointing to the resolved model path.
+        # model.id under model_dir pointing to the model path.
         uses_staging_dir=True,
         version_packages=("exllamav2", "exllamav3"),
         # flash-attn was built against cuda-12.5; CUDA_HOME ensures nvcc resolution.
@@ -306,16 +306,6 @@ SERVERS: list[ServerSoftware] = [
         chat_template_flag="--chat-template",
     ),
 
-]
-
-
-# ---------------------------------------------------------------------------
-# Cache mount registry  (populated from config.toml [[cache_mounts]])
-# ---------------------------------------------------------------------------
-
-CACHE_MOUNTS: list[CacheMount] = [
-    CacheMount(label=m.label, root=m.root, priority=m.priority)
-    for m in CONFIG.cache_mounts
 ]
 
 

@@ -42,16 +42,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from launcher.data import AI_MODELS, CACHE_MOUNTS
+from launcher.data import AI_MODELS
 from launcher.chat_template import patched_template
 from launcher.environments import ENVIRONMENTS, Environment
 from launcher.gpu_power import PowerLimitStep
 from launcher.models import (
-    AIModel, CacheMount, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
+    AIModel, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
     QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key,
     gguf_shard_paths, gguf_split_info,
 )
 from launcher.config import CONFIG
+from launcher.storage import (
+    LOCATIONS, DeletionPlan, Location, location_of, model_metadata_dir, relocated_entry,
+)
 
 
 _LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -130,22 +133,35 @@ def _merged(server: ServerSoftware, model: "AIModel | None", param_overrides: di
     return p
 
 
-def _patch_catalog(model_id: str, apply: "Callable[[dict], None]") -> None:
-    """Load models_local.json, find the entry for model_id, call apply(entry), then save.
+def _entry_key(entry: dict) -> tuple[str, str]:
+    """Catalog key of a JSON entry — matches AIModel.key."""
+    return entry["path"], entry["format"]
 
-    Raises ValueError if model_id is not found in the catalog.
-    """
+
+def _load_catalog() -> dict:
     with open(_CATALOG_PATH, encoding="utf-8") as f:
-        catalog = json.load(f)
-    for entry in catalog["models"]:
-        if entry["id"] == model_id:
-            apply(entry)
-            break
-    else:
-        raise ValueError(f"Could not find model id={model_id!r} in models_local.json")
+        return json.load(f)
+
+
+def _save_catalog(catalog: dict) -> None:
     with open(_CATALOG_PATH, "w", encoding="utf-8") as f:
         json.dump(catalog, f, indent=2, ensure_ascii=False)
         f.write("\n")
+
+
+def _patch_catalog(model: AIModel, apply: "Callable[[dict], None]") -> None:
+    """Load models_local.json, find *model*'s entry (by key), call apply(entry), then save.
+
+    Raises ValueError if the model is not found in the catalog.
+    """
+    catalog = _load_catalog()
+    for entry in catalog["models"]:
+        if _entry_key(entry) == model.key:
+            apply(entry)
+            break
+    else:
+        raise ValueError(f"Could not find {model.path} ({model.format.value}) in models_local.json")
+    _save_catalog(catalog)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +295,7 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
     if model is None or gpu_count <= 1:
         return ParallelismPlan(tp=1, pp=max(gpu_count, 1), gpu_count=max(gpu_count, 1))
 
-    cfg = _read_hf_parallelism_fields(model.resolve_path())
+    cfg = _read_hf_parallelism_fields(model.path)
     if cfg is None:
         return ParallelismPlan(tp=1, pp=gpu_count, gpu_count=gpu_count)
 
@@ -403,7 +419,7 @@ def _hf_rope_override(model: AIModel) -> dict[str, Any]:
     """
     rs = model.rope_scaling
     assert rs is not None
-    root = Path(model.resolve_path())
+    root = Path(model.path)
     cfg_path = (root if root.is_dir() else root.parent) / "config.json"
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -449,7 +465,7 @@ def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p:
     if p["cache_ram_mib"] is not None:
         cmd += ["--cache-ram", str(p["cache_ram_mib"])]
     if model.mmproj_path:
-        cmd += ["--mmproj", model.resolve_mmproj_path()]
+        cmd += ["--mmproj", model.mmproj_path]
     cmd += _mtp_args(model, p)
     cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
@@ -468,7 +484,7 @@ def _mtp_args(model: AIModel, p: dict) -> list[str]:
     if mode is False:
         return []
     if model.mtp_path:
-        return ["--spec-type", "draft-mtp", "--model-draft", model.resolve_mtp_path()]
+        return ["--spec-type", "draft-mtp", "--model-draft", model.mtp_path]
     if model.mtp_embedded and mode:
         return ["--spec-type", "draft-mtp"]
     return []
@@ -498,7 +514,7 @@ def llamacpp_model_args(server: ServerSoftware, model: AIModel, p: dict) -> list
 
 def _build_tabby(server: ServerSoftware, env: Environment, model: AIModel, p: dict) -> list[str]:
     # model_dir is a staging directory; launch() creates a symlink named model.id
-    # there pointing to the resolved (cached or source) path before this builder runs.
+    # there pointing to the model's path before this builder runs.
     cmd = [
         str(env.python), str(CONFIG.tabby_main),
         "--model-dir",    p["model_dir"],
@@ -521,7 +537,7 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
     model_ref = _staged_name(server, model)
     if _is_split_gguf(model):
         # Name shard 1 explicitly: ooba's metadata reader takes an unsorted glob's first hit.
-        model_ref += "/" + Path(model.resolve_path()).name
+        model_ref += "/" + Path(model.path).name
     cmd = [
         str(env.python), str(CONFIG.ooba_main),
         "--model",          model_ref,
@@ -543,7 +559,7 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         if p.get("tensor_split"):
             cmd += ["--tensor-split", p["tensor_split"]]
         if model.mmproj_path:
-            cmd += ["--mmproj", model.resolve_mmproj_path()]
+            cmd += ["--mmproj", model.mmproj_path]
         cmd += _mtp_args(model, p)
     if server.applies_rope_scaling(model):
         # ooba has no RoPE options of its own; it forwards these to its llama-server.
@@ -718,7 +734,7 @@ def compute_quant_output_path(
     tool: QuantizationTool,
     model: AIModel,
     quant_option: str,
-    dest: CacheMount,
+    dest: Location,
 ) -> Path:
     """Derive the output *directory* for a quantization job.
 
@@ -726,16 +742,16 @@ def compute_quant_output_path(
     is always consistent: delete the directory and its contents.
 
     GGUF output:
-        <dest.root>/<model.cache_subdir>/<stem_no_quant>-GGUF-<quant>/
+        <dest.root>/<model.type_subdir>/<stem_no_quant>-GGUF-<quant>/
         Existing GGUF inputs have their quant suffix removed; HF directory
         inputs keep their source directory name.
 
     EXL2 convert:
-        <dest.root>/<model.cache_subdir>/<source_dirname>-exl2-<bpw>bpw/
+        <dest.root>/<model.type_subdir>/<source_dirname>-exl2-<bpw>bpw/
         e.g. ~/fast_models/text-generation/BeMag-123B-v0.1-exl2-4.0bpw/
     """
-    src = Path(model.resolve_path())
-    output_root = dest.root / model.cache_subdir
+    src = Path(model.path)
+    output_root = dest.root / model.type_subdir
     if tool.output_format == ModelFormat.GGUF:
         stem = _strip_gguf_quant(src.stem) if model.format == ModelFormat.GGUF else src.name
         return output_root / f"{stem}-GGUF-{quant_option}"
@@ -751,12 +767,12 @@ def _build_llama_quantize(
     output_dir: Path,
 ) -> list[str]:
     # output_dir is the per-job directory; the actual file goes inside it.
-    src = Path(model.resolve_path())
+    src = Path(model.path)
     stem = _strip_gguf_quant(src.stem)
     output_file = output_dir / f"{stem}.{quant_option}.gguf"
     return [
         str(env.executable("llama-quantize")),
-        model.resolve_path(),
+        model.path,
         str(output_file),
         quant_option,
     ]
@@ -776,7 +792,7 @@ def _build_exl2_convert(
         cmd_prefix = [str(env.python), "-m", "exllamav2.conversion.convert_exl2"]
     return [
         *cmd_prefix,
-        "-i", model.resolve_path(),
+        "-i", model.path,
         "-o", str(output_path),
         "-b", quant_option,
     ]
@@ -793,7 +809,7 @@ def _build_llama_hf_to_gguf(
     script = source_root / "convert_hf_to_gguf.py"
     if not script.is_file():
         raise FileNotFoundError(f"llama.cpp converter script not found: {script}")
-    source = Path(model.resolve_path())
+    source = Path(model.path)
     if not source.is_dir():
         raise ValueError(f"HF-to-GGUF conversion requires a model directory: {source}")
     output_file = output_dir / f"{source.name}.{quant_option}.gguf"
@@ -817,7 +833,7 @@ def build_quantize_cmd(
     tool: QuantizationTool,
     model: AIModel,
     quant_option: str,
-    dest: CacheMount,
+    dest: Location,
     cuda_devices: str | None = None,
 ) -> tuple[list[str], Path]:
     """Return (argv, output_path), including the job's explicit CUDA environment."""
@@ -850,7 +866,7 @@ def launch_params(
     """Resolved builder params: merged defaults/overrides plus the injected _model_path / _runtime_quant / _chat_template."""
     p = _merged(server, model, param_overrides)
     if model is not None:
-        p["_model_path"] = model.resolve_path()  # fastest available copy
+        p["_model_path"] = model.path
     p["_runtime_quant"] = runtime_quant
     template = patched_template(model) if model is not None and server.chat_template_flag else None
     p["_chat_template"] = str(template.path) if template is not None else ""  # written by launch()
@@ -906,7 +922,7 @@ def _ensure_lib_symlinks(lib_dir: Path, links: dict[str, str]) -> None:
 
 
 def _is_split_gguf(model: AIModel) -> bool:
-    return model.format == ModelFormat.GGUF and len(gguf_shard_paths(Path(model.resolve_path()))) > 1
+    return model.format == ModelFormat.GGUF and len(gguf_shard_paths(Path(model.path))) > 1
 
 
 def _staged_name(server: ServerSoftware, model: AIModel) -> str:
@@ -914,7 +930,7 @@ def _staged_name(server: ServerSoftware, model: AIModel) -> str:
     if _is_split_gguf(model):
         return model.id
     if server.staging_use_source_filename:
-        return Path(model.resolve_path()).name
+        return Path(model.path).name
     return model.id + server.staging_format_suffixes.get(model.format, "")
 
 
@@ -934,11 +950,23 @@ def _stage_model(server: ServerSoftware, model: AIModel, staging: Path) -> None:
             raise FileExistsError(f"Staging path {entry} is a real directory; refusing to replace it")
         shutil.rmtree(entry)
     if not _is_split_gguf(model):
-        entry.symlink_to(model.resolve_path())
+        entry.symlink_to(model.path)
         return
     entry.mkdir()
-    for shard in gguf_shard_paths(Path(model.resolve_path())):
+    for shard in gguf_shard_paths(Path(model.path)):
         (entry / shard.name).symlink_to(shard)
+
+
+def _one_copy_each(models: list[AIModel]) -> list[AIModel]:
+    """One entry per model: copies collapse to the first present on disk, in [[locations]] order."""
+    def preference(m: AIModel) -> tuple[bool, int]:
+        loc = location_of(m.path)
+        return not Path(m.path).exists(), LOCATIONS.index(loc) if loc is not None else len(LOCATIONS)
+
+    chosen: dict[tuple[str, str], AIModel] = {}
+    for m in sorted(models, key=preference):
+        chosen.setdefault((m.id, m.format.value), m)
+    return list(chosen.values())
 
 
 def _prepend_path(entry: str, var: str) -> str:
@@ -1046,7 +1074,9 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
         # Used by servers (e.g. ComfyUI) where the client picks the model per-request.
         # stage single model: used by servers that load exactly one model at startup.
         if server.stage_all_models:
-            models_to_stage: list[AIModel] = [m for m in AI_MODELS if m.compatible_with(server)]
+            models_to_stage: list[AIModel] = _one_copy_each(
+                [m for m in AI_MODELS if m.compatible_with(server)]
+            )
         else:
             assert model is not None, f"model is required for server {server.id!r}"
             models_to_stage = [model]
@@ -1081,7 +1111,7 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
     quant_str = f" + {runtime_quant.value}" if runtime_quant else ""
     if model is not None:
         model_line = f"# model:  {model.id}  ({model.format.value}{quant_str}, {model.size_gb} GB)\n"
-        path_line  = f"# path:   {model.resolve_path()}\n"
+        path_line  = f"# path:   {model.path}\n"
     else:
         model_line = "# model:  (all catalog models staged)\n"
         path_line  = ""
@@ -1113,7 +1143,7 @@ def quantize(
     tool: QuantizationTool,
     model: AIModel,
     quant_option: str,
-    dest: CacheMount,
+    dest: Location,
     cuda_devices: str | None = None,
 ) -> tuple[subprocess.Popen[bytes], Path, int]:
     """Build the quantization command and spawn the process.
@@ -1141,7 +1171,7 @@ def quantize(
         f"# model:   {model.id}  ({model.format.value}, {model.size_gb} GB)\n"
         f"# tool:    {tool.id}\n"
         f"# option:  {quant_option}\n"
-        f"# source:  {model.resolve_path()}\n"
+        f"# source:  {model.path}\n"
         f"# output:  {output_path}\n"
         f"#\n"
         f"# command:\n"
@@ -1154,17 +1184,18 @@ def quantize(
 
 
 def finalize_quantization(job: QuantizeJob) -> AIModel:
-    """Copy model metadata, catalog a successful output, and return its model."""
+    """Copy model metadata, catalog a successful output, and return its model.
+
+    The output inherits the source model's intrinsic catalog fields
+    (AIModel.derived_entry_fields) on top of what ingest detects from disk.
+    """
     from launcher.ingest import copy_model_metadata, ingest_model
 
+    copy_model_metadata(model_metadata_dir(Path(job.model.path)), job.output_path)
     ingest_path = job.output_path
     if job.tool.output_format == ModelFormat.EXL2:
-        copy_model_metadata(Path(job.model.resolve_path()), job.output_path)
         _remove_exl2_work_artifacts(job.output_path)
     elif job.tool.output_format == ModelFormat.GGUF:
-        source = Path(job.model.resolve_path())
-        if source.is_dir():
-            copy_model_metadata(source, job.output_path)
         gguf_files = sorted(job.output_path.glob("*.gguf"))
         if not gguf_files:
             raise FileNotFoundError(f"GGUF conversion produced no .gguf output in {job.output_path}")
@@ -1178,6 +1209,7 @@ def finalize_quantization(job: QuantizeJob) -> AIModel:
             raise FileNotFoundError(f"GGUF output is missing shard(s): {', '.join(map(str, missing_shards))}")
 
     entry_overrides = {
+        **job.model.derived_entry_fields(),
         "id": job.output_path.name.lower().replace(".", "-"),
         "name": job.model.name,
         "quant": (
@@ -1201,96 +1233,44 @@ def finalize_quantization(job: QuantizeJob) -> AIModel:
 
 
 # ---------------------------------------------------------------------------
-# Cache management
+# Copies and deletion — catalog bookkeeping (file operations live in storage.py)
 # ---------------------------------------------------------------------------
 
-def cache_disk_info(mount: CacheMount) -> tuple[float, float]:
-    """Return (total_gb, free_gb) for the filesystem containing mount.root."""
-    try:
-        return (
-            shutil.disk_usage(str(mount.root)).total / 1024**3,
-            shutil.disk_usage(str(mount.root)).free  / 1024**3,
-        )
-    except OSError:
-        return 0.0, 0.0
+def copies_of(model: AIModel) -> list[AIModel]:
+    """Other catalog entries holding the same model at other paths."""
+    return [m for m in AI_MODELS if m.is_copy_of(model)]
 
 
-def _source_files(model: AIModel) -> list[Path]:
-    """Source files of a file-based model: every GGUF shard plus its companion files."""
-    return gguf_shard_paths(Path(model.path)) + [Path(c) for c in model.companion_paths]
+def register_copy(model: AIModel, dest: Location) -> list[AIModel]:
+    """Add catalog entries for *model* copied to *dest* (after storage.copy_model() succeeded).
 
-
-def cache_source_size_gb(model: AIModel) -> float:
-    """Return the actual on-disk footprint of the model's source, excluding any .git subtree.
-
-    Used by the cache UI to estimate required space — independent of the size_gb
-    catalog field, which records only the logical weight files.  For a file
-    model, sums every GGUF shard plus its companion files (mmproj, MTP head).  For a directory, recursively
-    sums all files except those under a .git/ subdirectory.
+    Every entry sharing the model's path (several formats in one directory) gets a
+    copy — a snapshot of all its fields at its mirrored path.  Entries already
+    catalogued at *dest* are left as they are.  Returns the entries at *dest*.
     """
-    path = Path(model.path)
-    if path.is_file():
-        return sum(p.stat().st_size for p in _source_files(model) if p.is_file()) / 1024**3
-    total = 0
-    for p in path.rglob("*"):
-        if ".git" in p.parts:
-            continue
-        if p.is_file():
-            total += p.stat().st_size
-    return total / 1024**3
+    catalog = _load_catalog()
+    keys = {_entry_key(e) for e in catalog["models"]}
+    copied: list[AIModel] = []
+    for entry in [e for e in catalog["models"] if e["path"] == model.path]:
+        relocated = relocated_entry(entry, dest)
+        key = _entry_key(relocated)
+        if key not in keys:
+            catalog["models"].append(relocated)
+            keys.add(key)
+            AI_MODELS.append(AIModel.from_dict(relocated))
+        copied.append(next(m for m in AI_MODELS if m.key == key))
+    _save_catalog(catalog)
+    return copied
 
 
-def cache_model(model: AIModel, mount: CacheMount) -> tuple["subprocess.Popen[bytes]", str]:
-    """Rsync model from source to a local cache mount.
-
-    Returns a running (Popen, dest_path) pair.  dest_path is where the cached
-    copy will live once rsync completes.  On success the caller should persist
-    it with save_cached_path(model, dest_path).  Re-running it on an existing
-    cache copies only what is missing.
-    """
-    src_p = Path(model.path)
-    dest_root = mount.root / model.cache_subdir
-    if src_p.is_file():                    # file(s) → <mount>/<subdir>/<id>/<filename>
-        dest_dir = dest_root / model.id
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_p = dest_dir / src_p.name
-        # Flattened into one dir: llama.cpp finds split shards beside the first,
-        # and the resolve_*_path() methods look for companion files there too.
-        srcs = [str(p) for p in _source_files(model)]
-        dst = str(dest_dir) + "/"
-    else:                                   # directory → <mount>/<subdir>/<src_dirname>/
-        dest_p = dest_root / src_p.name
-        dest_p.mkdir(parents=True, exist_ok=True)
-        srcs = [str(src_p) + "/"]
-        dst = str(dest_p) + "/"
-    proc = subprocess.Popen(
-        ["rsync", "-ah", "--info=progress2", "--exclude=.git", *srcs, dst],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return proc, str(dest_p)
-
-
-def uncache_model(model: AIModel, mount: CacheMount) -> None:
-    """Delete the cached copy.  Never touches the original source.
-
-    Raises FileNotFoundError if the model has no cached_path set.
-    The mount parameter is accepted for API compatibility but the actual
-    path is taken from model.cached_path.
-    """
-    if not model.cached_path:
-        raise FileNotFoundError(f"No cached_path set for model {model.id!r}")
-    cached_p = Path(model.cached_path)
-    if not cached_p.exists():
-        raise FileNotFoundError(f"Cached path not found on disk: {cached_p}")
-    if cached_p.is_file():
-        cached_files = gguf_shard_paths(cached_p) + [
-            cached_p.parent / Path(c).name for c in model.companion_paths
-        ]
-        for f in cached_files:
-            f.unlink(missing_ok=True)
-    else:
-        shutil.rmtree(str(cached_p))
+def delete_model(plan: DeletionPlan) -> None:
+    """Delete the files in *plan* (see storage.plan_deletion), then drop its catalog entries."""
+    plan.execute()
+    keys = {m.key for m in plan.entries}
+    catalog = _load_catalog()
+    catalog["models"] = [e for e in catalog["models"] if _entry_key(e) not in keys]
+    _save_catalog(catalog)
+    AI_MODELS[:] = [m for m in AI_MODELS if m.key not in keys]
 
 
 def save_server_status(
@@ -1315,7 +1295,7 @@ def save_server_status(
         env_dict = entry.setdefault("server_status", {}).setdefault(server_id, {}).setdefault(env_name, {})
         env_dict[qk] = status
 
-    _patch_catalog(model.id, _apply)
+    _patch_catalog(model, _apply)
 
 
 def _rewrite_env_status(server_id: str, old_name: str, new_name: str | None) -> int:
@@ -1380,7 +1360,7 @@ def save_ctx_override(model: AIModel, value: int) -> None:
         else:
             entry.pop("ctx_override", None)
 
-    _patch_catalog(model.id, _apply)
+    _patch_catalog(model, _apply)
 
 
 def save_rope_scaling(model: AIModel, rope_scaling: RopeScaling | None) -> None:
@@ -1396,41 +1376,7 @@ def save_rope_scaling(model: AIModel, rope_scaling: RopeScaling | None) -> None:
         else:
             entry.pop("rope_scaling", None)
 
-    _patch_catalog(model.id, _apply)
-
-
-def save_cached_path(model: AIModel, cached_path: str) -> None:
-    """Persist cached_path for all catalog entries sharing the same source path.
-
-    Multiple catalog entries can point to the same source path (e.g. different
-    format variants of a directory-based model).  Caching that directory applies
-    to all of them — every co-path entry receives the same cached_path, or has
-    it cleared together when uncached.
-
-    Mutates all matching in-memory models immediately, then rewrites all matching
-    entries in the JSON catalog in a single file write.
-    Called after a successful cache_model() rsync (to set) or after
-    uncache_model() (to clear).
-    """
-    source_path = model.path
-
-    # 1. Update all in-memory models with the same source path.
-    for m in AI_MODELS:
-        if m.path == source_path:
-            m.cached_path = cached_path
-
-    # 2. Update all matching entries in the JSON catalog in one write.
-    with open(_CATALOG_PATH, encoding="utf-8") as f:
-        catalog = json.load(f)
-    for entry in catalog["models"]:
-        if entry["path"] == source_path:
-            if cached_path:
-                entry["cached_path"] = cached_path
-            else:
-                entry.pop("cached_path", None)
-    with open(_CATALOG_PATH, "w", encoding="utf-8") as f:
-        json.dump(catalog, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    _patch_catalog(model, _apply)
 
 
 def save_favorite(model: AIModel, favorite: bool) -> None:
@@ -1447,7 +1393,7 @@ def save_favorite(model: AIModel, favorite: bool) -> None:
         else:
             entry.pop("favorite", None)
 
-    _patch_catalog(model.id, _apply)
+    _patch_catalog(model, _apply)
 
 
 def save_server_param(model: AIModel, server: ServerSoftware, key: str, value: Any) -> None:
@@ -1471,7 +1417,7 @@ def save_server_param(model: AIModel, server: ServerSoftware, key: str, value: A
             entry.pop("server_params")
 
     _apply(model.server_params)
-    _patch_catalog(model.id, _apply_entry)
+    _patch_catalog(model, _apply_entry)
 
 
 def save_template_patch_enabled(model: AIModel, patch_id: str, enabled: bool) -> None:
@@ -1493,4 +1439,4 @@ def save_template_patch_enabled(model: AIModel, patch_id: str, enabled: bool) ->
         else:
             entry.pop("disabled_template_patches", None)
 
-    _patch_catalog(model.id, _apply)
+    _patch_catalog(model, _apply)

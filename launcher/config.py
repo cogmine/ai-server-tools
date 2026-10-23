@@ -52,11 +52,11 @@ def _count_gpus() -> int:
 
 
 @dataclass
-class CacheMountConfig:
-    """One local storage tier that caches a subset of the source model library."""
-    label:    str
-    root:     Path
-    priority: int  # lower = checked first
+class LocationConfig:
+    """One storage location models can live on (NAS, NVMe, …)."""
+    label:       str    # short name shown in the model list, e.g. "NAS"
+    root:        Path
+    description: str = ""
 
 
 @dataclass
@@ -80,7 +80,7 @@ class SiteConfig:
     # None = not configured, servers keep their own default.
     host_cache_ram_mib:   int | None = None
     server_ports:         dict[str, int] = field(default_factory=dict)  # per-server port overrides from [ports]
-    cache_mounts:         list[CacheMountConfig] = field(default_factory=list)
+    locations:            list[LocationConfig] = field(default_factory=list)  # in config order
 
     @property
     def resolved_cuda_devices(self) -> str:
@@ -118,14 +118,14 @@ def _load() -> SiteConfig:
     if pp == 0:
         pp = _count_gpus()
 
-    mounts: list[CacheMountConfig] = []
-    for m in raw.get("cache_mounts", []):
-        mounts.append(CacheMountConfig(
-            label=m["label"],
-            root=expand_path(m["root"]),
-            priority=int(m["priority"]),
-        ))
-    mounts.sort(key=lambda m: m.priority)
+    locations = [
+        LocationConfig(
+            label=loc["label"],
+            root=expand_path(loc["root"]),
+            description=loc.get("description", ""),
+        )
+        for loc in raw.get("locations", [])
+    ]
 
     return SiteConfig(
         conda_base=expand_path(
@@ -152,7 +152,7 @@ def _load() -> SiteConfig:
             paths.get("comfyui_models_dir", "~/ComfyUI/models")),
         host_cache_ram_mib=_parse_ram_mib(memory.get("host_cache_ram")),
         server_ports=ports,
-        cache_mounts=mounts,
+        locations=locations,
     )
 
 

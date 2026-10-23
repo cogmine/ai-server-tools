@@ -152,12 +152,7 @@ GpuTable DataTable {
     min-width: 12;
 }
 
-/* ── Cache management screens ────────────────────────────────────────────── */
-#cache-table {
-    height: 1fr;
-    margin: 0 1;
-}
-
+/* ── Copy screens ─────────────────────────────────────────────────────────── */
 #storage-bar {
     height: 1;
     margin: 0 1;
@@ -166,42 +161,42 @@ GpuTable DataTable {
     color: $text-muted;
 }
 
-#cache-status-label {
+#copy-status-label {
     margin: 0 1 1 1;
 }
 
-#cache-ops {
+#copy-ops {
     margin: 0 1;
 }
 
-#cache-ops Button {
+#copy-ops Button {
     width: 100%;
     margin-bottom: 1;
 }
 
-#cache-op-title {
+#copy-op-title {
     margin: 0 1 1 1;
     text-style: bold;
     color: $accent;
 }
 
-#cache-progress-bar {
+#copy-progress-bar {
     margin: 0 1 0 1;
     height: 1;
 }
 
-#cache-progress-detail {
+#copy-progress-detail {
     height: 1;
     margin: 0 1;
     text-align: right;
 }
 
-#cache-ops-status {
+#copy-ops-status {
     height: 1;
     margin: 0 1;
 }
 
-#cache-op-buttons {
+#copy-op-buttons {
     height: auto;
     margin: 1 1 0 1;
     align: center middle;

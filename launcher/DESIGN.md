@@ -5,7 +5,7 @@
 A keyboard-driven Textual TUI that selects and launches large-model inference servers (vLLM, llama.cpp, tabbyAPI). The key objectives:
 
 - Navigate a large model catalogue without touching config files each time
-- Prefer the fastest cached copy of a model over the original source automatically
+- Track every copy of a model across storage locations (NAS, local drives) and copy / delete them from the TUI
 - Persist test-result annotations (good / bad / unknown) per model per server environment
 - Run each server from one of several registered environments (e.g. a stable and an experimental vLLM install)
 - Keep all system-specific paths out of version control
@@ -19,11 +19,12 @@ A keyboard-driven Textual TUI that selects and launches large-model inference se
 config.py                   Site-specific loader — reads user_data/config.toml, exposes CONFIG singleton
 config.toml.example         Tracked template — copy to user_data/config.toml and edit
 models.py                   Schema — enums, dataclasses, pure logic (no instances, no I/O)
-data.py                     Generic instances — SERVERS list + CACHE_MOUNTS (config-driven, committable)
+data.py                     Generic instances — SERVERS list, QUANTIZATION_TOOLS, catalog loading (committable)
+storage.py                  Storage locations (LOCATIONS), mirrored paths, model files, copy + deletion plans
 environments.py             Server runtime environments — Environment kinds (conda / native) + ENVIRONMENTS registry
 environments.json.example   Tracked template — environment registry (copy to user_data/environments.json)
 models_local.json.example   Tracked template — schema reference + 3 sample entries
-launch.py                   Command builders + process spawner + cache manager
+launch.py                   Command builders + process spawner + catalog persistence (incl. copy/delete bookkeeping)
 chat_template.py            Chat template reader + launch-time patches (TEMPLATE_PATCHES) → user_data/chat_templates/
 fit.py                      Pre-launch memory-fit estimates (FitProbe per server — llama.cpp: llama-fit-params)
 screens.py                  All Textual screens
@@ -49,8 +50,8 @@ user_data/                  Gitignored — all machine-specific and personal dat
 ```
 user_data/config.toml (gitignored)
     └── config.py → SiteConfig dataclass (singleton CONFIG)
-            ├── models.py  (cache mounts)
-            ├── data.py    (SERVERS.default_params, CACHE_MOUNTS)
+            ├── storage.py (LOCATIONS — [[locations]])
+            ├── data.py    (SERVERS.default_params)
             ├── environments.py (conda_base → conda env locations)
             └── launch.py  (app paths, CUDA_VISIBLE_DEVICES, CUDA_HOME)
 
@@ -65,13 +66,13 @@ user_data/environments.json (gitignored, written by the TUI)
 
 `[memory] host_cache_ram` (a share of physical RAM such as `"60%"`, or integer MiB) is resolved once at load into `CONFIG.host_cache_ram_mib` (`None` when unset) and becomes llama.cpp's `cache_ram_mib` default (`--cache-ram`). It is a host-level budget rather than a per-server one because it is sized against the machine's RAM; other servers' host-side KV caches (SGLang hierarchical cache, vLLM KV offload) can draw on the same setting.
 
-**Why TOML, not envvars or a Python file?** TOML is structured and typed without being executable. Envvars are awkward for multi-key sections (cache mounts) and invisible at a glance. A Python file would need `exec()` or an import that could shadow package modules.
+**Why TOML, not envvars or a Python file?** TOML is structured and typed without being executable. Envvars are awkward for multi-key sections (storage locations) and invisible at a glance. A Python file would need `exec()` or an import that could shadow package modules.
 
 ---
 
 ## The Privacy Split: data.py vs models_local.py
 
-`data.py` contains the SERVERS list and CACHE_MOUNTS table — both are fully config-driven (paths come from CONFIG) and are safe to commit.
+`data.py` contains the SERVERS list and quantization tools — fully config-driven (paths come from CONFIG) and safe to commit.
 
 `user_data/models_local.json` (gitignored) contains the AI_MODELS catalog. It is a plain JSON file: one object with a `"models"` array, each element corresponding to one `AIModel`. Being JSON rather than Python means:
 - A future catalog scanner can generate or update it without touching Python source
@@ -94,8 +95,8 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 
 | Field | Purpose |
 |---|---|
-| `id` | Unique slug; becomes `--served-model-name` / llama.cpp `--alias` |
-| `path` | Absolute path to the model file or directory — any accessible location (local SSD, network share, etc.) |
+| `id` | Slug used as `--served-model-name` / llama.cpp `--alias`. Shared by copies of the model at other locations, so it is **not** the catalog key — an entry is identified by `AIModel.key` = `(path, format)` (one directory may hold several formats, each its own entry). |
+| `path` | Absolute path to the model file or directory, inside a storage location. Each entry has exactly one path; a model on two drives is two entries. |
 | `format` | Gates server compatibility (`ModelFormat` enum) |
 | `ai_types` | frozenset of AIType — determines which type-selection menus it appears in |
 | `ctx` | Native/trained maximum context length (tokens); used verbatim if no `ctx_override` is set |
@@ -106,12 +107,12 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `min_sm` | Minimum CUDA compute capability required to load this model (integer, e.g. `89` for sm_89+). `0` = no constraint. Checked against `system_min_sm()` at display time. |
 | `hw_note` | Optional human-readable explanation shown in the note bar when `hw_compat()` returns `False`. When omitted, `hw_compat_note` generates a default: `"Requires sm_{min_sm}+ GPU"`. |
 | `comfyui_subdir` | `image_gen` models only — ComfyUI `models/` subdirectory to stage into. Default: `"checkpoints"` (omit from JSON). Use `"diffusion_models"` for FLUX UNets. Extensible: any valid subdirectory name accepted by ComfyUI. |
-| `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time — via `resolve_mmproj_path()`, which prefers the copy cached beside the model. Omitted from JSON when empty. |
-| `mtp_path` | Absolute path to the companion `mtp-*.gguf` multi-token-prediction draft head. Set automatically by `ingest`/`refresh`. llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <resolve_mtp_path()>` unless the `mtp` server param is `false`. Cached alongside the model. Omitted from JSON when empty. |
+| `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time — from the entry's own `mmproj_path`. Omitted from JSON when empty. |
+| `mtp_path` | Absolute path to the companion `mtp-*.gguf` multi-token-prediction draft head. Set automatically by `ingest`/`refresh`. llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <mtp_path>` unless the `mtp` server param is `false`. Cached alongside the model. Omitted from JSON when empty. |
 | `mtp_embedded` | `True` when the GGUF itself carries MTP (NextN) layers — `<arch>.nextn_predict_layers > 0` in its header, read by `gguf_header.py` during `ingest`/`refresh`. Used (`--spec-type draft-mtp`, no draft file) only when the `mtp` server param is `true`, since many GGUFs keep NextN layers that a llama.cpp build cannot run for their architecture (e.g. GLM5-Next: "NextN graph not implemented yet"). Omitted from JSON when false. |
 | `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. |
 | `disabled_template_patches` | frozenset of `ChatTemplatePatch.id`s the model opts out of; every other patch matching its chat template is applied at launch (see *Chat Template Patches*). Toggled with `t` on the model list via `save_template_patch_enabled()`. Omitted from JSON when empty. |
-| `cached_path` | Optional absolute path to a faster local copy. Set by the TUI cache action; cleared on uncache. `resolve_path()` returns this when non-empty and present on disk, otherwise returns `path`. Multiple entries may share the same `cached_path` when they point to the same source directory — `save_cached_path()` fans out to all of them. |
+| `family` | Shared by an original model and every copy, conversion and quantization of it (ingest assigns the slug of the model's name; `register_copy()` and `finalize_quantization()` carry it over). Groups related entries without a per-model link chain, so deleting an intermediate (e.g. an F16 GGUF used to make a Q8_0) loses nothing. |
 | `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
 | `server_params` | Per-server overrides merged on top of server defaults at launch time |
 
@@ -159,7 +160,7 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 | `stage_all_models` | `bool` | When `True`, stage every compatible catalog model (ComfyUI — model is chosen per API request, not at launch) |
 | `staging_format_suffixes` | `dict[ModelFormat, str]` | Maps format → file extension suffix for the staging symlink (e.g. `{GGUF: ".gguf"}`; empty = no suffix) |
 | `staging_subdir_attr` | `str \| None` | Name of an `AIModel` field whose value is appended as a subdirectory within `model_dir` (e.g. `"comfyui_subdir"` → `model.comfyui_subdir`) |
-| `staging_use_source_filename` | `bool` | When `True`, the staged symlink is named after the source file (`Path(resolve_path()).name`) rather than `model.id + suffix`. Use for servers (e.g. ComfyUI) where the client selects models by original filename, not catalog ID. |
+| `staging_use_source_filename` | `bool` | When `True`, the staged symlink is named after the source file (`Path(model.path).name`) rather than `model.id + suffix`. Use for servers (e.g. ComfyUI) where the client selects models by original filename, not catalog ID. |
 | `launch_cwd` | `str \| None` | Working directory for the spawned process (`None` = inherit) |
 | `max_gpus` | `int` | Maximum GPUs selectable in `GpuSelectScreen`: `0` = unlimited (all GPUs, multi-select); `1` = single GPU only (radio-button) |
 | `gpu_count_param` | `str \| None` | When set, `GpuSelectScreen` injects `{gpu_count_param: selected_count}` as a `param_overrides` entry so parallelism flags (e.g. `pipeline_parallel` for vLLM/SGLang) stay consistent with the selected GPU count. `None` for servers that handle variable GPU counts automatically (tabbyAPI `--gpu-split-auto`, llama.cpp layer distribution) |
@@ -250,9 +251,8 @@ App.on_mount
         │                                       └─ ConfirmLaunch(command, factory, None, server, env)
         │                                               └─ App.exit(LaunchJob(model=None))
         └─ Manage Models → ModelManageScreen(type)
-                               └─ → / Enter → CacheActionScreen(model)
-                                                   ├─ [Cache]   → CacheProgressScreen(model, mount)
-                                                   └─ [Uncache] → removes cached copy, pops screen
+                               └─ → / Enter → CopyModelScreen(model)
+                                                   └─ [location] → CopyProgressScreen(model, dest)
 ```
 
 `uses_hub_flow(servers, ai_type)` returns `True` when every server for a given AI type has `stage_all_models=True`. The check lives in `models.py` (domain logic) so neither `screens.py` nor `app.py` need to know about `stage_all_models` directly.
@@ -265,9 +265,9 @@ For server launches with a model, `run()` re-opens the menu after Ctrl-C with th
 
 **`EnvManageScreen`** (`e`): table of the server's environments (★ default, name / missing flag, versions, note) with a detail bar (location, "also used by"). Bindings: `a` add, `c` create missing, `r` rename, `d` remove, `s` set default, `n` note. Multi-step flows are `@work` async methods using `push_screen_wait()` with three reusable dialogs: `TextPromptScreen` (validated single-line input), `ChoiceScreen` (message + button list) and `CommandRunScreen` (streams an external command's output; dismisses with success). Adding a conda env that does not exist offers: create empty (prompts for a Python version, default 3.11), clone any existing registered conda env (same-server first), register without creating, or cancel.
 
-**`ImageGenHubScreen`**: Two-button menu. "Launch Server" pushes `ServerSelectScreen(model=None, ai_type=...)` which filters servers by type (via `servers_for_type()`), skips path validation, and suppresses g/x/? status marking. "Manage Models" pushes `ModelManageScreen` — all catalog management bindings work identically to `ModelSelectScreen`; `→`/`Enter` open `CacheActionScreen` for the focused model (cache/uncache) rather than advancing toward a server launch. Both buttons use `variant="primary"`.
+**`ImageGenHubScreen`**: Two-button menu. "Launch Server" pushes `ServerSelectScreen(model=None, ai_type=...)` which filters servers by type (via `servers_for_type()`), skips path validation, and suppresses g/x/? status marking. "Manage Models" pushes `ModelManageScreen` — all catalog management bindings work identically to `ModelSelectScreen`; `→`/`Enter` open `CopyModelScreen` for the focused model (copy to another location) rather than advancing toward a server launch. Both buttons use `variant="primary"`.
 
-**`ModelManageScreen`**: Subclass of `ModelSelectScreen` — overrides `_open_model()` (the template method called by both `action_dt_select` and `on_data_table_row_selected`) to push `CacheActionScreen` instead of `ServerSelectScreen`, and overrides `_title_text()` to show "manage models" in the title. `set_ctx_override`, `quantize_selected` and `template_patches` are hidden via `_MANAGE_HIDDEN` in `check_action` (text-gen-only concepts irrelevant for diffusion models). The template method pattern is necessary because Textual calls all MRO classes' message handlers — both `@on` decorator and auto-named handlers — so standard Python MRO shadowing does not work for Textual message dispatch; only plain method calls (like `_open_model()`) respect the most-derived override.
+**`ModelManageScreen`**: Subclass of `ModelSelectScreen` — overrides `_open_model()` (the template method called by both `action_dt_select` and `on_data_table_row_selected`) to push `CopyModelScreen` instead of `ServerSelectScreen`, and overrides `_title_text()` to show "manage models" in the title. `set_ctx_override`, `quantize_selected` and `template_patches` are hidden via `_MANAGE_HIDDEN` in `check_action` (text-gen-only concepts irrelevant for diffusion models). The template method pattern is necessary because Textual calls all MRO classes' message handlers — both `@on` decorator and auto-named handlers — so standard Python MRO shadowing does not work for Textual message dispatch; only plain method calls (like `_open_model()`) respect the most-derived override.
 
 **Root-screen back action**: Textual always keeps a blank `_DefaultScreen` at stack index 0. The root application screen sits at index 1. `action_dt_back()` on root screens (`ModelSelectScreen`, `AITypeScreen`) checks `len(screen_stack) > 2` (not `> 1`) before popping; at the root it calls `app.exit(None)` instead.
 
@@ -290,7 +290,7 @@ Pure button screens need none of this — buttons don't consume `enter`, `right`
 
 **Footer binding conventions**: All screens follow a consistent ordering and glyph convention for footer bindings:
 
-1. **Quit** — always first: `Binding("q", "quit_app", "Quit")`. Omitted on `ContextSettingsScreen` (Input captures `q`) and on `CacheProgressScreen` (`q` is the cancel key, not quit).
+1. **Quit** — always first: `Binding("q", "quit_app", "Quit")`. Omitted on `ContextSettingsScreen` (Input captures `q`) and on `CopyProgressScreen` (`q` is the cancel key, not quit).
 2. **Back / Cancel** — always second: `key_display="esc/←"`. Escape-only modals (e.g. `ContextSettingsScreen`) use `key_display="esc"`.
 3. **Contextual bindings** — alphabetical by key character (e.g. `?`, `c`, `f`, `g`, `l`, `x`, `z`).
 4. **Select / primary action** — always last:
@@ -298,7 +298,7 @@ Pure button screens need none of this — buttons don't consume `enter`, `right`
    - Button screens: `key_display="↵/→/Space"` — space activates the focused button.
    - `GpuSelectScreen`: `key_display="↵/→"` — space toggles GPU selection items, not confirm.
 
-`CacheProgressScreen` is a special case: `escape,q,b,left` are all folded into a single Cancel binding displayed as `esc/←`; `q` means "abort transfer" here, not "quit app".
+`CopyProgressScreen` is a special case: `escape,q,b,left` are all folded into a single Cancel binding displayed as `esc/←`; `q` means "abort transfer" here, not "quit app".
 
 The App-level `q → quit_app` binding uses `show=False` to prevent duplication in the footer (each screen's own Quit binding takes precedence and displays first).
 
@@ -314,7 +314,7 @@ The App-level `q → quit_app` binding uses `show=False` to prevent duplication 
 ModelSelectScreen → z
     → (>1 tool) QuantizeToolScreen   — choose tool; skipped when exactly one applies
     → QuantizeOptionScreen            — choose quant level / bpw from tool.quant_options
-    → QuantizeDestScreen              — choose output destination (CACHE_MOUNTS with free space)
+    → QuantizeDestScreen              — choose output destination (LOCATIONS with free space; offline disabled)
     → QuantizeGpuScreen               — choose GPUs exposed to the quantization tool
     → ConfirmQuantize                 — show command + output path; runs job outside TUI
 ```
@@ -334,7 +334,7 @@ Groups of rows equal in the primary column cascade to the secondary, then tertia
 Sort-direction conventions in `_SORT_KEY`:
 - **Scalars** (`size`, `params`, `ctx`, `moe`): raw value — ascending = smallest first.
 - **Boolean flags** (`fav`, `vision`, `trc`): expressed as `0 if flag else 1` so ascending (default) puts flagged/interesting rows at the top.
-- **Cache**: tuple `(0, label)` if cached, `(1, "")` if not — cached rows come first; ties broken A–Z by mount label.
+- **Location**: index of the model's location in `[[locations]]` order; paths outside every location sort last.
 - **Text** (`name`, `format`, `note`): lower-cased string, A–Z ascending.
 
 The `warn` column is intentionally excluded from `_SORT_KEY`: it is a derived visual icon whose underlying signals (model size vs VRAM, `min_sm`) are already captured by the `size` and `format` sort keys.
@@ -388,7 +388,7 @@ The fitter logs its projection for the requested settings within ~2 s (a per-dev
 ServerSoftware.default_params
     + AIModel.server_params[server.id]   (merged at build time; skipped when model=None)
     + param_overrides                    (from GpuSelectScreen — e.g. pipeline_parallel = N, parallel slots)
-    + AIModel.resolve_path() → injected as _model_path  (skipped when model=None)
+    + AIModel.path → injected as _model_path  (skipped when model=None)
     + patched_template(model) → injected as _chat_template (path, or "" when no patch applies)
     → _build_<server_id>(server, env, model, merged_params) → list[str]
 ```
@@ -406,7 +406,7 @@ All builders take their context from `server.launch_ctx(model)` (not `model.ctx`
 
 The vLLM/SGLang JSON (`_hf_rope_override()`) starts from the model's own RoPE block in `config.json` (`text_config` for multimodal checkpoints; `rope_parameters` in transformers ≥ 5, else `rope_scaling`) and sets `rope_type`, `factor` and `original_max_position_embeddings`: the servers replace the block wholesale, so fields like `mrope_section`, `partial_rotary_factor` and `rope_theta` must be carried over. Frameworks implement static YaRN, which can cost quality on short prompts, so it is opt-in per model. Builders for `stage_all_models` servers (e.g. `_build_comfyui`) accept `model=None` and must not access model attributes.
 
-`resolve_path()` returns `model.cached_path` if it is set and the path exists on disk (`Path.exists()` — handles both files and directories uniformly); otherwise returns `model.path`. The `mounts` list in `CacheMount` is used only to determine *where* to place new cached copies and to display disk-space info in the UI.
+Builders use the entry's own `path` and companion paths: the user picks which copy to launch by picking its row.
 
 Builders take the interpreter / binaries from `env` (`env.python`, `env.executable(...)`) — never from config.
 
@@ -432,7 +432,7 @@ Some chat templates reject conversations the model handles fine. Qwen 3.5 / 3.6 
 - **`system_anywhere`** replaces the `raise_exception('System message must be at the beginning.')` statement with `{{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}`. In both template variants the statement is reached only for system messages not already rendered as the leading system block, and `content` is the message loop's rendered content (a `requires` guard), so leading-system-only prompts render byte-identically. Verified with Python Jinja2 (vLLM / SGLang / ooba / tabby) and llama.cpp's own engine (`test-chat-template`).
 - **Reading** (`read_chat_template(model)`): from `model.resolve_path()` — a GGUF's `tokenizer.chat_template` header key (via `gguf_header.py`), else `chat_template.jinja` → `chat_template.json` → `tokenizer_config.json` (transformers' precedence; for a list of named templates, the `"default"` one). Reads are LRU-cached per (file, mtime), so the per-build lookup is cheap even over the NAS.
 - **Application**: `patched_template(model)` applies every matching patch not in `model.disabled_template_patches` and returns a `PatchedChatTemplate` (`None` when nothing applies). `launch_params()` injects its path as `_chat_template` for servers with a `chat_template_flag`; each builder emits `_chat_template_args()` just before `extra_flags` (so a hand-written override in `extra_flags` still wins). Like staging, the file is written by `launch()` — `user_data/chat_templates/<model.id>.jinja`, rewritten only when the content changed — and the log header gets a `# tmpl:` line naming the applied patches.
-- **Why a sidecar file rather than patching the model?** Every text-gen server accepts a template override, so source copies (often on the read-only NAS) and caches stay pristine and the patch also works for uncached models. Rewriting a GGUF's embedded template would change its header size, forcing a rewrite of the whole multi-GB file.
+- **Why a sidecar file rather than patching the model?** Every text-gen server accepts a template override, so model files on every location stay pristine and the patch also works for models. Rewriting a GGUF's embedded template would change its header size, forcing a rewrite of the whole multi-GB file.
 - **Opt-out**: automatic by default; `t` on the model list runs `available_patches()` in a thread (the GGUF header may be on the NAS) and shows a `ChoiceScreen` toggling each matching patch, persisted via `save_template_patch_enabled()`.
 
 ---
@@ -459,12 +459,12 @@ Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matchi
 
 `compute_quant_output_path(tool, model, quant_option, dest)` in `launch.py` always returns a **directory**. Every job gets its own uniquely-named directory so that removal is always consistent: delete the directory and its contents, regardless of format.
 
-- **GGUF output**: `<dest.root>/<model.cache_subdir>/<source_stem>-GGUF-<quant>/`
+- **GGUF output**: `<dest.root>/<model.type_subdir>/<source_stem>-GGUF-<quant>/`
   — GGUF re-quantization strips the source quant suffix; HF conversion keeps the source directory name. The builder writes a `.gguf` file inside the directory.
   Example: `<dest>/text-generation/MyModel-GGUF-Q4_K_M/MyModel.Q4_K_M.gguf` or `<dest>/text-generation/MyModel-GGUF-F16/MyModel.F16.gguf`
 
-- **EXL2 convert**: `<dest.root>/<model.cache_subdir>/<source_dirname>-exl2-<bpw>bpw/`
-  — `source_dirname` is `Path(model.resolve_path()).name`.
+- **EXL2 convert**: `<dest.root>/<model.type_subdir>/<source_dirname>-exl2-<bpw>bpw/`
+  — `source_dirname` is `Path(model.path).name`.
   Example: `<dest>/text-generation/MyModel-exl2-4.0bpw/`
 
 The output directory is shown to the user in `ConfirmQuantize` before they confirm.
@@ -476,7 +476,7 @@ Follows the same PTY + log structure as `launch()`:
 - Output directory created before spawn
 - `build_quantize_cmd(tool, model, quant_option, dest, cuda_devices=None)` includes an explicit `env CUDA_VISIBLE_DEVICES=…` prefix and `CUDA_HOME` from `tool.cuda_home` when non-empty. The picker passes its selected devices through confirmation to `quantize()`; non-TUI callers default to `CONFIG.resolved_cuda_devices`. Preview, log, and execution use the same builder.
 - Same PTY window-size stamping and bash wrapper
-- On exit code 0, `finalize_quantization()` copies source config/tokenizer metadata for directory inputs, removes EXL2 work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), resolves the first shard of GGUF outputs, and registers the generated model through `ingest_model()`
+- On exit code 0, `finalize_quantization()` copies the source's config/tokenizer files (from `ingest.model_metadata_dir()` — the HF directory itself, or the directory beside / one level above a GGUF) into the output, removes EXL2 work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), resolves the first shard of GGUF outputs, and registers the generated model through `ingest_model()`. The entry overrides start from `AIModel.derived_entry_fields()` — model-intrinsic facts and behaviour settings (`_DERIVED_FIELDS` in `models.py` plus `rope_scaling` and `disabled_template_patches`) — so values ingest cannot re-detect (e.g. a GGUF source without `config.json`) or that the user curated survive. Format-, size- and launch-specific fields (note, favorite, status, server params, ctx override, hardware requirements) are not inherited.
 - The launcher then reopens with the generated model focused; failed or interrupted outputs remain on disk for inspection/resume but are not registered
 
 ### `exl2_convert_script` config field
@@ -546,7 +546,7 @@ ComfyUI differs from text generation servers in one key way: **it does not accep
 | `"checkpoints"` (default) | `~/ComfyUI/models/checkpoints/` | SDXL / SD1.5 full checkpoints |
 | `"diffusion_models"` | `~/ComfyUI/models/diffusion_models/` | FLUX UNets / diffusion transformers |
 
-Each link target is `model.resolve_path()` — so a locally cached copy is used whenever one exists, and the source path is used otherwise. The symlink name is the **original source filename** (`Path(model.resolve_path()).name`) because ComfyUI workflows reference models by their natural filenames (e.g. `flux1-dev.safetensors`, `ae.safetensors`). This is controlled by `staging_use_source_filename=True` on the ComfyUI `ServerSoftware` entry.
+Each link target is the model's `path`; a model with copies on several locations is staged once (`_one_copy_each()` — first copy present on disk in `[[locations]]` order). The symlink name is the **original source filename** (`Path(model.path).name`) because ComfyUI workflows reference models by their natural filenames (e.g. `flux1-dev.safetensors`, `ae.safetensors`). This is controlled by `staging_use_source_filename=True` on the ComfyUI `ServerSoftware` entry.
 
 This is fully driven by catalog entries. Adding a model to the catalog (via `ingest --ai-type image_gen`) and launching ComfyUI is all that's needed for it to appear in ComfyUI's model picker.
 
@@ -639,7 +639,7 @@ Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
 | `cache_ram_mib` | `CONFIG.host_cache_ram_mib` | `--cache-ram <v>` when not `None`. Host-RAM store of saved slot states, restored instead of re-processing a prompt when more conversations are active than slots; filled on demand. llama.cpp's 8 GiB default holds less than one full 128K slot of a large model |
 | `ubatch` | `None` | `--ubatch-size <v>` when set (llama.cpp default 512). Compute buffers scale with ubatch × total context and outweigh the KV cache at YaRN 1M contexts (Qwen3.8-Flash-Next Q8_0, 3 × 1M: 187 GiB at 512 vs 131 GiB at 256); smaller values cost prompt-processing speed. In `llamacpp_model_args()`, so the fit estimate reflects it |
 | `threads` | `0` | `--threads <v>` only when non-zero; otherwise llama.cpp uses the physical core count (hyperthreads only add contention for CPU math, and fully offloaded models barely use the CPU) |
-| `mtp` | `None` | MTP speculative decoding, via `_mtp_args()` (shared with ooba). `None` (auto): `--spec-type draft-mtp --model-draft <resolve_mtp_path()>` when the model has a sidecar `mtp_path`. `true`: additionally `--spec-type draft-mtp` alone for an `mtp_embedded` model (opt-in per model, once its architecture's MTP graph is known to work on the build). `false`: off. Not passed to `llama-fit-params` (it rejects speculative flags), so the fit estimate excludes the head |
+| `mtp` | `None` | MTP speculative decoding, via `_mtp_args()` (shared with ooba). `None` (auto): `--spec-type draft-mtp --model-draft <mtp_path>` when the model has a sidecar `mtp_path`. `true`: additionally `--spec-type draft-mtp` alone for an `mtp_embedded` model (opt-in per model, once its architecture's MTP graph is known to work on the build). `false`: off. Not passed to `llama-fit-params` (it rejects speculative flags), so the fit estimate excludes the head |
 
 Always-on: `--model`, `--alias <model.id>`, `--host 0.0.0.0`, `--port`, `--log-prefix`, `--log-timestamps`; `--mmproj` when the model has a projector. `extra_flags` are appended last.
 
@@ -648,19 +648,21 @@ Possible extension: newer builds add `--kv-unified-per-slot N` (one shared KV po
 
 ---
 
-## Cache Management
+## Storage Locations, Copies and Deletion
 
-`cache_model()` runs `rsync -ah --info=progress2` from the model's `path` to a local cache mount. Single-file models are detected with `src_p.is_file()` (not extension-based, so `.safetensors`, `.gguf`, and any future single-file formats are handled correctly); directories use trailing-slash semantics to sync contents. A split GGUF set (`<base>-00001-of-000NN.gguf`) is catalogued by its first shard, so file models are expanded via `gguf_shard_paths()` (`models.py`, shared with ingest) and every shard is copied into the same destination directory — llama.cpp locates the remaining shards next to the first. A file model's companion files (`AIModel.companion_paths`: `mmproj_path`, `mtp_path`) are copied into that same directory too (`_source_files()` lists shards + companions for sizing and copying); `resolve_mmproj_path()` / `resolve_mtp_path()` return the cached copy whenever the cached model is in use, and builders pass those. Re-running `cache_model()` on an existing cache copies only what is missing. `stdout=PIPE` is set so the TUI can read rsync output live; `stderr=PIPE` captures error text on failure. The returned `Popen` lets the UI poll progress without blocking.
+**Locations** (`storage.py`): every place models live — NAS and local drives — is a `Location(label, root, description)` from `config.toml` `[[locations]]`, in display order (`LOCATIONS`). There are no priorities and no cache tier: `location_of(path)` (innermost root containing the path) gives a model's location, shown in the model list's Location column (dimmed when `Location.online` is false, i.e. the root is missing — an unmounted NAS). `disk_info()` feeds the free-space hints of every destination picker.
 
-`uncache_model()` deletes the cached copy only — it never touches the original source; for a split GGUF it deletes every shard, plus the cached companion files. Raises `FileNotFoundError` if `model.cached_path` is empty or the path no longer exists. `resolve_path()` only returns `cached_path` when every shard of a split set is present, so an interrupted copy falls back to the source.
+**One entry per copy**: a catalog entry is one model at one path. A copy is another entry with the same `id` (served name), `format` and `family` at the **mirrored path** — the same path relative to its location root (`mirrored_path()`), so every location has the same layout. `AIModel.is_copy_of()` / `launch.copies_of()` find copies; `AIModel.key` = `(path, format)` identifies entries everywhere (catalog persistence via `_patch_catalog(model, …)`, DataTable row keys, preselection after quantize). Settings are a snapshot taken at copy time — afterwards copies are independent.
 
-**Cache destination**: `cache_model()` places directory models at `mount.root / <cache_subdir> / src_p.name` (the source directory's own basename, e.g. `BeMag-123B-v0.1/`) and single-file models at `mount.root / <cache_subdir> / model.id / <filename>`. Using the source directory name means that multiple catalog entries pointing to the same source path (e.g. different format variants extracted from one directory) share the same cached location.
+**Model files** (`model_files()`): a directory model is its directory (copied whole, minus `.git`). A file model is every shard of the GGUF, its companions (`mmproj_path`, `mtp_path`) and the `METADATA_FILES` (config/tokenizer) in its `model_metadata_dir()` — not the rest of its bundle. `model_size_gb()` sums them for the copy picker (computed in a worker; buttons show the catalog `size_gb` until then).
 
-**Fan-out on save/clear**: `save_cached_path(model, path)` updates *all* in-memory `AI_MODELS` entries and all JSON catalog entries that share `model.path`, in a single catalog write. This keeps every co-path entry in sync when a directory is cached or uncached.
+**Copy** (`storage.copy_model()` → `CopyProgressScreen` → `launch.register_copy()`): `rsync -ahR --info=progress2` with each source anchored as `<root>/./<relative path>`, so rsync recreates the relative layout under the destination root in one transfer (re-running copies only what is missing). On success `register_copy()` adds a snapshot of every entry sharing the model's path, relocated with `storage.relocated_entry()` (path and companion paths mirrored). Copying onto the model's own location is refused; locations already holding a copy are shown disabled.
 
-**Space estimation**: `cache_source_size_gb(path)` returns the actual on-disk footprint of the source, recursively summing all files while excluding `.git` subtrees (for a file model, the sum over all shards of a split GGUF). This is separate from `size_gb` (which records logical weight-file size only and is shown in the model list). `CacheActionScreen` computes the actual source size asynchronously on mount — buttons initially show `~{size_gb}` until the worker finishes and updates them with the accurate value. On rsync completion, `CacheProgressScreen` calls `save_cached_path(model, dest_path)`. `uncache_model()` deletes the path stored in `model.cached_path` and calls `save_cached_path(model, "")` to clear all co-path entries.
+**Delete** (`storage.plan_deletion()` → `_confirm_delete()` → `launch.delete_model()`): the `DeletionPlan` is computed first, shown verbatim in the confirmation (Cancel focused) and then executed as shown. It removes every entry sharing the model's path; for a directory model, the directory. For a file model: its shards plus companions no other entry references; if the model's directory then holds no other weights or subdirectories and no other entry points inside it, the whole directory goes (unless it is a top-level directory of the location). Directories left empty are pruned up to — never including — the location root. Deleting the last copy (no `copies_of()` for an entry in the plan) also requires typing the model name. Deletion is refused while the location is offline, so an unmounted NAS can never make files look absent and drop entries.
 
-**Progress display**: `CacheProgressScreen._run_cache()` runs in a `@work(thread=True)` worker. It reads rsync stdout in a `select.select()` loop with a 0.5 s timeout, splits on `\r` and `\n` (rsync uses `\r` for in-place progress updates), and passes the most recent non-empty fragment to `_update_progress_line()`. That method parses `(\d+)%\s+([\d.]+\S+/s)\s+([\d:]+)` to extract percentage, speed, and ETA, then updates a Textual `ProgressBar` widget and a detail `Label`. After stdout EOF, `proc.wait()` is called to ensure `returncode` is populated (EOF alone does not guarantee this) before checking success. Stderr content is surfaced in the detail label on failure.
+**Staging with copies**: `stage_all_models` servers (ComfyUI) stage one entry per `(id, format)` via `_one_copy_each()` — the first copy present on disk in `[[locations]]` order — so copies never collide on the same staged filename.
+
+**Progress display**: `CopyProgressScreen._run_copy()` runs in a `@work(thread=True)` worker. It reads rsync stdout in a `select.select()` loop with a 0.5 s timeout, splits on `\r` and `\n` (rsync uses `\r` for in-place progress updates), and passes the most recent non-empty fragment to `_update_progress_line()`, which parses `(\d+)%\s+([\d.]+\S+/s)\s+([\d:]+)` into the `ProgressBar` and a speed/ETA label. After stdout EOF, `proc.wait()` populates `returncode` before checking success; stderr is surfaced on failure.
 
 ---
 
@@ -682,7 +684,7 @@ Possible extension: newer builds add `--kv-unified-per-slot N` (one shared KV po
 
 **Add an environment kind** (e.g. a venv or container image): subclass `Environment` in `environments.py`, implement `location` / `bin_dir` / `exists()` and whichever lifecycle hooks apply, declare `extra_fields`, and register it in `_ENV_KINDS`.
 
-**Add a cache tier**: add a `[[cache_mounts]]` entry in `config.toml`. Priority determines probe order. No code changes needed.
+**Add a storage location**: add a `[[locations]]` entry in `config.toml`. No code changes needed; `ingest` can then recognise copies found there.
 
 **Add an AIType**: extend the `AIType` enum in `models.py`; create corresponding `AI_TYPE_LABELS` entry in `screens.py`; tag models and servers with the new type.
 
@@ -699,6 +701,8 @@ python -m launcher.ingest copy-mmproj <scan_root> [--dry-run]
 ```
 
 Scans a given `scan_root` directory for model paths not already in `models_local.json` and appends new entries. Without `--all`, stops after the first new model (useful for testing detection); with `--all`, ingests every uncatalogued model in one pass.
+
+Every entry is built by `build_entry()`: a path at the same relative position (and format) as a catalogued model on another location is a **copy** — the entry is a snapshot of that model's entry (`storage.relocated_entry()`: same id, family and settings). Anything else is detected from disk and starts a new family (`family` = slug of the detected name).
 
 ### Subcommands
 
@@ -723,10 +727,10 @@ Directories with no `config.json` and no weight files are skipped.
 ### Detection — GGUF files
 
 - **`quant`**: matched against `GGUFQuant` values by regex on the filename. A filename may contain more than one recognised label (e.g. a Q8_0 quant of a BF16 upcast named `<model>-bf16.Q8_0.gguf`), so the **rightmost** match wins — the trailing tag is the actual quantisation. Ties at the same position are broken by the longer label, so `Q4_K_M` still beats a shorter prefix.
-- **`ctx`**: from `config.json` if present in the bundle dir (placed by `copy-configs`); falls back to borrowing from a sibling entry already in the catalog; `0` if neither available.
+- **`ctx`**: from `config.json` if present in the bundle dir (placed by `copy-configs`); else the GGUF header's `<arch>.context_length`; else borrowed from a sibling entry already in the catalog; `0` if none available.
 - **`size_gb`**: from `stat().st_size` of the individual GGUF file; for a split set, the sum of every shard. Missing shards are reported as a warning.
 - **`params_m`**: from `config.json` `num_parameters` if present; falls back to regex extraction from filename (e.g. `70B` → 70000).
-- **`arch`**, **MoE**, **`vision`**, **`trust_remote_code`**: from `config.json` when present.
+- **`arch`**, **MoE**, **`vision`**, **`trust_remote_code`**: from `config.json` when present. Without it, MoE counts come from the GGUF header (`<arch>.expert_count` / `expert_used_count`), `vision` is inferred from an `mmproj-*.gguf` in the bundle dir, and `arch` stays empty (the catalog records HF class names, which GGUF lacks).
 - **`mmproj_path`**: auto-detected from `mmproj-*.gguf` in bundle root when `vision=True`.
 - **`mtp_path`**: auto-detected from `mtp-*.gguf` (multi-token-prediction draft head) in the bundle dir or the bundle root above it; when several are present, the one whose quant label matches the model's wins.
 - **`mtp_embedded`**: from the GGUF header (`launcher/gguf_header.py`, a dependency-free reader of the key/value metadata; ~0.1 s per file even over the NAS).
@@ -758,7 +762,7 @@ With `--ai-type image_gen`, each `.safetensors` file in the scan directory becom
 
 ### refresh subcommand
 
-`refresh` re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, `moe_experts`, `moe_active`, `vision`, `mmproj_path`, `mtp_path`, `mtp_embedded`) for existing catalog entries. User-curated fields (`id`, `name`, `format`, `path`, `cached_path`, `ctx_override`, `favorite`, `server_status`, `server_params`, `min_sm`, `hw_note`, `comfyui_subdir`, `quant`, `trust_remote_code`, `note`) are never touched.
+`refresh` re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, `moe_experts`, `moe_active`, `vision`, `mmproj_path`, `mtp_path`, `mtp_embedded`) for existing catalog entries. User-curated fields (`id`, `name`, `format`, `path`, `family`, `ctx_override`, `favorite`, `server_status`, `server_params`, `min_sm`, `hw_note`, `comfyui_subdir`, `quant`, `trust_remote_code`, `note`) are never touched.
 
 - `--path <path>` limits refresh to a single entry; otherwise all entries are refreshed.
 - Size recompute uses the stored (user-curated) format, not the freshly-detected one — if a format has been manually corrected, the size reflects the corrected format's weight files.
@@ -768,7 +772,7 @@ With `--ai-type image_gen`, each `.safetensors` file in the scan directory becom
 
 Preparation steps for GGUF bundles — run before `ingest` or `refresh` so that metadata detection has access to `config.json` and mmproj files.
 
-Both commands search `scan_root` plus cache mount subdirs mirroring the same leaf directory (e.g. if `scan_root` is `/mnt/nas/ai_models/text-generation`, also checks `~/fast_models/text-generation` from configured cache mounts). For each GGUF bundle directory that lacks the target files, the original (non-GGUF) model is located via normalised name matching and the files are copied across.
+Both commands search `scan_root` plus the same leaf directory under every other storage location (e.g. if `scan_root` is `/mnt/nas/ai_models/text-generation`, also checks `~/fast_models/text-generation` from the configured locations). For each GGUF bundle directory that lacks the target files, the original (non-GGUF) model is located via normalised name matching and the files are copied across.
 
 The copied set (`_CONFIG_FILES`) covers `config.json`, the tokenizer files, `generation_config.json`, and `chat_template.jinja` / `chat_template.json` — transformers ≥ 4.55 ships the chat template as a standalone file instead of embedding it in `tokenizer_config.json`.
 

@@ -13,7 +13,8 @@ from launcher import launch, screens
 from launcher.data import QUANTIZATION_TOOLS, SERVERS
 from launcher.environments import NativeEnvironment
 from launcher.gpu import GpuRow
-from launcher.models import AIModel, AIType, CacheMount, ModelFormat, tools_for_model
+from launcher.models import AIModel, AIType, ModelFormat, tools_for_model
+from launcher.storage import Location
 
 
 def model_for(fmt: ModelFormat) -> AIModel:
@@ -46,7 +47,7 @@ class PickerApp(App):
 class QuantizeCommandTests(unittest.TestCase):
     def test_cuda_environment_matches_tool_requirements(self) -> None:
         env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
-        dest = CacheMount("test", Path("/cache"), 0)
+        dest = Location("test", Path("/cache"))
         builders = {tool.id: lambda *_: ["quant-tool"] for tool in QUANTIZATION_TOOLS}
         with (
             patch.object(launch, "_tool_env", return_value=env),
@@ -77,7 +78,7 @@ class QuantizeCommandTests(unittest.TestCase):
 
     def test_hf_to_gguf_builds_cpu_converter_command(self) -> None:
         tool = next(tool for tool in QUANTIZATION_TOOLS if tool.id == "llama-hf-to-gguf")
-        dest = CacheMount("test", Path("/cache"), 0)
+        dest = Location("test", Path("/cache"))
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "llama.cpp"
@@ -159,7 +160,7 @@ class QuantizeCommandTests(unittest.TestCase):
         env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            dest = CacheMount("test", root / "output", 0)
+            dest = Location("test", root / "output")
             with (
                 patch.object(launch, "_tool_env", return_value=env),
                 patch.object(launch, "_LOGS_DIR", root / "logs"),
@@ -177,7 +178,7 @@ class QuantizeCommandTests(unittest.TestCase):
         tool = QUANTIZATION_TOOLS[0]
         model = model_for(ModelFormat.GGUF)
         env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
-        dest = CacheMount("test", Path("/cache"), 0)
+        dest = Location("test", Path("/cache"))
         with (
             patch.object(launch, "_tool_env", return_value=env),
             patch.dict(launch._QUANT_BUILDERS, {
@@ -194,15 +195,16 @@ class QuantizePickerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.model = model_for(ModelFormat.GGUF)
         self.tool = QUANTIZATION_TOOLS[0]
-        self.dest = CacheMount("test", Path("/cache"), 0)
+        self.dest = Location("test", Path("/cache"))
         self.env = NativeEnvironment(server_id="test", name="test", bin_dir="/tools")
 
     async def test_destination_picker_confirmation_and_back(self) -> None:
         picker = screens.QuantizeDestScreen(self.model, self.tool, "Q4_K_M")
         app = PickerApp(picker)
         with (
-            patch.object(screens, "CACHE_MOUNTS", [self.dest]),
-            patch.object(launch, "cache_disk_info", return_value=(100, 80)),
+            patch.object(screens, "LOCATIONS", [self.dest]),
+            patch.object(Location, "online", property(lambda _: True)),
+            patch.object(Location, "disk_info", return_value=(100, 80)),
             patch.object(screens, "poll_gpus", return_value=[
                 gpu_row(2), gpu_row(4, "unavailable"), gpu_row(7),
             ]),
@@ -241,8 +243,9 @@ class QuantizePickerTests(unittest.IsolatedAsyncioTestCase):
         picker = screens.QuantizeDestScreen(model, tool, "F16")
         app = PickerApp(picker)
         with (
-            patch.object(screens, "CACHE_MOUNTS", [self.dest]),
-            patch.object(launch, "cache_disk_info", return_value=(100, 80)),
+            patch.object(screens, "LOCATIONS", [self.dest]),
+            patch.object(Location, "online", property(lambda _: True)),
+            patch.object(Location, "disk_info", return_value=(100, 80)),
             patch.object(launch, "build_quantize_cmd", return_value=(["python", "convert.py"], Path("/cache/out"))),
         ):
             async with app.run_test(size=(120, 40)) as pilot:

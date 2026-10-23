@@ -1,9 +1,10 @@
 {
   "_comment": "Model catalog for the AI model launcher. Copy this file to models_local.json and replace with your own models. This file is .gitignored — edit freely.",
   "_schema": {
-    "id":            "Unique slug — used as --served-model-name / llama.cpp --alias",
+    "id":            "Slug used as --served-model-name / llama.cpp --alias. Copies of a model at other storage locations are separate entries with the same id; an entry is identified by (path, format).",
     "name":          "Display name shown in the TUI",
-    "path":          "Absolute path to the model file or directory — any accessible location (local SSD, NAS, network share, etc.).",
+    "path":          "Absolute path to the model file or directory, inside one of the [[locations]] in config.toml.",
+    "family":        "Shared by an original model and every copy, conversion and quantization of it. Assigned by ingest (slug of the name); inherited on copy/convert.",
     "format":        "One of: gguf | safetensors_bf16 | safetensors_fp16 | safetensors_fp8 | int8_bnb | exl2 | pytorch_bin",
     "ai_types":      "List of: text_gen | image_gen | embedding | speech",
     "ctx":           "Native context window in tokens — set to 0 for image generation models where this is not applicable",
@@ -23,7 +24,6 @@
     "hw_note":       "(optional) Human-readable explanation shown when the model is incompatible with the current hardware.",
     "favorite":      "(optional) true to pin this model to the top of the list. Toggled with 'f' in the TUI.",
     "note":          "(optional) Free-text note shown in the TUI",
-    "cached_path":   "(optional) Absolute path to a faster local copy. Set automatically by the TUI cache action.",
     "trust_remote_code": "(optional) true if servers must pass --trust-remote-code for this model.",
     "server_status": "(optional) Test results: {server_id: {environment_name: {quant_key: good|bad|unknown}}}. environment_name is a registered environment (environments.json). Updated by the TUI g/x/? keys.",
     "server_params": "(optional) Per-server parameter overrides merged on top of server defaults at launch time.",
@@ -35,6 +35,7 @@
     {
       "id": "my-model-bf16",
       "name": "My Model 70B",
+      "family": "my-model-70b",
       "path": "/mnt/models/text-generation/My-Model-70B",
       "format": "safetensors_bf16",
       "ai_types": ["text_gen"],
@@ -45,6 +46,7 @@
     {
       "id": "my-model-q4km",
       "name": "My Model 70B",
+      "family": "my-model-70b",
       "path": "/mnt/models/text-generation/My-Model-70B-GGUF/my-model-70b.Q4_K_M.gguf",
       "format": "gguf",
       "ai_types": ["text_gen"],
@@ -55,6 +57,7 @@
     {
       "id": "my-model-custom-vllm",
       "name": "My Model 7B (custom vLLM params)",
+      "family": "my-model-7b",
       "path": "/mnt/models/text-generation/My-Model-7B",
       "format": "safetensors_fp16",
       "ai_types": ["text_gen"],
@@ -73,6 +76,7 @@
     {
       "id": "sdxl-base-fp16",
       "name": "Stable Diffusion XL Base 1.0",
+      "family": "stable-diffusion-xl-base-1-0",
       "path": "/mnt/models/image-generation/sd_xl_base_1.0.safetensors",
       "format": "safetensors_fp16",
       "ai_types": ["image_gen"],
@@ -83,6 +87,7 @@
     {
       "id": "flux-dev-bf16",
       "name": "FLUX.1-dev",
+      "family": "flux-1-dev",
       "path": "/mnt/models/image-generation/flux1-dev.safetensors",
       "format": "safetensors_bf16",
       "ai_types": ["image_gen"],

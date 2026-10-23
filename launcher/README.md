@@ -85,7 +85,7 @@ All system-specific paths live in **`user_data/config.toml`** (gitignored). The 
 | `[paths]` | `cuda_visible_devices` | Explicit GPU list; `""` = auto-derive from `pipeline_parallel` |
 | `[gpu]` | `pipeline_parallel` | GPU count for vLLM pipeline parallelism; `0` = auto-detect via NVML at startup |
 | `[memory]` | `host_cache_ram` | Ceiling for the host-RAM prompt cache (llama.cpp `--cache-ram`): a share of physical RAM (`"60%"`) or integer MiB; omit for the server default (8 GiB) |
-| `[[cache_mounts]]` | `label` / `root` / `priority` | Local storage tiers for caching models locally from remote sources |
+| `[[locations]]` | `label` / `root` / `description` | Storage locations models live on (NAS and local drives alike), in display order. `label` is the short name shown in the model list's Location column; `description` (optional) is shown in destination pickers. Copy, convert and quantize can write to any location. |
 
 `~` and environment variables are expanded in all path values.
 
@@ -173,7 +173,9 @@ python -m launcher.ingest copy-configs /path/to/models [--dry-run]
 python -m launcher.ingest copy-mmproj /path/to/models [--dry-run]
 ```
 
-Both commands search for the matching original (non-GGUF) model directory across the scan root and all configured cache mount subdirs.
+Both commands search for the matching original (non-GGUF) model directory across the scan root and the same directory under every other storage location.
+
+Ingesting a model found at the same relative path as a catalogued model on another location (e.g. a copy made outside the launcher) adds it as a copy of that model — same id, family and settings. Any other new model starts a new **family**, named after the model.
 
 ### Manual entry
 
@@ -213,15 +215,15 @@ Override server defaults per model with a `server_params` key:
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move cursor |
-| `→` / `Enter` | Select / confirm (model list: advance to server or cache screen; server list: advance to environment or GPU screen) |
+| `→` / `Enter` | Select / confirm (model list: advance to server screen, or the copy screen in image-gen model management; server list: advance to environment or GPU screen) |
 | `←` / `Esc` / `b` | Go back |
 | `q` | Quit from any screen |
 | `Space` | Toggle GPU selection (GPU screen) |
 | `a` | Select all GPUs (GPU screen, multi-GPU servers only) |
 | `+` / `-` | More / fewer concurrent request slots (GPU screen, llama.cpp) |
 | `p` / `P` | Set the power limit for the highlighted GPU / all selected GPUs (GPU screen) |
-| `c` | Cache focused model to local storage (model list) |
-| `u` | Uncache focused model (model list) |
+| `c` | Copy focused model to another storage location (model list) — see [Storage locations and copies](#storage-locations-and-copies) |
+| `Del` | Delete focused model's files and catalog entry (model list), after confirmation |
 | `l` | Context settings for focused model (model list): YaRN factor to extend the context (e.g. `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF) and/or a context-length override |
 | `f` | Toggle favorite pin for focused model (model list) |
 | `t` | Chat template patches for focused model (model list): shows the fixes that apply to its chat template and turns each on/off (see [Chat template patches](#chat-template-patches)) |
@@ -254,7 +256,7 @@ llama.cpp launches also default to a q8_0 KV cache (half the memory of f16, negl
 
 Some chat templates reject requests the model itself handles fine. Qwen 3.5 / 3.6 / 3.8 templates (official and Unsloth GGUF) fail any request with a system message after the start of the conversation — `System message must be at the beginning.` — whereas Qwen2.5 / Qwen3 templates rendered such messages in place.
 
-The launcher detects these templates and fixes them automatically at launch: it reads the model's template (GGUF header, `chat_template.jinja`, or `tokenizer_config.json`), applies the matching patches, writes the result to `user_data/chat_templates/<model id>.jinja`, and passes it to the server (`--chat-template-file` for llama.cpp and ooba, `--chat-template` for vLLM and SGLang, `--prompt-template` for tabbyAPI). Model files — source or cached — are never modified. The flag appears in the launch command, and the session log header names the applied patches (`# tmpl: …`).
+The launcher detects these templates and fixes them automatically at launch: it reads the model's template (GGUF header, `chat_template.jinja`, or `tokenizer_config.json`), applies the matching patches, writes the result to `user_data/chat_templates/<model id>.jinja`, and passes it to the server (`--chat-template-file` for llama.cpp and ooba, `--chat-template` for vLLM and SGLang, `--prompt-template` for tabbyAPI). Model files are never modified. The flag appears in the launch command, and the session log header names the applied patches (`# tmpl: …`).
 
 Patches:
 
@@ -291,7 +293,8 @@ launcher/
   app.py               Textual App class
   screens.py           All TUI screens
   models.py            Schema: AIModel, ServerSoftware, AIType, ModelFormat
-  data.py              SERVERS list + CACHE_MOUNTS (config-driven, safe to commit)
+  data.py              SERVERS list, quantization tools, catalog loading (safe to commit)
+  storage.py           Storage locations; model copy and deletion file operations
   environments.py      Server environments (conda envs / native builds) + registry
   environments.json.example  Template for user_data/environments.json
   launch.py            Command builders and subprocess launcher
@@ -311,6 +314,15 @@ launcher/
     models_local.json    model catalog
   model_launcher.tcss    Textual CSS layout
 ```
+
+## Storage locations and copies
+
+Every place models are stored — the NAS and each local drive — is a **location** (`[[locations]]` in `config.toml`). Each catalog entry is one model at one path; the model list's **Location** column (before Name) shows where it is, dimmed while that location is offline (e.g. the NAS is not mounted). There is no separate "cached copy": a model on two drives is two entries, which you pick between in the list.
+
+- **Copy (`c`)** copies the model to another location at the same path relative to the location root, so every location mirrors the same layout. For a GGUF that is the model file (all shards of a split set), its companion files (mmproj, MTP head) and the `config.json` / tokenizer files describing it — not the rest of the bundle. A directory model is copied whole. The copy becomes a new catalog entry with the same id (served model name), family and a snapshot of every setting (test results, favorite, note, server params, context settings); afterwards the two entries are independent.
+- **Delete (`Del`)** removes a model's files and its catalog entry. The confirmation lists every file or directory that will be deleted, with **Cancel** focused. Entries sharing the same directory (e.g. BF16 safetensors and `.bin` in one folder) are deleted together; companion files still used by another entry are kept; a GGUF bundle directory is removed once its last model is deleted. Deleting the **last copy** of a model additionally asks you to type its name. Any location can be written to and deleted from, including the NAS.
+
+Models are grouped into **families**: the original model plus every copy, conversion and quantization made from it share a `family` key in the catalog, so they stay associated even after an intermediate (e.g. an F16 GGUF used to make a Q8_0) is deleted.
 
 ## Status tracking
 
@@ -332,11 +344,11 @@ Press `z` on any model in the model list to start a conversion or quantization j
 **Flow:**
 1. If more than one tool supports the model's format, pick a tool. Otherwise this step is skipped.
 2. Pick a target quant level (e.g. Q4_K_M for GGUF re-quantization, F16/BF16 for HF-to-GGUF conversion, or 4.0 bpw for EXL2).
-3. Pick an output destination — one of the configured `[[cache_mounts]]`, with current free space shown.
+3. Pick an output destination — one of the configured `[[locations]]`, with current free space shown (offline locations are disabled).
 4. For CUDA quantizers, choose the GPUs to expose to the tool. The list shows current VRAM usage; all available GPUs start selected. Use Space to toggle a GPU, `a` to select all, and Enter / `→` to continue. At least one GPU must be selected; if GPU polling is unavailable, return and retry after restoring it. CPU-only converters skip this step.
 5. Review the full command and output path, then confirm. For CUDA tools, the command includes `CUDA_VISIBLE_DEVICES`; Back returns to the GPU picker with your selection intact.
 
-The TUI temporarily exits while the conversion runs in your terminal with live output, and the log is written to `logs/`. Outputs are placed under the AI-type subdirectory of the chosen cache mount (for example, `~/fast_models/text-generation/`). After a successful conversion, the launcher copies source config/tokenizer metadata when needed, removes EXL2 resumable work files, adds the generated model to `user_data/models_local.json`, and reopens with that model focused. Failed or interrupted outputs retain their work files and are not added to the catalog.
+The TUI temporarily exits while the conversion runs in your terminal with live output, and the log is written to `logs/`. Outputs are placed under the AI-type subdirectory of the chosen location (for example, `~/fast_models/text-generation/`). After a successful conversion, the launcher copies the source's config/tokenizer files beside the output, removes EXL2 resumable work files, adds the generated model to `user_data/models_local.json`, and reopens with that model focused. The new entry joins the source's family and inherits its model facts and behaviour settings — context, parameter count, architecture, MoE layout, vision companion (`mmproj`) and MTP head, tool-call parser, YaRN scaling and disabled chat-template patches — but not its note, favorite pin, test results, server parameters or context override, which depend on the format and size. Failed or interrupted outputs retain their work files and are not added to the catalog.
 
 ### Supported tools
 

@@ -84,7 +84,12 @@ def read_gguf_metadata(path: Path) -> dict[str, Scalar]:
     return metadata
 
 
+def arch_int(metadata: dict[str, Scalar], key: str) -> int:
+    """Integer value of the architecture-scoped key ``<arch>.<key>`` (0 when absent)."""
+    arch = metadata.get("general.architecture", "")
+    return int(metadata.get(f"{arch}.{key}", 0) or 0)
+
+
 def embedded_mtp_layers(metadata: dict[str, Scalar]) -> int:
     """Number of multi-token-prediction layers built into the model (0 = none)."""
-    arch = metadata.get("general.architecture", "")
-    return int(metadata.get(f"{arch}.nextn_predict_layers", 0) or 0)
+    return arch_int(metadata, "nextn_predict_layers")

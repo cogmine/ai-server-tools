@@ -44,12 +44,9 @@ AI_TYPE_LABELS: dict[AIType, str] = {
     AIType.SPEECH:    "Speech",
 }
 
-# Cache subdirectory name for each AI type.  Directory models are stored under
-# <mount.root>/<AI_TYPE_CACHE_SUBDIR[type]>/<source_dir_name>/ on every cache
-# mount, where source_dir_name is the basename of the model's source path.
-# Single-file models (GGUF, single safetensors) use
-# <mount.root>/<AI_TYPE_CACHE_SUBDIR[type]>/<model.id>/<filename>.
-AI_TYPE_CACHE_SUBDIR: dict[AIType, str] = {
+# Top-level directory under a storage location's root for each AI type; converted
+# and quantized outputs are written to <location.root>/<AI_TYPE_SUBDIR[type]>/.
+AI_TYPE_SUBDIR: dict[AIType, str] = {
     AIType.TEXT_GEN:  "text-generation",
     AIType.IMAGE_GEN: "text-to-image",
     AIType.EMBEDDING: "embedding",
@@ -250,11 +247,6 @@ def fmt_ctx(ctx: int) -> str:
     return str(ctx)
 
 
-# ---------------------------------------------------------------------------
-# Cache mount
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class RopeScaling:
     """Context extension by RoPE scaling (e.g. YaRN), applied at launch by servers that support it.
@@ -282,18 +274,13 @@ class RopeScaling:
         return d
 
 
-@dataclass
-class CacheMount:
-    """A local storage tier that holds a faster copy of a model.
-
-    When a model has a cached_path set in the catalog, resolve_path()
-    returns that stored path directly rather than scanning these mounts.
-    Mounts are used here only to determine *where* to place a new cached
-    copy and to display disk-space information in the UI.
-    """
-    label: str    # human-readable, e.g. "NVMe (fast_models)"
-    root: Path    # filesystem root for this cache tier
-    priority: int # 0 = highest priority
+# Plain AIModel fields inherited by models derived from it (see AIModel.derived_entry_fields).
+# mmproj_path / mtp_path are GGUF companions — only GGUF sources have them, and they
+# stay usable by any re-quantization of that GGUF.
+_DERIVED_FIELDS: tuple[str, ...] = (
+    "family", "ctx", "params_m", "arch", "moe_experts", "moe_active", "vision",
+    "mmproj_path", "mtp_path", "tool_call_parser",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +290,11 @@ class CacheMount:
 @dataclass
 class AIModel:
     """Describes a single model artefact on disk — what it IS.
+
+    Each entry has one path.  Copies of a model at other storage locations are
+    separate entries sharing its id (the served model name), so the catalog key
+    is (path, format) — see `key`.  All entries descended from one original
+    model (copies, conversions, quantizations) share its `family`.
 
     How to run it on a specific server is expressed as param overrides in
     server_params, merged on top of ServerSoftware.default_params at launch time.
@@ -314,15 +306,15 @@ class AIModel:
             "tabby": {"model_name": "BeMag-123B-BF16"},
         }
     """
-    id: str                        # unique slug; used as served-model-name / llama.cpp alias
+    id: str                        # slug shared by copies; served-model-name / llama.cpp alias
     name: str                      # human display name, e.g. "BeMag 123B v0.1"
-    path: str                      # canonical source path — any accessible location
+    path: str                      # model file or directory (inside a storage location)
     format: ModelFormat            # storage / quantisation format
     ai_types: frozenset[AIType]    # capabilities this model exposes
     ctx: int = 32_768              # model's native/trained max context length (tokens)
     ctx_override: int = 0         # launch override — passed to the server instead of ctx; 0 = use ctx
     rope_scaling: RopeScaling | None = None  # context extension; scales the default launch ctx
-    cached_path: str = ""          # faster local copy; resolve_path() returns this when set and present
+    family: str = ""               # shared by the original model and everything copied/derived from it
     size_gb: float = 0.0           # disk footprint in GB
     params_m: int = 0              # parameter count in millions (0 = unknown)
     moe_experts: int = 0           # routed expert count; 0 = dense model
@@ -370,7 +362,7 @@ class AIModel:
             id=d["id"],
             name=d["name"],
             path=d["path"],
-            cached_path=d.get("cached_path", ""),
+            family=d.get("family", ""),
             format=ModelFormat(d["format"]),
             ai_types=frozenset(AIType(t) for t in d.get("ai_types", ["text_gen"])),
             ctx=int(d.get("ctx", 32_768)),
@@ -399,65 +391,48 @@ class AIModel:
         )
 
     # ------------------------------------------------------------------
-    # Path / cache helpers
+    # Identity / path helpers
     # ------------------------------------------------------------------
 
     @property
-    def cache_subdir(self) -> str:
-        """Cache subdirectory name for this model's primary AI type.
+    def key(self) -> tuple[str, str]:
+        """Catalog key: (path, format).  Ids are shared by copies, and one directory
+        may hold several formats (e.g. safetensors and .bin), each its own entry."""
+        return self.path, self.format.value
 
-        Directory models are stored at <mount.root>/<cache_subdir>/<source_dir_name>/.
-        Single-file models are stored at <mount.root>/<cache_subdir>/<model.id>/.
-        The primary type is the first AIType by enum declaration order.
-        """
+    def is_copy_of(self, other: "AIModel") -> bool:
+        """True when *other* is the same model stored elsewhere."""
+        return self.id == other.id and self.format == other.format and self.key != other.key
+
+    @property
+    def type_subdir(self) -> str:
+        """Top-level directory for this model's primary AI type (first by enum order)."""
         for ai_type in AIType:
             if ai_type in self.ai_types:
-                return AI_TYPE_CACHE_SUBDIR[ai_type]
+                return AI_TYPE_SUBDIR[ai_type]
         return "models"  # unreachable in practice
-
-    def resolve_path(self) -> str:
-        """Return the fastest available path: cached_path if present on disk, else path."""
-        if self.cached_path:
-            p = Path(self.cached_path)
-            # An incomplete copy of a split GGUF would fail to load; fall back to the source.
-            if all(shard.exists() for shard in gguf_shard_paths(p)):
-                return self.cached_path
-        return self.path
 
     @property
     def companion_paths(self) -> list[str]:
-        """Source paths of companion files that must sit beside the model (mmproj, MTP head)."""
+        """Companion files that must sit beside the model (mmproj, MTP head)."""
         return [p for p in (self.mmproj_path, self.mtp_path) if p]
 
-    def _resolve_companion(self, source_path: str) -> str:
-        """Return the companion's copy beside the cached model when the cache is in use, else source_path."""
-        if not source_path:
-            return ""
-        resolved = self.resolve_path()
-        if resolved != self.path:
-            cached = Path(resolved).parent / Path(source_path).name
-            if cached.is_file():
-                return str(cached)
-        return source_path
+    def derived_entry_fields(self) -> dict[str, Any]:
+        """Catalog fields a converted / quantized model derived from this one inherits.
 
-    def resolve_mmproj_path(self) -> str:
-        return self._resolve_companion(self.mmproj_path)
-
-    def resolve_mtp_path(self) -> str:
-        return self._resolve_companion(self.mtp_path)
-
-    def cached_in(self, mounts: "list[CacheMount]") -> "CacheMount | None":
-        """Return the cache mount that contains cached_path, or None if not cached."""
-        if not self.cached_path:
-            return None
-        p = Path(self.cached_path)
-        for mount in sorted(mounts, key=lambda m: m.priority):
-            try:
-                p.relative_to(mount.root)
-                return mount
-            except ValueError:
-                continue
-        return None
+        Covers model-intrinsic facts (which the converted output may not let ingest
+        re-detect, e.g. a GGUF without config.json) and model-behaviour settings.
+        Format-, size- and launch-specific fields (note, status, server params,
+        context override, hardware requirements, favorite) are not inherited.
+        """
+        fields: dict[str, Any] = {
+            name: getattr(self, name) for name in _DERIVED_FIELDS if getattr(self, name)
+        }
+        if self.rope_scaling is not None:
+            fields["rope_scaling"] = self.rope_scaling.to_dict()
+        if self.disabled_template_patches:
+            fields["disabled_template_patches"] = sorted(self.disabled_template_patches)
+        return fields
 
     @property
     def scaled_ctx(self) -> int:
@@ -664,7 +639,7 @@ class ServerSoftware:
     # Allows per-model routing into different server-side subdirectories (e.g.
     # diffusion_models/ vs checkpoints/ in ComfyUI) without any branching in launch.py.
     staging_subdir_attr: str | None = None
-    # When True, the staged symlink is named after the source file (Path(resolve_path()).name)
+    # When True, the staged symlink is named after the source file (Path(model.path).name)
     # rather than model.id + format suffix.  Use for servers (e.g. ComfyUI) where the
     # client selects models by original filename, not by catalog ID.
     staging_use_source_filename: bool = False
