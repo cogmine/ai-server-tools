@@ -27,7 +27,6 @@ Adding a new server type:
 from __future__ import annotations
 
 import fcntl
-import functools
 import json
 import math
 import os
@@ -44,6 +43,7 @@ from typing import Any, Callable
 
 from launcher.data import AI_MODELS
 from launcher.chat_template import patched_template
+from launcher.hf_config import read_parallelism_fields
 from launcher.environments import ENVIRONMENTS, Environment
 from launcher.gpu_power import PowerLimitStep
 from launcher.models import (
@@ -51,6 +51,7 @@ from launcher.models import (
     QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key,
     gguf_shard_paths, gguf_split_info,
 )
+from launcher.params import AutoBoolParam, ParamSpec
 from launcher.config import CONFIG
 from launcher.storage import (
     LOCATIONS, DeletionPlan, Location, location_of, model_metadata_dir, relocated_entry,
@@ -228,42 +229,6 @@ _NO_PP_ARCHS: frozenset[str] = frozenset({
 })
 
 
-@functools.lru_cache(maxsize=64)
-def _read_hf_parallelism_fields(model_path: str) -> dict[str, Any] | None:
-    """Read parallelism-relevant fields from a model's HF config.json.
-
-    Multimodal checkpoints nest the language model's fields under
-    ``text_config``; those take precedence over the top level.
-    Returns None if config.json is absent or lacks num_attention_heads.
-    """
-    cfg_path = Path(model_path) / "config.json"
-    if not cfg_path.is_file():
-        return None
-    try:
-        with open(cfg_path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-    text = raw.get("text_config") or {}
-    def field(key: str, default: int = 0) -> int:
-        return int(text.get(key, raw.get(key, default)) or 0)
-    n_heads = field("num_attention_heads")
-    if not n_heads:
-        return None
-    architectures = raw.get("architectures", [])
-    return {
-        "num_attention_heads":    n_heads,
-        "num_key_value_heads":    field("num_key_value_heads", n_heads),
-        "intermediate_size":      field("intermediate_size"),
-        "num_hidden_layers":      field("num_hidden_layers"),
-        # Linear-attention (Gated DeltaNet) heads in hybrid models such as
-        # Qwen3-Next / Qwen3.5 / Qwen4Exp — also sharded across TP ranks.
-        "linear_num_key_heads":   field("linear_num_key_heads"),
-        "linear_num_value_heads": field("linear_num_value_heads"),
-        "architecture":           architectures[0] if architectures else "",
-    }
-
-
 def _sorted_divisors(n: int) -> list[int]:
     """Return the positive divisors of *n* in ascending order."""
     small: list[int] = []
@@ -295,7 +260,7 @@ def compute_parallelism(gpu_count: int, model: "AIModel | None") -> ParallelismP
     if model is None or gpu_count <= 1:
         return ParallelismPlan(tp=1, pp=max(gpu_count, 1), gpu_count=max(gpu_count, 1))
 
-    cfg = _read_hf_parallelism_fields(model.path)
+    cfg = read_parallelism_fields(model.path)
     if cfg is None:
         return ParallelismPlan(tp=1, pp=gpu_count, gpu_count=gpu_count)
 
@@ -390,6 +355,9 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd += ["--enable-chunked-prefill"]
     if p.get("expert_parallel"):
         cmd += ["--enable-expert-parallel"]
+    if p.get("mtp") and model.mtp_embedded:
+        spec = {"method": "mtp", "num_speculative_tokens": int(p["mtp_tokens"])}
+        cmd += ["--speculative-config", json.dumps(spec, separators=(",", ":"))]
     if p.get("enforce_eager"):
         cmd += ["--enforce-eager"]
     # Only pass --trust-remote-code for models that actually require custom code.
@@ -475,17 +443,17 @@ def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p:
 def _mtp_args(model: AIModel, p: dict) -> list[str]:
     """Speculative-decoding flags using the model's MTP head (llama-server and ooba share them).
 
-    Param "mtp": None (auto) uses a sidecar head (mtp_path) only; True also uses an
-    embedded head; False disables MTP.  Embedded heads are opt-in because many GGUFs
-    keep NextN layers that a given llama.cpp build cannot run for that architecture.
-    An embedded head runs on the main model's own weights, so no draft file is passed.
+    Param "mtp" arrives resolved (see the server's AutoBoolParam): auto is on only
+    for a sidecar head (mtp_path); on also uses an embedded head; off disables.
+    Embedded heads are opt-in because many GGUFs keep NextN layers that a given
+    llama.cpp build cannot run for that architecture.  An embedded head runs on the
+    main model's own weights, so no draft file is passed.
     """
-    mode = p.get("mtp")
-    if mode is False:
+    if not p.get("mtp"):
         return []
     if model.mtp_path:
         return ["--spec-type", "draft-mtp", "--model-draft", model.mtp_path]
-    if model.mtp_embedded and mode:
+    if model.mtp_embedded:
         return ["--spec-type", "draft-mtp"]
     return []
 
@@ -863,14 +831,51 @@ def launch_params(
     runtime_quant: "RuntimeQuant | None" = None,
     param_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resolved builder params: merged defaults/overrides plus the injected _model_path / _runtime_quant / _chat_template."""
+    """Resolved builder params: merged defaults/overrides with "auto" values resolved,
+    plus the injected _model_path / _runtime_quant / _chat_template."""
     p = _merged(server, model, param_overrides)
+    for spec, value, _reason in _resolve_auto(server, model, p):
+        p[spec.key] = value
     if model is not None:
         p["_model_path"] = model.path
     p["_runtime_quant"] = runtime_quant
     template = patched_template(model) if model is not None and server.chat_template_flag else None
     p["_chat_template"] = str(template.path) if template is not None else ""  # written by launch()
     return p
+
+
+def _resolve_auto(
+    server: ServerSoftware, model: "AIModel | None", merged: dict[str, Any],
+) -> list[tuple[AutoBoolParam, bool, str]]:
+    return [
+        (spec, *spec.resolve(model, merged))
+        for spec in server.auto_params()
+        if merged.get(spec.key) is None
+    ]
+
+
+def auto_param_states(
+    server: ServerSoftware, model: "AIModel | None", param_overrides: dict[str, Any] | None = None,
+) -> list[tuple[AutoBoolParam, bool, str]]:
+    """(spec, resolved value, reason) for each parameter left at "auto" for this launch."""
+    return _resolve_auto(server, model, _merged(server, model, param_overrides))
+
+
+def gpu_param_overrides(
+    server: ServerSoftware, model: "AIModel | None", gpu_count: int,
+) -> tuple[dict[str, Any], "ParallelismPlan | None"]:
+    """Parallelism params for launching on *gpu_count* GPUs, and the TP×PP plan when one applies.
+
+    vLLM / SGLang (gpu_count_param "pipeline_parallel") get a planned TP×PP split
+    (which may use fewer GPUs — see plan.gpu_count); other servers with a
+    gpu_count_param receive the count itself.
+    """
+    if server.gpu_count_param == "pipeline_parallel" and model is not None:
+        plan = compute_parallelism(gpu_count, model)
+        return {"tensor_parallel": plan.tp, "pipeline_parallel": plan.pp}, plan
+    if server.gpu_count_param:
+        return {server.gpu_count_param: gpu_count}, None
+    return {}, None
 
 
 def build_cmd(server: ServerSoftware, env: Environment, model: "AIModel | None", runtime_quant: "RuntimeQuant | None" = None, param_overrides: dict[str, Any] | None = None) -> list[str]:
@@ -1400,11 +1405,14 @@ def save_server_param(model: AIModel, server: ServerSoftware, key: str, value: A
     """Persist one per-model server param override (e.g. the last-launched slot count).
 
     A value equal to the server default removes the override, keeping the catalog
-    tidy.  Mutates the in-memory model immediately, then updates the JSON catalog.
+    tidy (so saving the default is how an override is reset).  Mutates the in-memory
+    model immediately, then updates the JSON catalog.
     """
+    default = server.param(key).default_value()
+
     def _apply(server_params: dict) -> None:
         params = server_params.setdefault(server.id, {})
-        if value == server.default_params.get(key):
+        if value == default:
             params.pop(key, None)
         else:
             params[key] = value
@@ -1418,6 +1426,23 @@ def save_server_param(model: AIModel, server: ServerSoftware, key: str, value: A
 
     _apply(model.server_params)
     _patch_catalog(model, _apply_entry)
+
+
+def save_model_field(model: AIModel, spec: ParamSpec, value: Any) -> None:
+    """Persist one user-editable AIModel field (see models.MODEL_FIELDS).
+
+    The catalog omits the key at its default.  Mutates the in-memory model
+    immediately, then updates the JSON catalog.
+    """
+    setattr(model, spec.key, value)
+
+    def _apply(entry: dict) -> None:
+        if value == spec.default_value():
+            entry.pop(spec.key, None)
+        else:
+            entry[spec.key] = value
+
+    _patch_catalog(model, _apply)
 
 
 def save_template_patch_enabled(model: AIModel, patch_id: str, enabled: bool) -> None:

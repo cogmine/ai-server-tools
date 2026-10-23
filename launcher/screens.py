@@ -1,9 +1,12 @@
 
-"""screens.py — Navigation: AI Type → Model → Server → [Environment] → [Quant] → GPUs → Confirm.
+"""screens.py — Navigation: AI Type → Model → Model settings → Server → [Environment] → [Quant] → GPUs → Confirm.
 
 Navigation stack:
   AITypeScreen        — Level 1: choose what kind of AI (text-gen, image-gen, …)
   ModelSelectScreen   — Level 2: choose a model (filtered by AIType)
+  ModelPropertiesScreen — Level 2a: the model's settings (context / YaRN, chat template
+                          patches, model fields, every compatible server's launch
+                          parameters); Enter continues
   ServerSelectScreen  — Level 3: choose a server (filtered by model format + type)
   EnvSelectScreen     — Level 3a (optional): choose the environment, when the
                           server has more than one registered
@@ -28,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar
 
 from rich.markup import escape
+from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -52,11 +56,13 @@ from launcher.gpu import GpuRow, poll_gpus, system_min_sm
 from launcher.gpu_power import (
     POWER_LIMITS, PowerLimitStep, fmt_power_limit, parse_power_limit, power_limit_range, power_limit_step,
 )
+from launcher.config import CONFIG
 from launcher.models import (
     AIModel,
     AIType,
     AI_TYPE_LABELS,
     FORMAT_SHORT,
+    MODEL_FIELDS,
     ModelFormat,
     QuantizationTool,
     RopeScaling,
@@ -74,6 +80,7 @@ from launcher.models import (
     uses_hub_flow,
 )
 from launcher.data import AI_MODELS, QUANTIZATION_TOOLS, SERVERS
+from launcher.params import AutoBoolParam, ParamSpec
 from launcher.chat_template import available_patches
 from launcher.environments import ENVIRONMENTS, Environment, env_kind
 from launcher.fit import FitEstimate, estimate_fit, fit_probe_for
@@ -1358,11 +1365,8 @@ class GpuSelectScreen(GpuSelectionScreen):
         self._fit: FitEstimate | None = None
 
     def _initial_gpu_count(self) -> int:
-        n_available = len(self._valid_rows)
-        if self._server.gpu_count_param == "pipeline_parallel" and self._model:
-            plan = launcher.compute_parallelism(n_available, self._model)
-            return plan.gpu_count
-        return super()._initial_gpu_count()
+        _, plan = launcher.gpu_param_overrides(self._server, self._model, len(self._valid_rows))
+        return plan.gpu_count if plan is not None else super()._initial_gpu_count()
 
     @staticmethod
     def _gpu_label(row: GpuRow) -> str:
@@ -1398,8 +1402,8 @@ class GpuSelectScreen(GpuSelectionScreen):
             f"[dim]CUDA_VISIBLE_DEVICES=[/][bold]{devices_str}[/]"
             f"  [dim]({n} GPU{'s' if n != 1 else ''})[/]"
         ]
-        if self._server.gpu_count_param == "pipeline_parallel" and self._model:
-            self._plan = launcher.compute_parallelism(n, self._model)
+        overrides, self._plan = launcher.gpu_param_overrides(self._server, self._model, n)
+        if self._plan is not None:
             if self._plan.gpu_count < n:
                 adj = selected[:self._plan.gpu_count]
                 adj_str = ",".join(str(i) for i in adj)
@@ -1416,10 +1420,11 @@ class GpuSelectScreen(GpuSelectionScreen):
             if self._plan.note:
                 parts.append(f"[yellow]{self._plan.note}[/]")
         elif self._server.gpu_count_param:
-            self._plan = None
             parts.append(f"[dim]{self._server.gpu_count_param}[/] → [bold]{n}[/]")
-        else:
-            self._plan = None
+        if self._model is not None:
+            for spec, value, _reason in launcher.auto_param_states(self._server, self._model, overrides):
+                if value:
+                    parts.append(f"{spec.label.lower()}: [bold]on[/] [dim](auto)[/]")
         power_step = self._power_step()
         if power_step is not None:
             parts.append(f"[dim]power limits[/] {' '.join(power_step.args())}")
@@ -1437,11 +1442,7 @@ class GpuSelectScreen(GpuSelectionScreen):
         indices = self._launch_indices()
         if not indices:
             return None
-        overrides: dict[str, Any] = {}
-        if self._plan is not None:
-            overrides = {"tensor_parallel": self._plan.tp, "pipeline_parallel": self._plan.pp}
-        elif self._server.gpu_count_param:
-            overrides = {self._server.gpu_count_param: len(indices)}
+        overrides, _ = launcher.gpu_param_overrides(self._server, self._model, len(indices))
         if self._slots is not None and self._server.concurrency_param:
             overrides[self._server.concurrency_param] = self._slots
         return ",".join(str(i) for i in indices), overrides
@@ -2039,8 +2040,6 @@ class ModelSelectScreen(DataTableScreen):
         Binding("delete",        "delete_selected",   "Delete", key_display="Del"),
         Binding("f",             "mark_favorite",     "Favorite"),
         Binding("f",             "unmark_favorite",   "Unfavorite"),
-        Binding("l",             "set_ctx_override",  "Context / YaRN"),
-        Binding("t",             "template_patches",  "Chat template"),
         Binding("z",             "quantize_selected", "Convert / quantize"),
         Binding("f5",            "dt_select",         "Select", key_display="↵/→/dbl-click"),
     ]
@@ -2315,9 +2314,9 @@ class ModelSelectScreen(DataTableScreen):
         self._populate()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Enable copy/delete/favorite/quantize/template actions only when a model is focused and state matches."""
+        """Enable copy/delete/favorite/quantize actions only when a model is focused and state matches."""
         if action in ("copy_selected", "delete_selected", "mark_favorite", "unmark_favorite",
-                      "quantize_selected", "template_patches"):
+                      "quantize_selected"):
             model = self._focused_model()
             if model is None:
                 return False
@@ -2327,8 +2326,6 @@ class ModelSelectScreen(DataTableScreen):
             if action == "mark_favorite":     return not model.favorite
             if action == "unmark_favorite":   return model.favorite
             if action == "quantize_selected": return bool(tools_for_model(QUANTIZATION_TOOLS, model))
-            if action == "template_patches":
-                return any(s.chat_template_flag for s in servers_for_model(SERVERS, model))
         return True
 
     def on_screen_resume(self) -> None:
@@ -2385,52 +2382,9 @@ class ModelSelectScreen(DataTableScreen):
     def action_unmark_favorite(self) -> None:
         self._set_favorite(False)
 
-    def action_set_ctx_override(self) -> None:
-        model = self._focused_model()
-        if model is not None:
-            self.app.push_screen(
-                ContextSettingsScreen(model),
-                callback=lambda _: self._sort_models() or self._populate(),
-            )
-
     def _open_model(self, model: AIModel) -> None:
         """Navigate to the next screen for the selected model. Override in subclasses."""
-        self.app.push_screen(ServerSelectScreen(model))
-
-    @work(exclusive=True)
-    async def action_template_patches(self) -> None:
-        """Show the chat template patches matching the focused model and toggle its opt-outs."""
-        model = self._focused_model()
-        if model is None:
-            return
-        patches = await asyncio.to_thread(available_patches, model)  # GGUF header may be on the NAS
-        if not patches:
-            self.notify(f"No chat template patches apply to {model.name}", timeout=3)
-            return
-        while True:
-            lines: list[str] = []
-            choices: list[tuple[str, str, str]] = []
-            for patch in patches:
-                enabled = patch.id not in model.disabled_template_patches
-                state = "[green]● on[/]" if enabled else "[dim]○ off[/]"
-                lines.append(f"{state}  [bold]{escape(patch.label)}[/]\n[dim]{escape(patch.description)}[/]")
-                verb = "Disable" if enabled else "Enable"
-                choices.append((patch.id, f"{verb}: {patch.label}", "warning" if enabled else "success"))
-            choices.append(("", "Done", "default"))
-            message = "\n\n".join(lines) + (
-                "\n\n[dim]Enabled patches are applied at launch to a copy of the template in "
-                "launcher/user_data/chat_templates/ — model files are never modified.[/]"
-            )
-            choice = await self.app.push_screen_wait(
-                ChoiceScreen(f"Chat template patches — {escape(model.name)}", message, choices)
-            )
-            if not choice:
-                return
-            try:
-                launcher.save_template_patch_enabled(model, choice, choice in model.disabled_template_patches)
-            except Exception as e:
-                self.notify(str(e), severity="error", timeout=5)
-                return
+        self.app.push_screen(ModelPropertiesScreen(model))
 
     def action_dt_select(self) -> None:
         model = self._focused_model()
@@ -2465,10 +2419,422 @@ class ModelSelectScreen(DataTableScreen):
 
 
 # ---------------------------------------------------------------------------
+# Model properties — per-model settings, shown after a model is chosen
+# ---------------------------------------------------------------------------
+
+def strip_markup(text: str) -> str:
+    """Plain text of a Rich-markup string (for notifications)."""
+    return Text.from_markup(text).plain
+
+
+async def edit_spec_value(app: App, title: str, spec: ParamSpec, current: Any) -> tuple[bool, Any]:
+    """Ask for a new value of *spec* (picker or text prompt).  Returns (changed, value)."""
+    options = spec.options()
+    if options is not None:
+        choices = [
+            (f"opt-{i}", f"{'● ' if value == current else '  '}{label}", "primary" if value == current else "default")
+            for i, (value, label) in enumerate(options)
+        ]
+        choice = await app.push_screen_wait(ChoiceScreen(title, escape(spec.help), choices))
+        if choice is None:
+            return False, current
+        return True, options[int(choice.removeprefix("opt-"))][0]
+
+    def _validate(text: str) -> str | None:
+        try:
+            spec.parse(text)
+        except ValueError as e:
+            return str(e)
+        return None
+
+    text = await app.push_screen_wait(
+        TextPromptScreen(title, spec.help, initial=spec.to_text(current), validate=_validate)
+    )
+    if text is None:
+        return False, current
+    return True, spec.parse(text)
+
+
+async def edit_template_patches(app: App, model: AIModel) -> None:
+    """Show the chat template patches matching *model* and toggle its opt-outs."""
+    patches = await asyncio.to_thread(available_patches, model)  # GGUF header may be on the NAS
+    if not patches:
+        app.notify(f"No chat template patches apply to {model.name}", timeout=3)
+        return
+    while True:
+        lines: list[str] = []
+        choices: list[tuple[str, str, str]] = []
+        for patch in patches:
+            enabled = patch.id not in model.disabled_template_patches
+            state = "[green]● on[/]" if enabled else "[dim]○ off[/]"
+            lines.append(f"{state}  [bold]{escape(patch.label)}[/]\n[dim]{escape(patch.description)}[/]")
+            verb = "Disable" if enabled else "Enable"
+            choices.append((patch.id, f"{verb}: {patch.label}", "warning" if enabled else "success"))
+        choices.append(("", "Done", "default"))
+        message = "\n\n".join(lines) + (
+            "\n\n[dim]Enabled patches are applied at launch to a copy of the template in "
+            "launcher/user_data/chat_templates/ — model files are never modified.[/]"
+        )
+        choice = await app.push_screen_wait(
+            ChoiceScreen(f"Chat template patches — {escape(model.name)}", message, choices)
+        )
+        if not choice:
+            return
+        try:
+            launcher.save_template_patch_enabled(model, choice, choice in model.disabled_template_patches)
+        except Exception as e:
+            app.notify(str(e), severity="error", timeout=5)
+            return
+
+
+class _PropRow:
+    """One row of ModelPropertiesScreen: what it shows and how it is edited / reset."""
+
+    label = ""
+    help = ""
+    editable = False
+
+    def value(self, screen: "ModelPropertiesScreen") -> str:
+        return ""
+
+    def source(self, screen: "ModelPropertiesScreen") -> str:
+        return ""
+
+    def cyclable(self) -> bool:
+        return False
+
+    def overridden(self, screen: "ModelPropertiesScreen") -> bool:
+        return False
+
+    async def edit(self, screen: "ModelPropertiesScreen") -> None:
+        pass
+
+    def cycle(self, screen: "ModelPropertiesScreen") -> None:
+        pass
+
+    def reset(self, screen: "ModelPropertiesScreen") -> None:
+        pass
+
+
+class _SectionRow(_PropRow):
+    def __init__(self, title: str) -> None:
+        self.label = f"[bold]{escape(title)}[/]"
+
+
+def _source_cell(overridden: bool) -> str:
+    return "[bold]this model[/]" if overridden else "[dim]default[/]"
+
+
+class _ContextRow(_PropRow):
+    label = "Context / YaRN"
+    help = "Launch context: native, RoPE-scaled with YaRN, or an explicit override — e to edit, r to reset"
+    editable = True
+
+    def value(self, screen: "ModelPropertiesScreen") -> str:
+        m = screen.model
+        if m.ctx_override:
+            return f"{fmt_ctx(m.ctx_override)}  [dim](override; native {fmt_ctx(m.ctx)})[/]"
+        if m.rope_scaling:
+            return f"{fmt_ctx(m.effective_ctx)}  [dim]({fmt_ctx(m.ctx)} × {m.rope_scaling.factor:g} YaRN)[/]"
+        return f"{fmt_ctx(m.ctx)}  [dim](native)[/]"
+
+    def overridden(self, screen: "ModelPropertiesScreen") -> bool:
+        return bool(screen.model.ctx_override or screen.model.rope_scaling)
+
+    def source(self, screen: "ModelPropertiesScreen") -> str:
+        return _source_cell(self.overridden(screen))
+
+    async def edit(self, screen: "ModelPropertiesScreen") -> None:
+        await screen.app.push_screen_wait(ContextSettingsScreen(screen.model))
+
+    def reset(self, screen: "ModelPropertiesScreen") -> None:
+        launcher.save_rope_scaling(screen.model, None)
+        launcher.save_ctx_override(screen.model, 0)
+
+
+class _TemplatePatchesRow(_PropRow):
+    label = "Chat template patches"
+    help = "Fixes applied to a copy of the model's chat template at launch — e to toggle"
+    editable = True
+
+    def value(self, screen: "ModelPropertiesScreen") -> str:
+        patches = screen.template_patches
+        if patches is None:
+            return "[dim]checking…[/]"
+        if not patches:
+            return "[dim]none apply[/]"
+        on = [p.label for p in patches if p.id not in screen.model.disabled_template_patches]
+        return f"{len(on)} of {len(patches)} on" + (f"  [dim]({escape(', '.join(on))})[/]" if on else "")
+
+    def overridden(self, screen: "ModelPropertiesScreen") -> bool:
+        return bool(screen.model.disabled_template_patches)
+
+    def source(self, screen: "ModelPropertiesScreen") -> str:
+        return _source_cell(self.overridden(screen))
+
+    async def edit(self, screen: "ModelPropertiesScreen") -> None:
+        await edit_template_patches(screen.app, screen.model)
+
+    def reset(self, screen: "ModelPropertiesScreen") -> None:
+        for patch_id in list(screen.model.disabled_template_patches):
+            launcher.save_template_patch_enabled(screen.model, patch_id, True)
+
+
+class _SpecRow(_PropRow):
+    """A row whose value is described by a ParamSpec (model field or server parameter)."""
+
+    def __init__(self, spec: ParamSpec) -> None:
+        self.spec = spec
+        self.label = spec.label
+        self.help = spec.help
+        self.editable = spec.editable
+
+    def current(self, screen: "ModelPropertiesScreen") -> Any:
+        raise NotImplementedError
+
+    def store(self, screen: "ModelPropertiesScreen", value: Any) -> None:
+        raise NotImplementedError
+
+    def cyclable(self) -> bool:
+        return self.editable and self.spec.options() is not None
+
+    def overridden(self, screen: "ModelPropertiesScreen") -> bool:
+        return self.current(screen) != self.spec.default_value()
+
+    def source(self, screen: "ModelPropertiesScreen") -> str:
+        return _source_cell(self.overridden(screen))
+
+    def value(self, screen: "ModelPropertiesScreen") -> str:
+        return escape(self.spec.format(self.current(screen)))
+
+    async def edit(self, screen: "ModelPropertiesScreen") -> None:
+        changed, value = await edit_spec_value(screen.app, self.spec.label, self.spec, self.current(screen))
+        if changed:
+            self.store(screen, value)
+
+    def cycle(self, screen: "ModelPropertiesScreen") -> None:
+        self.store(screen, self.spec.cycle(self.current(screen)))
+
+    def reset(self, screen: "ModelPropertiesScreen") -> None:
+        self.store(screen, self.spec.default_value())
+
+
+class _ModelFieldRow(_SpecRow):
+    def current(self, screen: "ModelPropertiesScreen") -> Any:
+        return getattr(screen.model, self.spec.key)
+
+    def store(self, screen: "ModelPropertiesScreen", value: Any) -> None:
+        launcher.save_model_field(screen.model, self.spec, value)
+
+
+class _ServerParamRow(_SpecRow):
+    def __init__(self, server: ServerSoftware, spec: ParamSpec) -> None:
+        super().__init__(spec)
+        self.server = server
+
+    def current(self, screen: "ModelPropertiesScreen") -> Any:
+        overrides = screen.model.server_params.get(self.server.id, {})
+        return overrides.get(self.spec.key, self.spec.default_value())
+
+    def store(self, screen: "ModelPropertiesScreen", value: Any) -> None:
+        launcher.save_server_param(screen.model, self.server, self.spec.key, value)
+
+    def overridden(self, screen: "ModelPropertiesScreen") -> bool:
+        return self.spec.key in screen.model.server_params.get(self.server.id, {})
+
+    def source(self, screen: "ModelPropertiesScreen") -> str:
+        if self.spec.managed_by:
+            return "[dim]GPU screen[/]"
+        if not self.overridden(screen) and isinstance(self.spec, AutoBoolParam):
+            return "[dim]auto[/]"
+        return _source_cell(self.overridden(screen))
+
+    def value(self, screen: "ModelPropertiesScreen") -> str:
+        preview = screen.preview_params(self.server)
+        if self.spec.managed_by:
+            return f"{escape(self.spec.format(preview[self.spec.key]))}  [dim](planned for {screen.gpu_count} GPUs)[/]"
+        if self.current(screen) is None and isinstance(self.spec, AutoBoolParam):
+            resolved, reason = self.spec.resolve(screen.model, preview)
+            return f"auto → {'on' if resolved else 'off'}  [dim]({escape(reason)})[/]"
+        return super().value(screen)
+
+
+class ModelPropertiesScreen(DataTableScreen):
+    """A model's settings, shown after it is chosen and before picking a server.
+
+    Lists the model's own settings (context / YaRN, chat template patches, tool-call
+    parser, …) and the launch parameters of every compatible server with their
+    effective values and where each comes from: the server default, this model, or
+    "auto" (resolved at launch — previewed here for all GPUs).  Edits are saved to
+    this catalog entry only (copies at other locations keep their own settings).
+
+    Enter continues to the server list.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("q",        "quit_app",       "Quit"),
+        Binding("escape,b", "app.pop_screen", "Back", key_display="esc/←"),
+        Binding("e",        "edit",           "Edit"),
+        Binding("space",    "cycle",          "Toggle"),
+        Binding("r",        "reset",          "Reset"),
+        Binding("f5",       "dt_select",      "Continue", key_display="↵/→"),
+    ]
+
+    def __init__(self, model: AIModel) -> None:
+        super().__init__()
+        self.model = model
+        self.gpu_count = CONFIG.pipeline_parallel
+        self.template_patches: list | None = None   # filled by a worker (may read the NAS)
+        self._servers = servers_for_model(SERVERS, model)
+        self._rows: list[_PropRow] = [_SectionRow("Model"), _ContextRow()]
+        if any(s.chat_template_flag for s in self._servers):
+            self._rows.append(_TemplatePatchesRow())
+        self._rows += [_ModelFieldRow(spec) for spec in MODEL_FIELDS]
+        for server in self._servers:
+            self._rows.append(_SectionRow(server.label))
+            self._rows += [_ServerParamRow(server, spec) for spec in server.model_params(model)]
+
+    def preview_params(self, server: ServerSoftware) -> dict[str, Any]:
+        """Merged params as a launch on all GPUs would see them (auto values unresolved)."""
+        overrides, _ = launcher.gpu_param_overrides(server, self.model, self.gpu_count)
+        return {**server.default_params, **self.model.server_params.get(server.id, {}), **overrides}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Label(f"[bold]Model settings:[/]  {escape(self.model.name)}  ·  {self.model.format_tag}",
+                    id="screen-title")
+        yield Static(self._info_text(), id="props-info")
+        table = DataTable(id="props-table", cursor_type="row")
+        table.add_column("Setting", key="label")
+        table.add_column("Value", key="value")
+        table.add_column("Source", key="source")
+        yield table
+        yield Label("", id="props-help")
+        yield Footer()
+
+    def _info_text(self) -> str:
+        m = self.model
+        facts = [f"{m.size_gb:.0f} GB" if m.size_gb else ""]
+        if m.params_m:
+            facts.append(f"{m.params_m / 1000:g}B params")
+        if m.moe_experts:
+            facts.append(f"MoE {m.moe_active}/{m.moe_experts}")
+        facts += [m.arch, "vision" if m.vision else ""]
+        mtp = "sidecar head" if m.mtp_path else ("embedded" if m.mtp_embedded else "")
+        if mtp:
+            facts.append(f"MTP: {mtp}")
+        loc = location_of(m.path)
+        copies = [c for c in (location_of(c.path) for c in launcher.copies_of(m)) if c is not None]
+        where = f"[dim]{escape(loc.label if loc else 'path')}:[/] {escape(m.path)}"
+        if copies:
+            where += f"  [dim]· also on {escape(', '.join(c.label for c in copies))} (settings are per copy)[/]"
+        lines = ["  ·  ".join(escape(f) for f in facts if f), where]
+        if not m.hw_compat(system_min_sm()):
+            lines.append(f"[red]⛔  {escape(m.hw_compat_note)}[/]")
+        return "\n".join(lines)
+
+    def on_mount(self) -> None:
+        self._populate()
+        self._move_to_first_setting()
+        self._load_template_patches()
+
+    def on_screen_resume(self) -> None:
+        self._populate()
+
+    @work(thread=True)
+    def _load_template_patches(self) -> None:
+        patches = available_patches(self.model)
+        self.app.call_from_thread(self._on_template_patches, patches)
+
+    def _on_template_patches(self, patches: list) -> None:
+        self.template_patches = patches
+        self._populate()
+
+    def _move_to_first_setting(self) -> None:
+        first = next(i for i, row in enumerate(self._rows) if not isinstance(row, _SectionRow))
+        self.query_one("#props-table", DataTable).move_cursor(row=first)
+
+    def _populate(self) -> None:
+        table = self.query_one("#props-table", DataTable)
+        saved_row = table.cursor_row
+        table.clear()
+        for i, row in enumerate(self._rows):
+            table.add_row(row.label, row.value(self), row.source(self), key=str(i))
+        table.move_cursor(row=min(saved_row, len(self._rows) - 1))
+        self._update_help()
+
+    def _focused_row(self) -> _PropRow | None:
+        idx = self.query_one("#props-table", DataTable).cursor_row
+        return self._rows[idx] if 0 <= idx < len(self._rows) else None
+
+    def _update_help(self) -> None:
+        row = self._focused_row()
+        text = escape(row.help) if row is not None and row.help else ""
+        if isinstance(row, _SpecRow) and row.spec.managed_by:
+            text = f"{text}  [dim]({escape(row.spec.managed_by)})[/]".strip()
+        self.query_one("#props-help", Label).update(text)
+        self.refresh_bindings()
+
+    @on(DataTable.RowHighlighted)
+    def on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._update_help()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        row = self._focused_row()
+        if action == "edit":
+            return row is not None and row.editable
+        if action == "cycle":
+            return row is not None and row.cyclable()
+        if action == "reset":
+            return row is not None and row.editable and row.overridden(self)
+        return True
+
+    def _saved(self, row: _PropRow) -> None:
+        self._populate()
+        self.notify(f"{strip_markup(row.label)}: {strip_markup(row.value(self))}", timeout=2)
+
+    @work(exclusive=True)
+    async def action_edit(self) -> None:
+        row = self._focused_row()
+        if row is None or not row.editable:
+            return
+        try:
+            await row.edit(self)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=5)
+        self._populate()
+
+    def action_cycle(self) -> None:
+        row = self._focused_row()
+        if row is None or not row.cyclable():
+            return
+        try:
+            row.cycle(self)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=5)
+            return
+        self._saved(row)
+
+    def action_reset(self) -> None:
+        row = self._focused_row()
+        if row is None or not row.overridden(self):
+            return
+        try:
+            row.reset(self)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=5)
+            return
+        self._saved(row)
+
+    def action_dt_select(self) -> None:
+        self.app.push_screen(ServerSelectScreen(self.model))
+
+
+# ---------------------------------------------------------------------------
 # Context settings — inline editor for a model's ctx_override and rope_scaling
 # ---------------------------------------------------------------------------
 
-class ContextSettingsScreen(Screen):
+class ContextSettingsScreen(Screen[None]):
     """Edit the focused model's launch context: a YaRN factor and/or a ctx override.
 
     YaRN factor: blank or 1 = off; otherwise RoPE-scales the native ctx (e.g. 4 →
@@ -2477,7 +2843,7 @@ class ContextSettingsScreen(Screen):
     """
 
     BINDINGS: ClassVar = [
-        Binding("escape", "app.pop_screen", "Cancel", key_display="esc"),
+        Binding("escape", "cancel", "Cancel", key_display="esc"),
     ]
 
     def __init__(self, model: AIModel) -> None:
@@ -2595,7 +2961,7 @@ class ContextSettingsScreen(Screen):
             self.notify(str(e), severity="error", timeout=5)
             return
         self.notify(f"Launch context: {fmt_ctx(self._model.effective_ctx)}", timeout=3)
-        self.app.pop_screen()
+        self.dismiss()
 
     @on(Input.Submitted)
     def on_submitted(self, event: Input.Submitted) -> None:
@@ -2612,8 +2978,8 @@ class ContextSettingsScreen(Screen):
         self._apply()
 
     @on(Button.Pressed, "#btn-cancel")
-    def on_cancel(self) -> None:
-        self.app.pop_screen()
+    def action_cancel(self) -> None:
+        self.dismiss()
 
 
 # ---------------------------------------------------------------------------
@@ -2628,17 +2994,14 @@ class ModelManageScreen(ModelSelectScreen):
     - Title reads "Manage Models" instead of "Select Model".
     - Backing out returns to the ImageGenHubScreen.
 
-    Catalog management bindings (c/f/g/x/?) work; l/z are suppressed (text-gen only).
+    Catalog management bindings (c/f/Del) work; z is suppressed (text-gen only).
     """
 
-    # Drop set_ctx_override (text-gen concept, ctx=0 for all image-gen models),
-    # quantize_selected (offline conversion tools produce text-gen artifacts,
-    # not diffusion models) and template_patches (chat templates are text-gen only).
+    # Drop quantize_selected (offline conversion tools produce text-gen artifacts,
+    # not diffusion models).
     # Textual merges BINDINGS across the full MRO, so filtering the list has no effect.
     # check_action is the correct mechanism to hide bindings inherited from the parent.
-    _MANAGE_HIDDEN: ClassVar[frozenset[str]] = frozenset(
-        {"set_ctx_override", "quantize_selected", "template_patches"}
-    )
+    _MANAGE_HIDDEN: ClassVar[frozenset[str]] = frozenset({"quantize_selected"})
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action in self._MANAGE_HIDDEN:

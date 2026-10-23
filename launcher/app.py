@@ -2,7 +2,7 @@
 app.py — Top-level Textual App.
 
 Navigation entry point is AITypeScreen (screens.py), which drives the
-flow: AI Type → Model → Server → [Environment] → [Quant] → GPUs → ConfirmLaunch.
+flow: AI Type → Model → Model settings → Server → [Environment] → [Quant] → GPUs → ConfirmLaunch.
 """
 from __future__ import annotations
 
@@ -25,7 +25,8 @@ from launcher.environments import ENVIRONMENTS
 from launcher.launch import LaunchJob, QuantizeJob, finalize_quantization
 from launcher.models import AIModel, available_ai_types, uses_hub_flow
 from launcher.screens import (
-    AITypeScreen, EnvSelectScreen, ImageGenHubScreen, ModelSelectScreen, ServerSelectScreen,
+    AITypeScreen, EnvSelectScreen, ImageGenHubScreen, ModelPropertiesScreen, ModelSelectScreen,
+    ServerSelectScreen,
 )
 
 
@@ -58,6 +59,7 @@ class ModelLauncherApp(App):
             if model is not None:
                 ai_type = next(iter(model.ai_types))
                 self.push_screen(ModelSelectScreen(ai_type, preselect_model=model))
+                self.push_screen(ModelPropertiesScreen(model))
                 self.push_screen(ServerSelectScreen(model, preselect_server_id=server.id))
                 if len(ENVIRONMENTS.for_server(server.id)) > 1:
                     self.push_screen(EnvSelectScreen(model, server, preselect_env=job.env.name))

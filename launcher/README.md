@@ -145,7 +145,7 @@ python -m launcher.ingest ingest /path/to/models --ai-type image_gen --all [--dr
 
 Without `--all`, scanning stops after the first new model (useful for testing detection). With `--all`, every uncatalogued model is added in one pass.
 
-Auto-detected fields: `id`, `name`, `format`, `ctx`, `size_gb`, `params_m`, `arch`, MoE expert counts, `vision`, `trust_remote_code`, `mmproj_path` (for vision GGUFs), `mtp_path` (MTP draft heads shipped as `mtp-*.gguf`), `mtp_embedded` (MTP layers inside the GGUF itself — used only after opting in with server param `mtp: true`), and FP8 `min_sm` constraints.
+Auto-detected fields: `id`, `name`, `format`, `ctx`, `size_gb`, `params_m`, `arch`, MoE expert counts, `vision`, `trust_remote_code`, `mmproj_path` (for vision GGUFs), `mtp_path` (MTP draft heads shipped as `mtp-*.gguf`), `mtp_embedded` (MTP layers inside the model itself — a GGUF's NextN layers, or an HF checkpoint whose `config.json` declares MTP layers and that ships their weights; used only after opting in — see [Model settings](#model-settings)), and FP8 `min_sm` constraints.
 
 HF directories with both safetensors and pytorch_bin weights get a separate catalog entry per format. GGUF bundle directories yield one entry per quant variant.
 
@@ -194,28 +194,45 @@ Quick example:
 }
 ```
 
-Override server defaults per model with a `server_params` key:
+Override server defaults per model with a `server_params` key (or edit them on the [model settings](#model-settings) page):
 
 ```json
 "server_params": {
-  "vllm": {"gpu_mem_util": 0.80, "tensor_parallel": 4}
+  "vllm": {"gpu_mem_util": 0.80, "max_num_seqs": 16}
 }
 ```
 
 ## Adding server types
 
-1. Create a `ServerSoftware(...)` entry in `data.py → SERVERS`.
+1. Create a `ServerSoftware(...)` entry in `data.py → SERVERS`, declaring its launch parameters as typed `ParamSpec`s (`params.py`) — they appear on the model settings page automatically.
 2. Write `_build_<id>(server, env, model, params) → list[str]` in `launch.py` (take the interpreter / binaries from `env`).
 3. Register it in `_BUILDERS`.
 4. If the server needs a staging model directory, add a symlink-creation block in `launch()`.
 5. Register an environment for it (`e` on the server list).
+
+## Model settings
+
+Choosing a model opens its settings page before the server list (Enter continues straight on). The top shows what the model is — size, MoE, architecture, vision, MTP, and which storage locations hold copies. Below is every setting with its effective value and where it comes from:
+
+- *default* — the server's default; *this model* — overridden for this model; *auto* — decided at launch (shown with the reason); *GPU screen* — set when you pick GPUs (tensor / pipeline parallel are previewed for all GPUs).
+- **Model**: context / YaRN (e.g. YaRN factor `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF, and/or a context-length override), [chat template patches](#chat-template-patches), tool-call parser, trust remote code, note.
+- **One section per compatible server** with its launch parameters, each with a description in the help line. Model-specific ones appear only where they apply — expert parallel for MoE models, MTP for models with an MTP head.
+
+`e` edits the focused setting (a picker or a validated text prompt), `Space` toggles on/off and cycles auto/on/off settings, `r` resets an override to the default. Changes are saved immediately to this catalog entry. Copies of a model at other locations are separate entries and keep their own settings (the page tells you which copies exist).
+
+Notable settings:
+
+- **Expert parallel (vLLM, MoE models)** — `auto` turns on `--enable-expert-parallel` exactly when the experts cannot be split across the tensor-parallel GPUs (e.g. Qwen3.8-Flash-Next FP8 at TP8: expert width 640 / 8 = 80 does not align to its 128-wide FP8 blocks). It has no effect when a model runs pipeline-parallel only (TP1), which is how most MoE models launch here. The GPU screen shows `expert parallel: on (auto)` when it applies.
+- **MTP speculative decoding (vLLM)** — off by default; turn it on for checkpoints that ship multi-token-prediction layers (detected by ingest/refresh). Adds `--speculative-config '{"method":"mtp","num_speculative_tokens":N}'` with *MTP draft tokens* (default 2). It speeds up decoding — Qwen3.8-Flash-Next averaged ~2 tokens per step with 2 — but costs memory: its context auto-fit dropped from 262K to ~190K. Check `SpecDecoding metrics` in the log to tune the draft count.
+- **MTP (llama.cpp / ooba GGUF)** — `auto` uses a sidecar `mtp-*.gguf` head; `on` also uses an embedded head (opt-in, as llama.cpp may not implement MTP for the architecture).
+- Prefix caching needs no setting: vLLM enables it by default.
 
 ## Navigation
 
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move cursor |
-| `→` / `Enter` | Select / confirm (model list: advance to server screen, or the copy screen in image-gen model management; server list: advance to environment or GPU screen) |
+| `→` / `Enter` | Select / confirm (model list: open the model's settings, or the copy screen in image-gen model management; model settings: continue to the server list; server list: advance to environment or GPU screen) |
 | `←` / `Esc` / `b` | Go back |
 | `q` | Quit from any screen |
 | `Space` | Toggle GPU selection (GPU screen) |
@@ -224,9 +241,8 @@ Override server defaults per model with a `server_params` key:
 | `p` / `P` | Set the power limit for the highlighted GPU / all selected GPUs (GPU screen) |
 | `c` | Copy focused model to another storage location (model list) — see [Storage locations and copies](#storage-locations-and-copies) |
 | `Del` | Delete focused model's files and catalog entry (model list), after confirmation |
-| `l` | Context settings for focused model (model list): YaRN factor to extend the context (e.g. `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF) and/or a context-length override |
 | `f` | Toggle favorite pin for focused model (model list) |
-| `t` | Chat template patches for focused model (model list): shows the fixes that apply to its chat template and turns each on/off (see [Chat template patches](#chat-template-patches)) |
+| `e` / `Space` / `r` | Edit / toggle / reset the focused setting (model settings) |
 | `z` | Convert / quantize focused model — opens tool/output/destination picker (model list) |
 | `g` / `x` / `?` | Mark the launch as good / bad / unknown — on the deepest screen for that server (server list, environment picker, or quantization picker) |
 | `e` | Manage environments for the focused server (server list, environment picker) |
@@ -237,7 +253,7 @@ The final **Ready to launch** screen is an editor containing the exact shell com
 
 ## Concurrent slots and memory fit (llama.cpp)
 
-The GPU screen shows how many requests llama.cpp will serve at once — `Slots N × 128K ctx` — and `+` / `-` change it. Every slot gets the model's full context (its `ctx`, or the `l` override): the launcher passes `--ctx-size` as context × slots, because llama.cpp divides it evenly between slots. The count you launch with is remembered for that model.
+The GPU screen shows how many requests llama.cpp will serve at once — `Slots N × 128K ctx` — and `+` / `-` change it. Every slot gets the model's full context (its `ctx`, or the override set on the model settings page): the launcher passes `--ctx-size` as context × slots, because llama.cpp divides it evenly between slots. The count you launch with is remembered for that model.
 
 While you pick GPUs and slots, the launcher asks llama.cpp's own planner (`llama-fit-params`, from the selected build) whether the launch fits in the GPUs' currently free memory, and shows the answer a couple of seconds later:
 
@@ -262,7 +278,7 @@ Patches:
 
 - `system_anywhere` — renders later system messages in place as ChatML system turns (`<|im_start|>system … <|im_end|>`) instead of failing. Requests with only a leading system message render exactly as before.
 
-Press `t` on the model list to see which patches apply to the focused model and to switch individual patches off (stored as `disabled_template_patches` in the catalog).
+On the model settings page, `e` on *Chat template patches* shows which patches apply to the model and switches individual patches off (stored as `disabled_template_patches` in the catalog).
 
 ## GPU power limits
 
@@ -292,7 +308,9 @@ launcher/
   __main__.py          Entry point: python -m launcher
   app.py               Textual App class
   screens.py           All TUI screens
-  models.py            Schema: AIModel, ServerSoftware, AIType, ModelFormat
+  models.py            Schema: AIModel, ServerSoftware, AIType, ModelFormat, editable model fields
+  params.py            Typed server launch parameters (default, help, editor, auto resolution)
+  hf_config.py         Model config.json facts for launch planning (parallelism, expert parallel)
   data.py              SERVERS list, quantization tools, catalog loading (safe to commit)
   storage.py           Storage locations; model copy and deletion file operations
   environments.py      Server environments (conda envs / native builds) + registry

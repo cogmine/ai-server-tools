@@ -9,6 +9,7 @@ Navigation flow produced by these types:
   Level 3 — ServerSoftware filtered by model.format ∈ server.supported_formats
                                     AND model.ai_types ∩ server.supported_ai_types ≠ ∅
   Launch  — merge server.default_params | model.server_params[server.id] → build command
+            (server.params — typed ParamSpecs, see params.py — define the defaults)
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import re
 from typing import Any, Iterable, Literal
 
 from launcher.config import CONFIG
+from launcher.params import AutoBoolParam, BoolParam, ParamSpec, TextParam
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +324,7 @@ class AIModel:
     vision: bool = False           # model accepts image/vision input
     mmproj_path: str = ""          # path to companion mmproj .gguf file (vision GGUF only)
     mtp_path: str = ""             # path to companion multi-token-prediction draft head .gguf (GGUF only)
-    mtp_embedded: bool = False     # GGUF carries its own MTP layers (nextn_predict_layers > 0)
+    mtp_embedded: bool = False     # the model carries its own MTP layers: GGUF nextn_predict_layers > 0, or an HF checkpoint declaring MTP layers that ships their weights
     trust_remote_code: bool = False  # servers must pass --trust-remote-code
     quant: str = ""                # quant suffix for display, e.g. "Q4_K_M" (mainly GGUF)
     note: str = ""                 # user-defined note shown in the status bar
@@ -563,6 +565,26 @@ class AIModel:
         return                         "yellow", "✗?"
 
 
+# Simple AIModel fields the user edits on a model's properties page.  key = the
+# AIModel attribute and catalog JSON key; the entry omits the key at its default.
+# Context (ctx_override / rope_scaling) and chat template patches have dedicated editors.
+MODEL_FIELDS: tuple[ParamSpec, ...] = (
+    TextParam(
+        key="tool_call_parser", label="Tool-call parser", default="", empty_label="none",
+        help="vLLM parser name (e.g. qwen3_coder, hermes, openai) — enables tool calling on "
+             "vLLM and SGLang (translated to SGLang's names)",
+    ),
+    BoolParam(
+        key="trust_remote_code", label="Trust remote code", default=False,
+        help="Pass --trust-remote-code: the checkpoint ships custom Python model code (auto_map in config.json)",
+    ),
+    TextParam(
+        key="note", label="Note", default="", empty_label="none",
+        help="Shown in the model list's note column and status bar",
+    ),
+)
+
+
 # ---------------------------------------------------------------------------
 # Server Software
 # ---------------------------------------------------------------------------
@@ -590,9 +612,10 @@ class VersionProbe:
 
 @dataclass
 class ServerSoftware:
-    """Describes a server process — supported formats/types and default launch params.
+    """Describes a server process — supported formats/types and its launch params.
 
-    default_params is the baseline for every launch on this server.
+    params declares every launch parameter (ParamSpec: default, help, editor, auto
+    resolver); default_params derives the baseline for every launch from it.
     A model's server_params[self.id] dict is merged on top at launch time.
     Only values that differ from these defaults need to appear in server_params.
     """
@@ -600,7 +623,7 @@ class ServerSoftware:
     label: str                                  # display text in the UI
     supported_formats: frozenset[ModelFormat]   # model formats this server can load
     supported_ai_types: frozenset[AIType]       # AI types this server can expose
-    default_params: dict[str, Any] = field(default_factory=dict)
+    params: tuple[ParamSpec, ...] = ()
     # Formats for which this server can apply runtime quantization (full-precision only).
     quantizable_formats: frozenset[ModelFormat] = field(default_factory=frozenset)
     # Ordered tuple of runtime quant options available for quantizable formats.
@@ -666,6 +689,22 @@ class ServerSoftware:
     # Flag taking a chat template file that replaces the model's own (e.g. llama.cpp
     # "--chat-template-file").  "" = no override: chat template patches are not applied.
     chat_template_flag: str = ""
+
+    @property
+    def default_params(self) -> dict[str, Any]:
+        """Baseline value of every launch parameter (fresh copies — safe to mutate)."""
+        return {spec.key: spec.default_value() for spec in self.params}
+
+    def param(self, key: str) -> ParamSpec:
+        return next(spec for spec in self.params if spec.key == key)
+
+    def auto_params(self) -> tuple[AutoBoolParam, ...]:
+        """Parameters whose None ("auto") value is resolved per launch."""
+        return tuple(spec for spec in self.params if isinstance(spec, AutoBoolParam))
+
+    def model_params(self, model: AIModel) -> tuple[ParamSpec, ...]:
+        """Parameters shown for *model* on its properties page."""
+        return tuple(spec for spec in self.params if not spec.hidden and spec.applies(model))
 
     def applies_rope_scaling(self, model: AIModel) -> bool:
         return model.rope_scaling is not None and model.format in self.rope_scaling_formats

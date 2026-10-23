@@ -18,8 +18,10 @@ A keyboard-driven Textual TUI that selects and launches large-model inference se
 ```
 config.py                   Site-specific loader — reads user_data/config.toml, exposes CONFIG singleton
 config.toml.example         Tracked template — copy to user_data/config.toml and edit
-models.py                   Schema — enums, dataclasses, pure logic (no instances, no I/O)
-data.py                     Generic instances — SERVERS list, QUANTIZATION_TOOLS, catalog loading (committable)
+models.py                   Schema — enums, dataclasses, pure logic (no instances, no I/O); MODEL_FIELDS
+params.py                   Typed launch parameters (ParamSpec kinds) — the schema behind every server setting
+hf_config.py                Launch-planning facts from a model's config.json (parallelism fields, expert-parallel need)
+data.py                     Generic instances — SERVERS (with their ParamSpecs), QUANTIZATION_TOOLS, catalog loading (committable)
 storage.py                  Storage locations (LOCATIONS), mirrored paths, model files, copy + deletion plans
 environments.py             Server runtime environments — Environment kinds (conda / native) + ENVIRONMENTS registry
 environments.json.example   Tracked template — environment registry (copy to user_data/environments.json)
@@ -51,7 +53,7 @@ user_data/                  Gitignored — all machine-specific and personal dat
 user_data/config.toml (gitignored)
     └── config.py → SiteConfig dataclass (singleton CONFIG)
             ├── storage.py (LOCATIONS — [[locations]])
-            ├── data.py    (SERVERS.default_params)
+            ├── data.py    (SERVERS params defaults)
             ├── environments.py (conda_base → conda env locations)
             └── launch.py  (app paths, CUDA_VISIBLE_DEVICES, CUDA_HOME)
 
@@ -109,9 +111,9 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `comfyui_subdir` | `image_gen` models only — ComfyUI `models/` subdirectory to stage into. Default: `"checkpoints"` (omit from JSON). Use `"diffusion_models"` for FLUX UNets. Extensible: any valid subdirectory name accepted by ComfyUI. |
 | `mmproj_path` | Absolute path to the companion `mmproj-*.gguf` vision encoder file. Set automatically by `ingest`/`refresh` when the file is present in the bundle root. Passed as `--mmproj` to llama.cpp and ooba at launch time — from the entry's own `mmproj_path`. Omitted from JSON when empty. |
 | `mtp_path` | Absolute path to the companion `mtp-*.gguf` multi-token-prediction draft head. Set automatically by `ingest`/`refresh`. llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <mtp_path>` unless the `mtp` server param is `false`. Cached alongside the model. Omitted from JSON when empty. |
-| `mtp_embedded` | `True` when the GGUF itself carries MTP (NextN) layers — `<arch>.nextn_predict_layers > 0` in its header, read by `gguf_header.py` during `ingest`/`refresh`. Used (`--spec-type draft-mtp`, no draft file) only when the `mtp` server param is `true`, since many GGUFs keep NextN layers that a llama.cpp build cannot run for their architecture (e.g. GLM5-Next: "NextN graph not implemented yet"). Omitted from JSON when false. |
-| `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. |
-| `disabled_template_patches` | frozenset of `ChatTemplatePatch.id`s the model opts out of; every other patch matching its chat template is applied at launch (see *Chat Template Patches*). Toggled with `t` on the model list via `save_template_patch_enabled()`. Omitted from JSON when empty. |
+| `mtp_embedded` | `True` when the model carries its own MTP (NextN) layers. GGUF: `<arch>.nextn_predict_layers > 0` in its header (`gguf_header.py`). HF checkpoint: `config.json` declares `mtp_num_hidden_layers` / `num_nextn_predict_layers` > 0 **and** the weights include them (`mtp.*` tensors, or a layer index past `num_hidden_layers`) — quantized/abliterated copies often keep the keys but drop the weights. Set by `ingest`/`refresh`. llama.cpp / ooba use it (`--spec-type draft-mtp`, no draft file) only when their `mtp` param is `on` (many GGUFs keep NextN layers a llama.cpp build cannot run, e.g. GLM5-Next); vLLM uses it for `--speculative-config` when its `mtp` param is on (opt-in). Omitted from JSON when false. |
+| `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. Editable on the model properties page (a `MODEL_FIELDS` entry, as are `trust_remote_code` and `note`). |
+| `disabled_template_patches` | frozenset of `ChatTemplatePatch.id`s the model opts out of; every other patch matching its chat template is applied at launch (see *Chat Template Patches*). Toggled on the model properties page via `save_template_patch_enabled()`. Omitted from JSON when empty. |
 | `family` | Shared by an original model and every copy, conversion and quantization of it (ingest assigns the slug of the model's name; `register_copy()` and `finalize_quantization()` carry it over). Groups related entries without a per-model link chain, so deleting an intermediate (e.g. an F16 GGUF used to make a Q8_0) loses nothing. |
 | `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
 | `server_params` | Per-server overrides merged on top of server defaults at launch time |
@@ -145,6 +147,7 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 
 | Field | Type | Purpose |
 |---|---|---|
+| `params` | `tuple[ParamSpec, ...]` | Every launch parameter — see *Launch Parameters* below. `default_params` (property) derives the baseline values; `param(key)`, `auto_params()` and `model_params(model)` (the specs shown for a model) are lookups |
 | `env_kind` | `str` | `Environment.kind` registered for this server — `"conda"` (default) or `"native"` (llama.cpp) |
 | `version_packages` | `tuple[str, ...]` | Python distributions whose installed versions label an environment in the UI and log header (e.g. `("vllm",)` → `vllm 0.26.0`) |
 | `version_probe` | `VersionProbe \| None` | Command-based version detection for environments without package metadata — runs `executable args` in the env and formats the first matching regex (`patterns`, tried in order) with `template`. llama.cpp: `llama-server --version` → `llama.cpp b11461 (4d756bc72)`. Output is cached per executable mtime (`Environment.command_output`). `ServerSoftware.env_version_label(env)` combines both sources and is the single entry point for UI and log headers |
@@ -164,9 +167,32 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 | `launch_cwd` | `str \| None` | Working directory for the spawned process (`None` = inherit) |
 | `max_gpus` | `int` | Maximum GPUs selectable in `GpuSelectScreen`: `0` = unlimited (all GPUs, multi-select); `1` = single GPU only (radio-button) |
 | `gpu_count_param` | `str \| None` | When set, `GpuSelectScreen` injects `{gpu_count_param: selected_count}` as a `param_overrides` entry so parallelism flags (e.g. `pipeline_parallel` for vLLM/SGLang) stay consistent with the selected GPU count. `None` for servers that handle variable GPU counts automatically (tabbyAPI `--gpu-split-auto`, llama.cpp layer distribution) |
-| `concurrency_param` | `str \| None` | `default_params` key holding the number of concurrently processed requests (llama.cpp: `"parallel"` slots). When set, `GpuSelectScreen` adjusts it with `+`/`-`, injects it into `param_overrides`, and remembers the launched value per model (`save_server_param`). The catalog `ctx` stays the per-request context; each builder translates (llama.cpp multiplies `--ctx-size` by the slot count) |
+| `concurrency_param` | `str \| None` | Param key holding the number of concurrently processed requests (llama.cpp: `"parallel"` slots). When set, `GpuSelectScreen` adjusts it with `+`/`-`, injects it into `param_overrides`, and remembers the launched value per model (`save_server_param`). The catalog `ctx` stays the per-request context; each builder translates (llama.cpp multiplies `--ctx-size` by the slot count) |
 
-Defined once per server type in `data.py`. The `default_params` dict establishes baseline launch parameters; per-model `server_params` only specify deltas.
+Defined once per server type in `data.py`. The `params` specs establish baseline launch parameters; per-model `server_params` only specify deltas.
+
+### Launch Parameters (`params.py`)
+
+Each server parameter is a `ParamSpec` — the single source of truth for its default, help text, how a value is shown and edited, which models it applies to and (for auto parameters) how it is resolved. Kinds are classes, so the properties page and launch resolution never branch on a parameter's type:
+
+| Kind | Values | Edited by |
+|---|---|---|
+| `BoolParam` | `False` / `True` | picker (Space toggles) |
+| `AutoBoolParam` | `None` (auto) / `True` / `False` — auto is resolved per launch by its `resolve(model, merged_params) → (value, reason)` | picker (Space cycles) |
+| `ChoiceParam` | one of `choices`; `labels` names special values (e.g. `""` → "auto") | picker (Space cycles) |
+| `IntParam` / `FloatParam` | numbers within `minimum`/`maximum`; `IntParam` optionally allows `None` (`none_label`) and keywords such as `"auto"` | text prompt with validation |
+| `TextParam` | free text (`empty_label` names the blank value) | text prompt |
+| `FlagsParam` | a list of extra command-line arguments | text prompt (shell syntax) |
+
+Common fields: `hidden` (internal plumbing such as staging directories — never shown per model), `managed_by` (set elsewhere in the flow, e.g. TP/PP "set from the GPU selection" — shown read-only), `applies_to(model)` (e.g. MoE-only or MTP-only parameters). `default_value()` returns a fresh, comparable copy (lists for `FlagsParam`).
+
+**Auto resolution**: `launch_params()` merges defaults, the model's `server_params` and `param_overrides`, then replaces every auto parameter still `None` with its resolved value — builders, the fit probe and the GPU screen only ever see booleans. `auto_param_states(server, model, overrides)` returns `(spec, value, reason)` for display (the GPU screen shows auto parameters that resolve on, e.g. `expert parallel: on (auto)`).
+
+Current auto parameters:
+- vLLM `expert_parallel` → `hf_config.expert_parallel_needed(model, tp)`: on when the expert width (`moe_intermediate_size`) does not divide by TP, or a TP shard does not align to the checkpoint's `weight_block_size` (Qwen3.8-Flash-Next FP8: 640 / 8 = 80 vs 128). Off at TP=1 (no effect there) and for dense models.
+- llama.cpp / ooba `mtp` → on only for a sidecar `mtp_path` head; an embedded head needs an explicit on.
+
+`MODEL_FIELDS` (`models.py`) reuses the same kinds for the simple user-editable `AIModel` fields (`tool_call_parser`, `trust_remote_code`, `note`), persisted with `save_model_field()`.
 
 ---
 
@@ -227,7 +253,8 @@ App.on_mount
     └─ one type, !hub_flow → ModelSelectScreen(type)
        multiple types      → AITypeScreen
                                 └─ !hub_flow → ModelSelectScreen(chosen_type)
-                                                    └─ ServerSelectScreen(model)
+                                                    └─ ModelPropertiesScreen(model)   (Enter continues)
+                                                            └─ ServerSelectScreen(model)
                                                             └─ [EnvSelectScreen]       (server has >1 environment)
                                                                     └─ [QuantSelectScreen]
                                                                             └─ GpuSelectScreen(server, env, model, quant)
@@ -259,7 +286,9 @@ App.on_mount
 
 `App.exit(result)` returns either a `LaunchJob(factory, model, server, env)` or a `QuantizeJob` (both frozen dataclasses in `launch.py`). The TUI tears down, then `app.py::run()` calls the process factory and blocks on `proc.wait()`. This means the TUI process *is* the parent process, so `Ctrl-C` propagates naturally.
 
-For server launches with a model, `run()` re-opens the menu after Ctrl-C with the `LaunchJob` as preselect: `ServerSelectScreen` focuses the server and, when it has more than one environment, `EnvSelectScreen` is pushed with the launched environment focused — so the result can be marked immediately. Image-gen launches (`model=None`) and interrupted quantization jobs reopen from the top. Successful quantization jobs finalize and focus the generated model.
+For server launches with a model, `run()` re-opens the menu after Ctrl-C with the `LaunchJob` as preselect (stack: model list → properties → server list): `ServerSelectScreen` focuses the server and, when it has more than one environment, `EnvSelectScreen` is pushed with the launched environment focused — so the result can be marked immediately. Image-gen launches (`model=None`) and interrupted quantization jobs reopen from the top. Successful quantization jobs finalize and focus the generated model.
+
+**`ModelPropertiesScreen`** (after choosing a model; Enter / `→` continues to `ServerSelectScreen`): a summary (size, MoE, architecture, vision, MTP, location and other copies — settings are per copy, so it says which copies exist) and a table of every setting with its value and source (`default`, `this model`, `auto`, `GPU screen`). Sections: *Model* — context / YaRN (opens `ContextSettingsScreen`), chat template patches (`edit_template_patches()`; the row resolves the matching patches in a worker since the GGUF header may be on the NAS), then `MODEL_FIELDS`; then one section per compatible server listing `server.model_params(model)`. Auto values are previewed for a launch on all GPUs (`gpu_param_overrides(server, model, CONFIG.pipeline_parallel)`), so TP/PP show the planned split and `expert_parallel` shows `auto → on (reason)`. Rows are small objects (`_SectionRow`, `_ContextRow`, `_TemplatePatchesRow`, `_ModelFieldRow`, `_ServerParamRow` — the last two share `_SpecRow`) that know how to show, edit, cycle and reset themselves. Bindings: `e` edit (picker or validated prompt via `edit_spec_value()`), Space toggle/cycle picker kinds, `r` reset to default (only when overridden). Edits save immediately to this catalog entry.
 
 **Environment step**: `ServerSelectScreen` shows an environment column (the single env with its versions, `N environments`, or `no environment`). A server with one environment skips `EnvSelectScreen`; with none, selection is refused with a hint to press `e`. `_continue_launch()` is the shared hand-off (used by both screens): it refuses a missing environment, then pushes `QuantSelectScreen` or `GpuSelectScreen`.
 
@@ -267,7 +296,7 @@ For server launches with a model, `run()` re-opens the menu after Ctrl-C with th
 
 **`ImageGenHubScreen`**: Two-button menu. "Launch Server" pushes `ServerSelectScreen(model=None, ai_type=...)` which filters servers by type (via `servers_for_type()`), skips path validation, and suppresses g/x/? status marking. "Manage Models" pushes `ModelManageScreen` — all catalog management bindings work identically to `ModelSelectScreen`; `→`/`Enter` open `CopyModelScreen` for the focused model (copy to another location) rather than advancing toward a server launch. Both buttons use `variant="primary"`.
 
-**`ModelManageScreen`**: Subclass of `ModelSelectScreen` — overrides `_open_model()` (the template method called by both `action_dt_select` and `on_data_table_row_selected`) to push `CopyModelScreen` instead of `ServerSelectScreen`, and overrides `_title_text()` to show "manage models" in the title. `set_ctx_override`, `quantize_selected` and `template_patches` are hidden via `_MANAGE_HIDDEN` in `check_action` (text-gen-only concepts irrelevant for diffusion models). The template method pattern is necessary because Textual calls all MRO classes' message handlers — both `@on` decorator and auto-named handlers — so standard Python MRO shadowing does not work for Textual message dispatch; only plain method calls (like `_open_model()`) respect the most-derived override.
+**`ModelManageScreen`**: Subclass of `ModelSelectScreen` — overrides `_open_model()` (the template method called by both `action_dt_select` and `on_data_table_row_selected`) to push `CopyModelScreen` instead of `ServerSelectScreen`, and overrides `_title_text()` to show "manage models" in the title. `quantize_selected` is hidden via `_MANAGE_HIDDEN` in `check_action` (a text-gen-only concept irrelevant for diffusion models). The template method pattern is necessary because Textual calls all MRO classes' message handlers — both `@on` decorator and auto-named handlers — so standard Python MRO shadowing does not work for Textual message dispatch; only plain method calls (like `_open_model()`) respect the most-derived override.
 
 **Root-screen back action**: Textual always keeps a blank `_DefaultScreen` at stack index 0. The root application screen sits at index 1. `action_dt_back()` on root screens (`ModelSelectScreen`, `AITypeScreen`) checks `len(screen_stack) > 2` (not `> 1`) before popping; at the root it calls `app.exit(None)` instead.
 
@@ -292,7 +321,7 @@ Pure button screens need none of this — buttons don't consume `enter`, `right`
 
 1. **Quit** — always first: `Binding("q", "quit_app", "Quit")`. Omitted on `ContextSettingsScreen` (Input captures `q`) and on `CopyProgressScreen` (`q` is the cancel key, not quit).
 2. **Back / Cancel** — always second: `key_display="esc/←"`. Escape-only modals (e.g. `ContextSettingsScreen`) use `key_display="esc"`.
-3. **Contextual bindings** — alphabetical by key character (e.g. `?`, `c`, `f`, `g`, `l`, `x`, `z`).
+3. **Contextual bindings** — alphabetical by key character (e.g. `?`, `c`, `f`, `g`, `x`, `z`).
 4. **Select / primary action** — always last:
    - DataTable screens: `key_display="↵/→/dbl-click"` — all three methods invoke the same action.
    - Button screens: `key_display="↵/→/Space"` — space activates the focused button.
@@ -304,7 +333,7 @@ The App-level `q → quit_app` binding uses `show=False` to prevent duplication 
 
 **Cursor preservation**: `ModelSelectScreen._populate()` saves `table.cursor_row` before rebuild and calls `table.move_cursor(row=saved_row)` after. This ensures navigating Back from the server screen and returning does not reset the position.
 
-**`ContextSettingsScreen`**: Pressing `l` on the model list opens a modal with two `Input`s: a YaRN factor (blank or `1` = off) and a ctx override (plain integer or K-suffixed value such as `32K`; blank or `0` = none). A live preview shows the resulting launch context, warns when it exceeds the (scaled) trained length, and lists which of the model's servers apply YaRN (derived from `rope_scaling_formats`). Editing the factor keeps an existing `method` / `original_ctx`. On confirm, calls `save_rope_scaling()` and `save_ctx_override()` and pops itself — `ModelSelectScreen.on_screen_resume()` fires, re-sorts, and calls `_populate()` to refresh the Ctx column (shown as `effective/native` whenever they differ).
+**`ContextSettingsScreen`**: `e` on the *Context / YaRN* row of the model properties page opens a modal with two `Input`s: a YaRN factor (blank or `1` = off) and a ctx override (plain integer or K-suffixed value such as `32K`; blank or `0` = none). A live preview shows the resulting launch context, warns when it exceeds the (scaled) trained length, and lists which of the model's servers apply YaRN (derived from `rope_scaling_formats`). Editing the factor keeps an existing `method` / `original_ctx`. On confirm, calls `save_rope_scaling()` and `save_ctx_override()` and dismisses itself (`dismiss()`, not `pop_screen()`, so the properties page's `push_screen_wait()` resolves); the model list's Ctx column shows `effective/native` whenever they differ.
 
 **Favorites (`f` key)**: Pressing `f` on a focused model calls `save_favorite(model, not model.favorite)`, toggling the pinned state. The star column (`★`) shows `★` for favorites and blank for others. Changing favorite state triggers an immediate re-sort and repopulate so the row moves to/from the top without requiring any other interaction.
 
@@ -371,10 +400,10 @@ The fitter logs its projection for the requested settings within ~2 s (a per-dev
 
 *Why a script instead of `sudo nvidia-smi -pl` in the command?* `scripts/gpu-power-limit IDX[,IDX…]=WATTS|default …` queries the current limits first and only invokes `sudo nvidia-smi -i … -pl …` for GPUs that differ, so sudo (and its password prompt) is needed only after a reboot/reset rather than on every launch. The command runs in the server's PTY, but sudo prompts and reads the password on the controlling terminal (`/dev/tty`), which the child inherits from the launcher after the TUI has exited.
 
-**Parallelism computation** (`compute_parallelism` in `launch.py`): reads the model's HF `config.json` for `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `num_hidden_layers`, and the linear-attention head counts `linear_num_key_heads` / `linear_num_value_heads` (hybrid Gated-DeltaNet models). Multimodal checkpoints nest these under `text_config`, which takes precedence over the top level. For PCIe topology (no NVLink), prefers the smallest valid TP (largest PP) to minimise cross-GPU tensor traffic. TP must evenly divide the attention, linear-attention and intermediate dimensions; `num_key_value_heads` must be divisible by TP *or* TP a multiple of it (vLLM/SGLang replicate KV heads when TP exceeds them). Architectures in `_NO_PP_ARCHS` (Qwen4Exp — its N-gram PLE embedding needs raw `input_ids`, which non-first PP ranks never receive) get the largest valid TP with PP=1, even if some selected GPUs go unused; the status bar notes why. Additionally, for architectures *not* in `_TP_SCOPED_ARCHS`, `intermediate_size` must also be divisible by the total GPU count — this guards against model implementations that assert `intermediate_size % world_size == 0` using the global process count rather than the TP group size. When no valid plan exists for the selected GPU count, the count is automatically reduced to the largest compatible value and a note is shown in the status bar. Architecture is read from `model.arch` (catalog) with a fallback to `architectures[0]` in `config.json`. Results of `_read_hf_parallelism_fields` are LRU-cached per model path.
+**Parallelism computation** (`compute_parallelism` in `launch.py`): reads the model's HF `config.json` for `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `num_hidden_layers`, and the linear-attention head counts `linear_num_key_heads` / `linear_num_value_heads` (hybrid Gated-DeltaNet models). Multimodal checkpoints nest these under `text_config`, which takes precedence over the top level. For PCIe topology (no NVLink), prefers the smallest valid TP (largest PP) to minimise cross-GPU tensor traffic. TP must evenly divide the attention, linear-attention and intermediate dimensions; `num_key_value_heads` must be divisible by TP *or* TP a multiple of it (vLLM/SGLang replicate KV heads when TP exceeds them). Architectures in `_NO_PP_ARCHS` (Qwen4Exp — its N-gram PLE embedding needs raw `input_ids`, which non-first PP ranks never receive) get the largest valid TP with PP=1, even if some selected GPUs go unused; the status bar notes why. Additionally, for architectures *not* in `_TP_SCOPED_ARCHS`, `intermediate_size` must also be divisible by the total GPU count — this guards against model implementations that assert `intermediate_size % world_size == 0` using the global process count rather than the TP group size. When no valid plan exists for the selected GPU count, the count is automatically reduced to the largest compatible value and a note is shown in the status bar. Architecture is read from `model.arch` (catalog) with a fallback to `architectures[0]` in `config.json`. The fields come from `hf_config.read_parallelism_fields()` (also the expert-parallel resolver's source), LRU-cached per model path. `gpu_param_overrides(server, model, n)` turns a GPU count into the parallelism params (planned TP×PP for `gpu_count_param == "pipeline_parallel"` servers) — shared by `GpuSelectScreen` and the properties page preview.
 
 **`build_cmd` / `launch` signatures**:
-- `build_cmd(server, env, model, runtime_quant, param_overrides)` — resolves params via `launch_params()` (`_merged()` with `param_overrides` last, plus the injected `_model_path` / `_runtime_quant`); the fit probe uses the same resolver.
+- `build_cmd(server, env, model, runtime_quant, param_overrides)` — resolves params via `launch_params()` (`_merged()` with `param_overrides` last, auto parameters resolved, plus the injected `_model_path` / `_runtime_quant`); the fit probe uses the same resolver.
 - `build_launch_command(server, env, model, runtime_quant, cuda_devices, param_overrides, power_step)` — wraps `build_cmd()` in the explicit environment and working-directory shell syntax shown in `ConfirmLaunch`; a `power_step` is prepended as `<gpu-power-limit …> && \` so the server never starts with its limits unapplied.
 - `launch(server, env, model, runtime_quant, cuda_devices, param_overrides, power_step, command)` — `command` is the shell text edited in `ConfirmLaunch`; it is logged and executed verbatim. Callers that omit it get the default from `build_launch_command()`.
 
@@ -385,9 +414,10 @@ The fitter logs its projection for the requested settings within ~2 s (a per-dev
 ## Command Building Pipeline
 
 ```
-ServerSoftware.default_params
+ServerSoftware.default_params            (from server.params specs)
     + AIModel.server_params[server.id]   (merged at build time; skipped when model=None)
     + param_overrides                    (from GpuSelectScreen — e.g. pipeline_parallel = N, parallel slots)
+    → auto parameters still None resolved (AutoBoolParam.resolve)
     + AIModel.path → injected as _model_path  (skipped when model=None)
     + patched_template(model) → injected as _chat_template (path, or "" when no patch applies)
     → _build_<server_id>(server, env, model, merged_params) → list[str]
@@ -433,7 +463,7 @@ Some chat templates reject conversations the model handles fine. Qwen 3.5 / 3.6 
 - **Reading** (`read_chat_template(model)`): from `model.resolve_path()` — a GGUF's `tokenizer.chat_template` header key (via `gguf_header.py`), else `chat_template.jinja` → `chat_template.json` → `tokenizer_config.json` (transformers' precedence; for a list of named templates, the `"default"` one). Reads are LRU-cached per (file, mtime), so the per-build lookup is cheap even over the NAS.
 - **Application**: `patched_template(model)` applies every matching patch not in `model.disabled_template_patches` and returns a `PatchedChatTemplate` (`None` when nothing applies). `launch_params()` injects its path as `_chat_template` for servers with a `chat_template_flag`; each builder emits `_chat_template_args()` just before `extra_flags` (so a hand-written override in `extra_flags` still wins). Like staging, the file is written by `launch()` — `user_data/chat_templates/<model.id>.jinja`, rewritten only when the content changed — and the log header gets a `# tmpl:` line naming the applied patches.
 - **Why a sidecar file rather than patching the model?** Every text-gen server accepts a template override, so model files on every location stay pristine and the patch also works for models. Rewriting a GGUF's embedded template would change its header size, forcing a rewrite of the whole multi-GB file.
-- **Opt-out**: automatic by default; `t` on the model list runs `available_patches()` in a thread (the GGUF header may be on the NAS) and shows a `ChoiceScreen` toggling each matching patch, persisted via `save_template_patch_enabled()`.
+- **Opt-out**: automatic by default; the *Chat template patches* row of the model properties page runs `available_patches()` in a thread (the GGUF header may be on the NAS) and shows a `ChoiceScreen` toggling each matching patch, persisted via `save_template_patch_enabled()`.
 
 ---
 
@@ -578,7 +608,9 @@ Statuses are stored as a nested dict: `server_status[server_id][env_name][quant_
 
 `save_favorite(model, favorite)` follows the same pattern: mutates `model.favorite` in-memory, then sets or removes the `favorite` key in the JSON entry (`False` → key removed to keep the catalog tidy).
 
-`save_server_param(model, server, key, value)` persists one per-model launch parameter in `server_params[server.id]` (used for the remembered slot count). A value equal to `server.default_params[key]` removes the key, and emptied `server_params` dicts are dropped.
+`save_server_param(model, server, key, value)` persists one per-model launch parameter in `server_params[server.id]` (the remembered slot count; every edit on the properties page). A value equal to the spec's `default_value()` removes the key — that is how "reset" works — and emptied `server_params` dicts are dropped.
+
+`save_model_field(model, spec, value)` does the same for a `MODEL_FIELDS` entry, omitting the key at its default.
 
 ---
 
@@ -588,7 +620,7 @@ Statuses are stored as a nested dict: `server_status[server_id][env_name][quant_
 |---|---|---|
 | TP size must divide model dimensions | `num_attention_heads`, linear-attention heads and `intermediate_size` must be divisible by `--tensor-parallel-size`; `num_key_value_heads` divisible by it or a divisor of it | `compute_parallelism()` picks the smallest valid TP for the selected GPU count |
 | No pipeline parallelism for some architectures | Qwen4Exp's N-gram PLE embedding needs raw `input_ids` on every rank; vLLM rejects PP > 1 | `_NO_PP_ARCHS` → pure TP plan (PP=1) |
-| FP8 block alignment of MoE experts under TP | Block-FP8 (128×128) experts cannot be TP-sharded when `moe_intermediate_size / TP` is not a multiple of 128 (Qwen3.8-Flash-Next: 640 / 8 = 80) | Per-model `expert_parallel: true` → `--enable-expert-parallel` (whole experts per rank; vLLM replicates the misaligned shared expert) |
+| FP8 block alignment of MoE experts under TP | Block-FP8 (128×128) experts cannot be TP-sharded when `moe_intermediate_size / TP` is not a multiple of 128 (Qwen3.8-Flash-Next: 640 / 8 = 80) | `expert_parallel` auto → `--enable-expert-parallel` exactly when needed (whole experts per rank; vLLM replicates the misaligned shared expert). Expert parallelism only acts at TP > 1, so pipeline-only launches never need it |
 | Global world_size assertions | Some model implementations assert `intermediate_size % world_size == 0` using total GPU count, not TP size | `compute_parallelism()` checks this for architectures not in `_TP_SCOPED_ARCHS` and auto-reduces GPU count |
 | PCIe topology, no NVLink | Tensor parallel cross-GPU communication is expensive on PCIe | `compute_parallelism()` prefers smallest TP (largest PP) — only activations cross GPU boundaries |
 | Ray compiled DAG limit | Default `_max_inflight_executions=10`; pp=11 submits 11 steps at once | Only relevant when `executor_backend="ray"` is set explicitly (no longer the default). Patch `ray_executor.py`: set `max(pp+1, 16)` |
@@ -601,19 +633,23 @@ Statuses are stored as a nested dict: `server_status[server_id][env_name][quant_
 `--enforce-eager`, `--max-num-seqs 64`, `--gpu-memory-utilization 0.97`, and an
 unconditional `--trust-remote-code`. Several of these caused hard-to-diagnose load
 failures (ray init/compiled-DAG issues, CUDA-graph OOM from `enforce-eager` + `0.97`
-utilization, dtype mismatches). They are now optional and driven by `default_params`:
+utilization, dtype mismatches). They are now optional and driven by the server's params:
 
-| Param (`default_params`) | Default | Flag emitted |
+| Param | Default | Flag emitted |
 |---|---|---|
 | `executor_backend` | `""` | `--distributed-executor-backend <v>` only when non-empty (else vLLM auto-picks `mp` for single-node) |
 | `dtype` | `"auto"` | `--dtype <v>` only when not `"auto"` (else vLLM honours the model's `torch_dtype`) |
 | `gpu_mem_util` | `0.90` | `--gpu-memory-utilization` always (vLLM default, leaves headroom) |
 | `max_num_seqs` | `0` | `--max-num-seqs <v>` only when non-zero (else vLLM default 256) |
 | `chunked_prefill` | `False` | `--enable-chunked-prefill` only when True |
-| `expert_parallel` | `False` | `--enable-expert-parallel` only when True (set per-model for MoE checkpoints) |
+| `expert_parallel` | auto | `--enable-expert-parallel` when resolved on — auto: needed at this TP (see *Launch Parameters*); MoE models only |
+| `mtp` | `False` | `--speculative-config '{"method":"mtp","num_speculative_tokens":<mtp_tokens>}'` when on and the model is `mtp_embedded` — opt-in: the MTP weights and draft KV cost memory (Qwen3.8-Flash-Next FP8 at TP8: the auto-fitted context drops from 262K to ~190K) |
+| `mtp_tokens` | `2` | `num_speculative_tokens`. vLLM defaults to the checkpoint's MTP layer count (1) and reuses the layer beyond it; each extra position is accepted less often (Qwen3.8-Flash-Next with 2: ~0.7 / ~0.4 per position, mean acceptance ~2.0 tokens/step) — read "SpecDecoding metrics" in the log to tune |
 | `auto_fit_ctx` | `False` | `--max-model-len -1` instead of `model.effective_ctx` — vLLM starts at the native context and lowers it only as far as needed to fit the KV cache (logged as "Auto-fit max_model_len"); set per-model for memory-tight models |
 | `enforce_eager` | `False` | `--enforce-eager` only when True (default allows faster CUDA graphs) |
 | `log_requests` | `False` | `--no-enable-log-requests` when False; nothing when True |
+
+Prefix caching is not a parameter: vLLM ≥ 0.31 enables it by default wherever the model supports it (hybrid Mamba/GDN models in "align" mode), and the launcher has no reason to override that.
 
 Always-on flags: `--model`, `--served-model-name`, `--tensor-parallel-size`,
 `--pipeline-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`
@@ -630,7 +666,7 @@ Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
 
 `_build_llamacpp` = `llama-server` + `llamacpp_model_args()` (shared with `LlamaCppFitProbe`, so the estimate always describes the command that will run) + serving flags.
 
-| Param (`default_params`) | Default | Flag emitted |
+| Param | Default | Flag emitted |
 |---|---|---|
 | `n_gpu_layers` | `"auto"` | `--n-gpu-layers <v>` — `auto` lets llama.cpp's fitter place layers |
 | `split_mode` | `"layer"` | `--split-mode <v>` |
@@ -639,7 +675,7 @@ Per-model overrides go in `server_params["vllm"]` (e.g. `{"enforce_eager": true,
 | `cache_ram_mib` | `CONFIG.host_cache_ram_mib` | `--cache-ram <v>` when not `None`. Host-RAM store of saved slot states, restored instead of re-processing a prompt when more conversations are active than slots; filled on demand. llama.cpp's 8 GiB default holds less than one full 128K slot of a large model |
 | `ubatch` | `None` | `--ubatch-size <v>` when set (llama.cpp default 512). Compute buffers scale with ubatch × total context and outweigh the KV cache at YaRN 1M contexts (Qwen3.8-Flash-Next Q8_0, 3 × 1M: 187 GiB at 512 vs 131 GiB at 256); smaller values cost prompt-processing speed. In `llamacpp_model_args()`, so the fit estimate reflects it |
 | `threads` | `0` | `--threads <v>` only when non-zero; otherwise llama.cpp uses the physical core count (hyperthreads only add contention for CPU math, and fully offloaded models barely use the CPU) |
-| `mtp` | `None` | MTP speculative decoding, via `_mtp_args()` (shared with ooba). `None` (auto): `--spec-type draft-mtp --model-draft <mtp_path>` when the model has a sidecar `mtp_path`. `true`: additionally `--spec-type draft-mtp` alone for an `mtp_embedded` model (opt-in per model, once its architecture's MTP graph is known to work on the build). `false`: off. Not passed to `llama-fit-params` (it rejects speculative flags), so the fit estimate excludes the head |
+| `mtp` | auto | MTP speculative decoding, via `_mtp_args()` (shared with ooba; receives the resolved value). auto → on only for a sidecar head: `--spec-type draft-mtp --model-draft <mtp_path>`. on: additionally `--spec-type draft-mtp` alone for an `mtp_embedded` model (opt-in per model, once its architecture's MTP graph is known to work on the build). off: none. Not passed to `llama-fit-params` (it rejects speculative flags), so the fit estimate excludes the head |
 
 Always-on: `--model`, `--alias <model.id>`, `--host 0.0.0.0`, `--port`, `--log-prefix`, `--log-timestamps`; `--mmproj` when the model has a projector. `extra_flags` are appended last.
 
@@ -671,7 +707,7 @@ Possible extension: newer builds add `--kv-unified-per-slot N` (one shared KV po
 **Add a model**: create an `AIModel` entry in `models_local.json`. No code changes needed.
 
 **Add a server type**:
-1. `ServerSoftware(...)` entry in `data.py` → `SERVERS` (set `env_kind` / `version_packages` or `version_probe`).
+1. `ServerSoftware(...)` entry in `data.py` → `SERVERS` with its `params` (ParamSpecs) (set `env_kind` / `version_packages` or `version_probe`).
 2. `_build_<id>(server, env, model, params) → list[str]` in `launch.py`.
 3. Register in `_BUILDERS`.
 4. If the server needs a staging model directory, add a block in `launch()`.
@@ -680,7 +716,11 @@ Possible extension: newer builds add `--kv-unified-per-slot N` (one shared KV po
 
 **Add an environment**: `e` on the server or environment list → `a`. No code changes needed.
 
-**Add a chat template patch**: append a `ChatTemplatePatch` to `chat_template.TEMPLATE_PATCHES` (pattern, verbatim replacement, `requires` guards). Detection, launch flags, the `t` toggle and opt-out persistence pick it up automatically. A new server type sets `chat_template_flag` to take part.
+**Add a launch parameter**: add a `ParamSpec` to the server's `params` in `data.py` (default + help; `applies_to` for model-specific ones) and read `p["key"]` in its builder. It appears on the properties page with the right editor automatically. For an "auto" parameter use `AutoBoolParam(resolve=…)` — the resolver gets the model and the merged params (incl. the planned TP/PP) and returns `(value, reason)`.
+
+**Add a user-editable model field**: add the `AIModel` field (and `from_dict()` handling) plus a `ParamSpec` in `models.MODEL_FIELDS`; the properties page and `save_model_field()` handle the rest.
+
+**Add a chat template patch**: append a `ChatTemplatePatch` to `chat_template.TEMPLATE_PATCHES` (pattern, verbatim replacement, `requires` guards). Detection, launch flags, the properties-page toggle and opt-out persistence pick it up automatically. A new server type sets `chat_template_flag` to take part.
 
 **Add an environment kind** (e.g. a venv or container image): subclass `Environment` in `environments.py`, implement `location` / `bin_dir` / `exists()` and whichever lifecycle hooks apply, declare `extra_fields`, and register it in `_ENV_KINDS`.
 
@@ -747,6 +787,7 @@ Reads `config.json`:
 - **`arch`**: from `architectures[0]` in `config.json`.
 - **MoE fields**: `moe_experts` / `moe_active` from `num_local_experts` / `n_routed_experts` / `num_experts` and `num_experts_per_tok`.
 - **`vision`**: `True` when `vision_config` is present.
+- **`mtp_embedded`**: `True` when `mtp_num_hidden_layers` / `num_nextn_predict_layers` (top level or `text_config`) is > 0 **and** the weights include the MTP layers — names from `model.safetensors.index.json` (else the shard headers): an `mtp.*` module or a `layers.<num_hidden_layers>.*` NextN layer.
 - **`trust_remote_code`**: `True` when `auto_map` is present (custom architecture code).
 - **`min_sm`**: set to `89` for static FP8 quantisation (non-dequantise, non-block-wise); `0` for block-wise FP8 (dequantises to BF16 at runtime, works on sm_86).
 - **`size_gb`**: recursive `stat()` sum of weight files matching the format's glob patterns (format-aware — e.g. pytorch_bin counts only HF shard files, not unrelated `.bin` artefacts). Mistral repos that ship the same weights twice (HF `model-*.safetensors` alongside native `consolidated-*.safetensors`) count only the HF shards, so the size is not doubled. The two sets are recognised by their index files declaring the same total within 1% — the layouts pack tensors differently, so the totals agree to parts-per-million rather than exactly. Deduplication is skipped (with a warning) when any HF shard is missing from disk, so a partially-downloaded set is never used as the basis for the size.

@@ -16,7 +16,7 @@
     "vision":        "(auto) true if the model accepts image input. Populated by ingest/refresh.",
     "mmproj_path":   "(optional, gguf vision only) Absolute path to the companion mmproj-*.gguf vision encoder. Passed as --mmproj at launch time.",
     "mtp_path":      "(auto, gguf only) Absolute path to the companion mtp-*.gguf multi-token-prediction draft head. llama.cpp/ooba launch with --spec-type draft-mtp --model-draft <path> unless server param mtp is false.",
-    "mtp_embedded":  "(auto, gguf only) true when the GGUF carries its own MTP layers. Used (--spec-type draft-mtp) only when server param mtp is true for the model.",
+    "mtp_embedded":  "(auto) true when the model carries its own MTP layers: a GGUF's NextN layers, or an HF checkpoint declaring MTP layers in config.json that ships their weights. Used only when the server's mtp param is on for the model (llama.cpp/ooba: --spec-type draft-mtp; vLLM: --speculative-config).",
     "quant":         "(optional) Quantisation label for display, e.g. Q4_K_M — mainly for GGUF",
     "ctx_override":  "(optional) Override the context length at launch time; 0 = use native ctx (scaled by rope_scaling when set). Set with the 'l' key in the TUI.",
     "rope_scaling":  "(optional) RoPE context extension, e.g. {\"factor\": 4.0} for YaRN 256K → 1M; optional \"method\" (default yarn) and \"original_ctx\" (default ctx). Applied by llama.cpp, vLLM, SGLang and ooba (GGUF). Set with the 'l' key in the TUI.",
@@ -26,7 +26,7 @@
     "note":          "(optional) Free-text note shown in the TUI",
     "trust_remote_code": "(optional) true if servers must pass --trust-remote-code for this model.",
     "server_status": "(optional) Test results: {server_id: {environment_name: {quant_key: good|bad|unknown}}}. environment_name is a registered environment (environments.json). Updated by the TUI g/x/? keys.",
-    "server_params": "(optional) Per-server parameter overrides merged on top of server defaults at launch time.",
+    "server_params": "(optional) Per-server parameter overrides merged on top of server defaults at launch time — editable on the model settings page, which lists every parameter with its help. Auto parameters (e.g. vllm expert_parallel) are omitted (or null) to stay auto.",
     "comfyui_subdir": "(optional, image_gen only) ComfyUI models/ subdirectory to stage into. Default: 'checkpoints'. Use 'diffusion_models' for FLUX UNets.",
     "tool_call_parser": "(optional) vLLM tool-call parser name (e.g. 'openai', 'hermes', 'llama3_json'). When set, servers emit tool-calling flags automatically. Translated for SGLang.",
     "disabled_template_patches": "(optional) Chat template patch ids NOT to apply at launch (e.g. ['system_anywhere']). Every other patch matching the model's chat template is applied automatically via a patched copy. Toggled by the TUI t key."

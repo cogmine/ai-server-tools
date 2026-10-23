@@ -6,8 +6,9 @@ Your personal model inventory lives in models_local.py (gitignored).
 Copy models_local.py.example → models_local.py to get started.
 
 Adding a new server:
-  1. Create a ServerSoftware() entry in SERVERS below, including any launch-time
-     fields (env_kind, version_packages, strip_pythonpath, cuda_home, uses_staging_dir,
+  1. Create a ServerSoftware() entry in SERVERS below: its launch parameters as
+     typed ParamSpecs (params.py) plus any launch-time fields (env_kind,
+     version_packages, strip_pythonpath, cuda_home, uses_staging_dir,
      staging_format_suffixes, launch_cwd) that the server requires.
   2. Create a matching builder function in launch.py and register it in _BUILDERS.
   3. Register at least one environment for it in user_data/environments.json.
@@ -17,9 +18,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from typing import Any
+
+from launcher.hf_config import expert_parallel_needed
 from launcher.models import (
     AIModel, AIType, GGUFQuant, ModelFormat,
     QuantizationTool, RuntimeQuant, ServerSoftware, VersionProbe,
+)
+from launcher.params import (
+    AutoBoolParam, BoolParam, ChoiceParam, FlagsParam, FloatParam, IntParam, TextParam,
 )
 from launcher.config import CONFIG
 
@@ -27,9 +34,54 @@ from launcher.config import CONFIG
 # ---------------------------------------------------------------------------
 # Server software registry
 # ---------------------------------------------------------------------------
-# default_params defines the baseline for every launch on that server.
-# A model's server_params[server.id] is merged on top at launch time;
-# only values that differ from these defaults need to be specified there.
+# params declares every launch parameter (default, help, editor); their defaults are
+# the baseline for every launch on that server.  A model's server_params[server.id]
+# is merged on top at launch time; only values that differ from the defaults need
+# to be specified there.  "auto" parameters are resolved per launch (launch_params).
+
+
+def _port(server_key: str, fallback: int, key: str = "port", label: str = "Port") -> IntParam:
+    return IntParam(key=key, label=label, default=CONFIG.server_ports.get(server_key, fallback),
+                    minimum=1, maximum=65535)
+
+
+_EXTRA_FLAGS = FlagsParam(
+    key="extra_flags", label="Extra flags",
+    help="Additional command-line arguments appended to the server command",
+)
+
+
+def _vllm_expert_parallel(model: AIModel | None, p: dict[str, Any]) -> tuple[bool, str]:
+    return expert_parallel_needed(model, int(p["tensor_parallel"]))
+
+
+def _sidecar_mtp(model: AIModel | None, p: dict[str, Any]) -> tuple[bool, str]:
+    """llama.cpp-style MTP: auto uses a sidecar mtp-*.gguf head; embedded heads are opt-in."""
+    if model is not None and model.mtp_path:
+        return True, "sidecar MTP head"
+    if model is not None and model.mtp_embedded:
+        return False, "embedded head is opt-in (the build may not support it for this architecture)"
+    return False, "no MTP head"
+
+
+def _has_mtp_head(model: AIModel) -> bool:
+    return bool(model.mtp_path or model.mtp_embedded)
+
+
+def _gguf_mtp_head(model: AIModel) -> bool:
+    """ooba applies MTP only through its llama.cpp loader (GGUF)."""
+    return model.format == ModelFormat.GGUF and _has_mtp_head(model)
+
+
+def _is_moe(model: AIModel) -> bool:
+    return model.moe_experts > 0
+
+
+def _has_embedded_mtp(model: AIModel) -> bool:
+    return model.mtp_embedded
+
+
+_GPU_SCREEN = "set from the GPU selection"
 
 # Checkpoints described by an HF config.json, which vLLM / SGLang can override at launch.
 _HF_CONFIG_FORMATS: frozenset[ModelFormat] = frozenset({
@@ -49,43 +101,72 @@ SERVERS: list[ServerSoftware] = [
         label="vLLM",
         supported_formats=_HF_CONFIG_FORMATS,
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
-        default_params={
-            "tensor_parallel":   1,
-            "pipeline_parallel": CONFIG.pipeline_parallel,
-            # "" = let vLLM choose its own executor (mp for single-node, which is
-            # simpler and more robust than ray).  Set to "ray"/"mp" per-model to force.
-            "executor_backend":  "",
-            # "auto" respects the model's own torch_dtype from config.json.  Override
-            # per-model (e.g. "bfloat16") only when a checkpoint's native dtype is
-            # undesirable (e.g. a float32 checkpoint that would otherwise OOM).
-            "dtype":             "auto",
-            # 0.90 is vLLM's own default and leaves headroom; 0.97 left too little and
-            # was a frequent cause of load-time / CUDA-graph OOM.
-            "gpu_mem_util":      0.90,
-            # 0 = omit the flag (use vLLM's default of 256).  Set per-model to cap
-            # concurrency for very large / memory-tight models.
-            "max_num_seqs":      0,
-            # False = allow CUDA graphs (faster).  Set True per-model only if graph
-            # capture causes OOM.
-            "enforce_eager":     False,
-            # False = omit the flag (vLLM enables chunked prefill itself when helpful).
-            "chunked_prefill":   False,
-            # True = --enable-expert-parallel: MoE experts are distributed whole across
-            # the TP ranks instead of each expert being TP-sharded.  Set per-model for
-            # MoE checkpoints whose expert widths do not split evenly into their FP8
-            # quantization blocks at the chosen TP (e.g. Qwen3.8-Flash-Next at TP8).
-            "expert_parallel":   False,
-            # True = --max-model-len -1: vLLM starts from the model's native context and
-            # lowers it only as far as needed to fit the KV cache in memory (logged as
-            # "Auto-fit max_model_len").  The model's ctx / ctx_override is not passed.
-            # Set per-model for memory-tight models where the native context may not fit.
-            "auto_fit_ctx":      False,
-            # False = pass --no-enable-log-requests (quieter logs).  True enables
-            # per-request logging.
-            "log_requests":      False,
-            "port":              CONFIG.server_ports.get("vllm", 5000),
-            "extra_flags":       [],
-        },
+        params=(
+            IntParam(key="tensor_parallel", label="Tensor parallel", default=1, managed_by=_GPU_SCREEN),
+            IntParam(key="pipeline_parallel", label="Pipeline parallel",
+                     default=CONFIG.pipeline_parallel, managed_by=_GPU_SCREEN),
+            ChoiceParam(
+                key="executor_backend", label="Executor backend", default="",
+                choices=("", "mp", "ray"), labels=(("", "auto"),),
+                help="auto lets vLLM choose (mp for single-node — simpler and more robust than ray)",
+            ),
+            ChoiceParam(
+                key="dtype", label="dtype", default="auto",
+                choices=("auto", "bfloat16", "float16", "float32"),
+                help="auto honours the model's torch_dtype; override only when a checkpoint's "
+                     "native dtype is undesirable (e.g. a float32 checkpoint that would OOM)",
+            ),
+            FloatParam(
+                key="gpu_mem_util", label="GPU memory utilization", default=0.90,
+                minimum=0.1, maximum=1.0,
+                help="vLLM's default 0.90 leaves headroom; 0.97 was a frequent cause of "
+                     "load-time / CUDA-graph OOM",
+            ),
+            IntParam(
+                key="max_num_seqs", label="Max concurrent sequences", default=0, minimum=0,
+                help="0 = vLLM's default (256); lower for very large / memory-tight models",
+            ),
+            BoolParam(
+                key="enforce_eager", label="Enforce eager", default=False,
+                help="Disable CUDA graphs (slower); only if graph capture causes OOM",
+            ),
+            BoolParam(
+                key="chunked_prefill", label="Chunked prefill", default=False,
+                help="off = omit the flag (vLLM enables chunked prefill itself when helpful)",
+            ),
+            AutoBoolParam(
+                key="expert_parallel", label="Expert parallel", resolve=_vllm_expert_parallel,
+                applies_to=_is_moe,
+                help="--enable-expert-parallel: distribute whole experts across the TP ranks "
+                     "instead of sharding each.  auto turns it on when the experts cannot be "
+                     "TP-sharded (width or FP8 block alignment); it has no effect at TP=1",
+            ),
+            BoolParam(
+                key="auto_fit_ctx", label="Auto-fit context", default=False,
+                help="--max-model-len -1: start from the native context and lower it only as far "
+                     "as needed to fit the KV cache (logged as \"Auto-fit max_model_len\")",
+            ),
+            BoolParam(
+                key="mtp", label="MTP speculative decoding", default=False,
+                applies_to=_has_embedded_mtp,
+                help="Use the checkpoint's multi-token-prediction layers as a draft "
+                     "(--speculative-config method mtp).  Speeds up decoding but its weights "
+                     "and draft KV cost memory (the fitted context shrinks)",
+            ),
+            IntParam(
+                key="mtp_tokens", label="MTP draft tokens", default=2, minimum=1, maximum=8,
+                applies_to=_has_embedded_mtp,
+                help="Tokens drafted per step.  Beyond the checkpoint's MTP layer count (usually 1) "
+                     "vLLM reuses the layer, and each extra position is accepted less often — "
+                     "check \"SpecDecoding metrics\" in the log",
+            ),
+            BoolParam(
+                key="log_requests", label="Log requests", default=False,
+                help="off = --no-enable-log-requests (quieter logs)",
+            ),
+            _port("vllm", 5000),
+            _EXTRA_FLAGS,
+        ),
         quantizable_formats=frozenset({
             ModelFormat.SAFETENSORS_BF16,
             ModelFormat.SAFETENSORS_FP16,
@@ -119,33 +200,53 @@ SERVERS: list[ServerSoftware] = [
         label="llama.cpp",
         supported_formats=frozenset({ModelFormat.GGUF}),
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
-        default_params={
-            "n_gpu_layers": "auto",
-            "split_mode":   "layer",
-            # Concurrent request slots.  Each slot gets the model's full effective_ctx:
-            # with fixed slots llama.cpp splits --ctx-size evenly between them, so the
-            # builder emits --ctx-size effective_ctx × parallel.
-            "parallel":     1,
-            # 0 = omit --threads; llama.cpp then uses the physical core count, which
-            # is optimal for CPU math (hyperthreads only add contention).
-            "threads":      0,
-            # KV cache dtype for both K and V ("" = llama.cpp default f16).  q8_0 halves
-            # KV VRAM at negligible quality cost — often what lets multiple long-context
-            # slots fit at all.  Override per model with "f16" if quality suffers.
-            "kv_cache_type": "q8_0",
-            # Physical micro-batch size (--ubatch-size); None = llama.cpp default (512).
-            # Compute buffers scale with ubatch × total context, so at very long contexts
-            # (YaRN 1M × several slots) a smaller value (256/128) is what lets it fit,
-            # at some cost in prompt-processing speed.
-            "ubatch":       None,
-            # Host-RAM prompt cache ceiling in MiB (--cache-ram); None = llama.cpp default.
-            "cache_ram_mib": CONFIG.host_cache_ram_mib,
-            # MTP speculative decoding: None = auto (sidecar mtp-*.gguf heads only),
-            # True = also the model's embedded head (opt-in per model), False = off.
-            "mtp":          None,
-            "port":         CONFIG.server_ports.get("llamacpp", 5000),
-            "extra_flags":  [],
-        },
+        params=(
+            IntParam(
+                key="n_gpu_layers", label="GPU layers", default="auto", minimum=-1, keywords=("auto",),
+                help="Layers offloaded to GPU — auto, a count, or -1 for all",
+            ),
+            ChoiceParam(
+                key="split_mode", label="Split mode", default="layer", choices=("layer", "row", "none"),
+                help="How the model is split across the visible GPUs",
+            ),
+            IntParam(
+                key="parallel", label="Request slots", default=1, minimum=1,
+                help="Concurrent request slots, each with the model's full context (--ctx-size is "
+                     "emitted as context × slots).  Also adjustable per launch with +/- on the GPU screen",
+            ),
+            IntParam(
+                key="threads", label="CPU threads", default=0, minimum=0,
+                help="0 = omit --threads; llama.cpp then uses the physical core count, which is "
+                     "optimal for CPU math (hyperthreads only add contention)",
+            ),
+            ChoiceParam(
+                key="kv_cache_type", label="KV cache type", default="q8_0",
+                choices=("", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"),
+                labels=(("", "llama.cpp default (f16)"),),
+                help="K and V cache dtype.  q8_0 halves KV VRAM at negligible quality cost — often "
+                     "what lets several long-context slots fit at all",
+            ),
+            IntParam(
+                key="ubatch", label="Micro-batch size", default=None, minimum=1,
+                none_label="llama.cpp default (512)",
+                help="--ubatch-size.  Compute buffers scale with ubatch × total context; at very long "
+                     "contexts (YaRN 1M × several slots) 256/128 is what lets it fit, at some "
+                     "prompt-processing speed",
+            ),
+            IntParam(
+                key="cache_ram_mib", label="Host prompt cache (MiB)", default=CONFIG.host_cache_ram_mib,
+                minimum=0, none_label="llama.cpp default",
+                help="--cache-ram ceiling (default from [memory] host_cache_ram in config.toml)",
+            ),
+            AutoBoolParam(
+                key="mtp", label="MTP speculative decoding", resolve=_sidecar_mtp,
+                applies_to=_has_mtp_head,
+                help="auto uses a sidecar mtp-*.gguf head; on also uses the model's embedded head "
+                     "(opt-in: llama.cpp may not implement MTP for the architecture); off disables",
+            ),
+            _port("llamacpp", 5000),
+            _EXTRA_FLAGS,
+        ),
         # llama.cpp is a native build: each environment is a build's bin/ directory.
         env_kind="native",
         # "version: 0.6.0-dev (build 11461, commit 4d756bc72)" (current) or
@@ -175,13 +276,18 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.EXL2,
         }),
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
-        default_params={
-            "model_dir":    str(CONFIG.tabby_model_dir),
-            "cache_mode":   "Q8",
-            "disable_auth": True,
-            "port":         CONFIG.server_ports.get("tabby", 5000),
-            "extra_flags":  [],
-        },
+        params=(
+            TextParam(key="model_dir", label="Model staging directory",
+                      default=str(CONFIG.tabby_model_dir), hidden=True),
+            ChoiceParam(
+                key="cache_mode", label="KV cache mode", default="Q8", choices=("FP16", "Q8", "Q6", "Q4"),
+                help="Quantized KV cache (Q8 is fast on Ampere)",
+            ),
+            BoolParam(key="disable_auth", label="Disable auth", default=True,
+                      help="Serve the API without an API key"),
+            _port("tabby", 5000),
+            _EXTRA_FLAGS,
+        ),
         # tabbyAPI requires a models directory; launch.py creates a symlink named
         # model.id under model_dir pointing to the model path.
         uses_staging_dir=True,
@@ -206,23 +312,32 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.PYTORCH_BIN,
         }),
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
-        default_params={
-            "model_dir":    str(CONFIG.ooba_model_dir),
-            # loader: "" = ooba auto-detects from file type; override per model if needed.
-            # Valid: Transformers, llama.cpp, ExLlamav3_HF, ExLlamav3
-            "loader":       "",
-            # llama.cpp loader options
-            "gpu_layers":   -1,     # offload all layers
-            "tensor_split": "",     # "" = no flag; "1,1,...,1" for equal N-GPU split
-            "cache_type":   "",     # "" = default; "q8_0" llama.cpp; "q8" ExLlama
-            # MTP speculative decoding: None = auto (sidecar mtp-*.gguf heads only),
-            # True = also the model's embedded head (opt-in per model), False = off.
-            "mtp":          None,
-            "api_port":     CONFIG.server_ports.get("ooba", 5000),
-            "webui_port":   CONFIG.server_ports.get("ooba_webui", 7860),
-            "nowebui":      False,  # True = skip Gradio WebUI, API only
-            "extra_flags":  [],
-        },
+        params=(
+            TextParam(key="model_dir", label="Model staging directory",
+                      default=str(CONFIG.ooba_model_dir), hidden=True),
+            ChoiceParam(
+                key="loader", label="Loader", default="",
+                choices=("", "Transformers", "llama.cpp", "ExLlamav3_HF", "ExLlamav3"),
+                labels=(("", "auto"),),
+                help="auto = ooba picks the loader from the file type",
+            ),
+            IntParam(key="gpu_layers", label="GPU layers (llama.cpp)", default=-1, minimum=-1,
+                     help="-1 offloads all layers"),
+            TextParam(key="tensor_split", label="Tensor split (llama.cpp)", default="", empty_label="none",
+                      help="e.g. 1,1,1,1 for an equal 4-GPU split; blank = no flag"),
+            TextParam(key="cache_type", label="KV cache type", default="", empty_label="default",
+                      help="e.g. q8_0 (llama.cpp loader) or q8 (ExLlama)"),
+            AutoBoolParam(
+                key="mtp", label="MTP speculative decoding", resolve=_sidecar_mtp,
+                applies_to=_gguf_mtp_head,
+                help="llama.cpp loader: auto uses a sidecar mtp-*.gguf head; on also uses the "
+                     "model's embedded head; off disables",
+            ),
+            _port("ooba", 5000, key="api_port", label="API port"),
+            _port("ooba_webui", 7860, key="webui_port", label="WebUI port"),
+            BoolParam(key="nowebui", label="API only (no WebUI)", default=False),
+            _EXTRA_FLAGS,
+        ),
         quantizable_formats=frozenset({
             ModelFormat.SAFETENSORS_BF16,
             ModelFormat.SAFETENSORS_FP16,
@@ -250,15 +365,15 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.SAFETENSORS_FP8,
         }),
         supported_ai_types=frozenset({AIType.IMAGE_GEN}),
-        default_params={
-            # model_dir is the base under which per-model subdirs are created.
-            # Each model is staged into model_dir/<model.comfyui_subdir>/<source_filename>
-            # (staging_use_source_filename=True preserves the original filename so that
-            # ComfyUI workflows can reference models by their natural names).
-            "model_dir":   str(CONFIG.comfyui_models_dir),
-            "port":        CONFIG.server_ports.get("comfyui", 8188),
-            "extra_flags": [],
-        },
+        params=(
+            # Base under which per-model subdirs are created: each model is staged into
+            # model_dir/<model.comfyui_subdir>/<source_filename> (staging_use_source_filename
+            # keeps the original filename so workflows can reference models by their names).
+            TextParam(key="model_dir", label="Model staging directory",
+                      default=str(CONFIG.comfyui_models_dir), hidden=True),
+            _port("comfyui", 8188),
+            _EXTRA_FLAGS,
+        ),
         # ComfyUI doesn't accept a model path at launch; all catalog image_gen models
         # are staged as symlinks so ComfyUI discovers them at startup.
         uses_staging_dir=True,
@@ -281,13 +396,15 @@ SERVERS: list[ServerSoftware] = [
         label="SGLang",
         supported_formats=_HF_CONFIG_FORMATS | {ModelFormat.GGUF},
         supported_ai_types=frozenset({AIType.TEXT_GEN}),
-        default_params={
-            "tensor_parallel":   1,
-            "pipeline_parallel": CONFIG.pipeline_parallel,
-            "mem_fraction":      0.9,
-            "port":              CONFIG.server_ports.get("sglang", 5000),
-            "extra_flags":       [],
-        },
+        params=(
+            IntParam(key="tensor_parallel", label="Tensor parallel", default=1, managed_by=_GPU_SCREEN),
+            IntParam(key="pipeline_parallel", label="Pipeline parallel",
+                     default=CONFIG.pipeline_parallel, managed_by=_GPU_SCREEN),
+            FloatParam(key="mem_fraction", label="Static memory fraction", default=0.9,
+                       minimum=0.1, maximum=1.0, help="--mem-fraction-static"),
+            _port("sglang", 5000),
+            _EXTRA_FLAGS,
+        ),
         quantizable_formats=frozenset({
             ModelFormat.SAFETENSORS_BF16,
             ModelFormat.SAFETENSORS_FP16,

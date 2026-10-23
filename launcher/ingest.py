@@ -640,6 +640,50 @@ def _detect_vision(cfg: dict[str, Any]) -> bool:
     return bool(cfg.get("vision_config"))
 
 
+# config.json keys declaring multi-token-prediction layers (vLLM's names; the first
+# is Qwen3.5 / Qwen4Exp, the second DeepSeek-V3, GLM, Qwen3-Next, Nemotron-H, …).
+_MTP_LAYER_KEYS = ("mtp_num_hidden_layers", "num_nextn_predict_layers")
+
+
+def _detect_hf_mtp(model_dir: Path, cfg: dict[str, Any]) -> bool:
+    """Return True if the checkpoint declares MTP layers *and* ships their weights.
+
+    Quantized, abliterated or converted copies often keep the config keys but drop
+    the weights, so the weight names are checked too: either an ``mtp.*`` module or
+    a layer index past ``num_hidden_layers`` (DeepSeek-style NextN layers).
+    """
+    text_cfg: dict[str, Any] = cfg.get("text_config") or {}
+    def _get(key: str) -> Any:
+        return text_cfg.get(key, cfg.get(key))
+    if not any(int(_get(k) or 0) > 0 for k in _MTP_LAYER_KEYS):
+        return False
+    n_layers = int(_get("num_hidden_layers") or 0)
+    nextn_prefix = f"layers.{n_layers}."
+    return any(
+        name.startswith("mtp.") or ".mtp." in name or (n_layers and nextn_prefix in name)
+        for name in _hf_weight_names(model_dir)
+    )
+
+
+def _hf_weight_names(model_dir: Path) -> list[str]:
+    """Tensor names of an HF checkpoint: from its safetensors index, else the shard headers."""
+    index = model_dir / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            return list(json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}))
+        except (OSError, json.JSONDecodeError):
+            return []
+    names: list[str] = []
+    for shard in sorted(model_dir.glob("*.safetensors")):
+        try:
+            with open(shard, "rb") as f:
+                header_len = int.from_bytes(f.read(8), "little")
+                names += [k for k in json.loads(f.read(header_len)) if k != "__metadata__"]
+        except (OSError, ValueError):
+            continue
+    return names
+
+
 def _detect_trust_remote_code(cfg: dict[str, Any]) -> bool:
     """Return True if config.json signals that --trust-remote-code is required.
 
@@ -1096,6 +1140,7 @@ def detect_hf_dir(
     arch          = _detect_arch(cfg)
     moe_experts, moe_active = _detect_moe(cfg)
     vision        = _detect_vision(cfg)
+    mtp_embedded  = _detect_hf_mtp(model_dir, cfg)
     trust_rc      = _detect_trust_remote_code(cfg)
     fp8_min_sm    = _detect_fp8_min_sm(cfg)
     display_name  = _dir_to_display_name(model_dir.name)
@@ -1130,6 +1175,7 @@ def detect_hf_dir(
     if moe_experts: entry["moe_experts"] = moe_experts
     if moe_active:  entry["moe_active"]  = moe_active
     if vision:      entry["vision"]      = True
+    if mtp_embedded: entry["mtp_embedded"] = True
     if trust_rc:    entry["trust_remote_code"] = True
     if fp8_min_sm:  entry["min_sm"]      = fp8_min_sm
     return entry
