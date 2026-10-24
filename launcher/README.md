@@ -226,10 +226,10 @@ Override server defaults per model with a `server_params` key (or edit them on t
 
 ## Model settings
 
-Choosing a model opens its settings page before the server list (Enter continues straight on). The top shows what the model is — size, MoE, architecture, vision, MTP, and which storage locations hold copies. Below is every setting with its effective value and where it comes from:
+Choosing a model opens its settings page before the server list (Enter continues straight on). The top shows what the model is — size, MoE, architecture, vision, tool calling (the chat template declares tools), MTP, and which storage locations hold copies. Below is every setting with its effective value and where it comes from:
 
 - *default* — the server's default; *this model* — overridden for this model; *auto* — decided at launch (shown with the reason); *GPU screen* — set when you pick GPUs (tensor / pipeline parallel are previewed for all GPUs).
-- **Model**: context / YaRN (e.g. YaRN factor `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF, and/or a context-length override), [chat template patches](#chat-template-patches), tool-call parser, reasoning parser (vLLM / SGLang return the model's thinking separately as `reasoning_content`; e.g. `qwen3`), trust remote code, note.
+- **Model**: context / YaRN (e.g. YaRN factor `4` → 256K × 4 = 1M on llama.cpp, vLLM, SGLang and ooba GGUF, and/or a context-length override), [chat template patches](#chat-template-patches), tool-call parser (needed for tool calling on vLLM / SGLang; llama.cpp only needs a chat template that declares tools — the model list's 🔧 column shows 🔧 when a parser is set and a dim ✓ when only the template supports tools), reasoning parser (vLLM / SGLang return the model's thinking separately as `reasoning_content`; e.g. `qwen3`), trust remote code, note.
 - **One section per compatible server** with its launch parameters, each with a description in the help line. Model-specific ones appear only where they apply — expert parallel for MoE models, MTP for models with an MTP head.
 
 `e` edits the focused setting (a picker or a validated text prompt), `Space` toggles on/off and cycles auto/on/off settings, `r` resets an override to the default. Changes are saved immediately to this catalog entry. Copies of a model at other locations are separate entries and keep their own settings (the page tells you which copies exist).

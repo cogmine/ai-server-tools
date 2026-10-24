@@ -163,7 +163,7 @@ _SORT_KEY: dict[str, Callable[["AIModel"], Any]] = {
     "moe":    lambda m: m.moe_experts,
     "vision": lambda m: 0 if m.vision            else 1,
     "trc":    lambda m: 0 if m.trust_remote_code else 1,
-    "tool":   lambda m: 0 if m.tool_call_parser    else 1,
+    "tool":   lambda m: 0 if m.tool_call_parser else 1 if m.template_tools else 2,
     "location": lambda m: _location_rank(m),
     "note":   lambda m: m.note.lower(),
 }
@@ -2279,8 +2279,10 @@ class ModelSelectScreen(DataTableScreen):
         return "[yellow]✓[/]" if model.trust_remote_code else ""
 
     def _tool_cell(self, model: AIModel) -> str:
-        """Wrench emoji when model has a tool-call parser configured, blank otherwise."""
-        return "🔧" if model.tool_call_parser else ""
+        """🔧 = tool-call parser configured (vLLM/SGLang); dim ✓ = template declares tools (llama.cpp)."""
+        if model.tool_call_parser:
+            return "🔧"
+        return "[dim]✓[/]" if model.template_tools else ""
 
     def _params_cell(self, model: AIModel) -> str:
         """Parameter count formatted as XB (≥1000M) or XM (<1000M); blank if unknown."""
@@ -2832,7 +2834,7 @@ class ModelPropertiesScreen(DataTableScreen):
             facts.append(f"{m.params_m / 1000:g}B params")
         if m.moe_experts:
             facts.append(f"MoE {m.moe_active}/{m.moe_experts}")
-        facts += [m.arch, "vision" if m.vision else ""]
+        facts += [m.arch, "vision" if m.vision else "", "tools" if m.template_tools else ""]
         mtp = "sidecar head" if m.mtp_path else ("embedded" if m.mtp_embedded else "")
         if mtp:
             facts.append(f"MTP: {mtp}")

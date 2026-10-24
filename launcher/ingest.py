@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from launcher.gguf_header import arch_int, embedded_mtp_layers, read_gguf_metadata
+from launcher.chat_template import declares_tools, read_template_at
 from launcher.models import AIModel, GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info
 from launcher.storage import (
     LOCATIONS, METADATA_FILES, fill_missing, location_of, missing_copy_files, model_metadata_dir,
@@ -83,8 +84,8 @@ def _known_path_formats(catalog: dict[str, Any]) -> set[tuple[str, str]]:
 
 
 def _save_catalog(path: Path, catalog: dict[str, Any]) -> None:
-    with open(path, "w") as f:
-        json.dump(catalog, f, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(catalog, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
 
@@ -1107,6 +1108,8 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     mmproj_path = (_find_mmproj(parent) or _find_mmproj(parent.parent)) if vision else None
     mtp_path = _find_mtp(parent, quant) or _find_mtp(parent.parent, quant)
     mtp_embedded = embedded_mtp_layers(header) > 0
+    template = header.get("tokenizer.chat_template")
+    template_tools = declares_tools(template if isinstance(template, str) else None)
 
     entry: dict[str, Any] = {
         "id": entry_id,
@@ -1127,6 +1130,7 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     if mmproj_path:   entry["mmproj_path"]  = str(mmproj_path)
     if mtp_path:      entry["mtp_path"]     = str(mtp_path)
     if mtp_embedded:  entry["mtp_embedded"] = True
+    if template_tools: entry["template_tools"] = True
     if trust_rc:      entry["trust_remote_code"] = True
     return entry
 
@@ -1150,6 +1154,7 @@ def detect_hf_dir(
     moe_experts, moe_active = _detect_moe(cfg)
     vision        = _detect_vision(cfg)
     mtp_embedded  = _detect_hf_mtp(model_dir, cfg)
+    template_tools = declares_tools(read_template_at(model_dir))
     trust_rc      = _detect_trust_remote_code(cfg)
     fp8_min_sm    = _detect_fp8_min_sm(cfg)
     display_name  = _dir_to_display_name(model_dir.name)
@@ -1185,6 +1190,7 @@ def detect_hf_dir(
     if moe_active:  entry["moe_active"]  = moe_active
     if vision:      entry["vision"]      = True
     if mtp_embedded: entry["mtp_embedded"] = True
+    if template_tools: entry["template_tools"] = True
     if trust_rc:    entry["trust_remote_code"] = True
     if fp8_min_sm:  entry["min_sm"]      = fp8_min_sm
     return entry
@@ -1328,7 +1334,8 @@ def build_entry(
 # favorite, server_status, server_params, min_sm, hw_note, comfyui_subdir,
 # quant, trust_remote_code) are never touched by refresh.
 _REFRESHABLE_FIELDS: frozenset[str] = frozenset({
-    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "mtp_embedded", "mtp_path", "params_m", "size_gb", "vision",
+    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "mtp_embedded", "mtp_path", "params_m", "size_gb",
+    "template_tools", "vision",
 })
 
 
@@ -1377,11 +1384,14 @@ def _refresh_one(
         if field in ("mmproj_path", "mtp_path"): return str(raw) if raw else ""
         if field == "ctx":                   return int(raw) if raw else 32_768
         if field in ("moe_experts", "moe_active"): return int(raw) if raw else 0
-        if field in ("vision", "mtp_embedded"): return bool(raw)
+        if field in ("vision", "mtp_embedded", "template_tools"): return bool(raw)
         return raw
 
     # Fields omitted from JSON when default — delete key rather than write falsy value
-    _omit_when_default = frozenset({"params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path", "mtp_path", "mtp_embedded"})
+    _omit_when_default = frozenset({
+        "params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path", "mtp_path", "mtp_embedded",
+        "template_tools",
+    })
 
     changes: list[str] = []
     updated = dict(entry)

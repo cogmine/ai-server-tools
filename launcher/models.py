@@ -281,7 +281,7 @@ class RopeScaling:
 # stay usable by any re-quantization of that GGUF.
 _DERIVED_FIELDS: tuple[str, ...] = (
     "family", "ctx", "params_m", "arch", "moe_experts", "moe_active", "vision",
-    "mmproj_path", "mtp_path", "tool_call_parser", "reasoning_parser",
+    "mmproj_path", "mtp_path", "tool_call_parser", "reasoning_parser", "template_tools",
 )
 
 
@@ -336,6 +336,8 @@ class AIModel:
     # When set, builders emit --enable-auto-tool-choice / --tool-call-parser flags.
     # Uses vLLM parser names as canonical; SGLang names are translated automatically.
     tool_call_parser: str = ""
+    # The chat template declares tools — enough for llama.cpp tool calling (detected by ingest).
+    template_tools: bool = False
     # vLLM/SGLang reasoning parser name (e.g. "qwen3", "deepseek_r1"): separates the
     # model's thinking into reasoning_content.  vLLM names are canonical; SGLang names
     # are translated automatically.
@@ -390,6 +392,7 @@ class AIModel:
             min_sm=int(d.get("min_sm", 0)),
             hw_note=d.get("hw_note", ""),
             tool_call_parser=d.get("tool_call_parser", ""),
+            template_tools=bool(d.get("template_tools", False)),
             reasoning_parser=d.get("reasoning_parser", ""),
             disabled_template_patches=frozenset(d.get("disabled_template_patches", [])),
             comfyui_subdir=d.get("comfyui_subdir", "checkpoints"),

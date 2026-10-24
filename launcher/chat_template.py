@@ -98,9 +98,8 @@ def _read_template(path: str, mtime_ns: int) -> str | None:
     return _json_template(p)
 
 
-def read_chat_template(model: AIModel) -> str | None:
-    """The chat template the server would use for *model*, or None if absent/unreadable."""
-    root = Path(model.path)
+def read_template_at(root: Path) -> str | None:
+    """The chat template of the model file/directory at *root*, or None if absent/unreadable."""
     if root.is_file():
         candidates = [root] if root.suffix == ".gguf" else []
     else:
@@ -113,6 +112,19 @@ def read_chat_template(model: AIModel) -> str | None:
         if template:
             return template
     return None
+
+
+def read_chat_template(model: AIModel) -> str | None:
+    """The chat template the server would use for *model*, or None if absent/unreadable."""
+    return read_template_at(Path(model.path))
+
+
+_TOOLS_REFERENCE = re.compile(r"\{[{%][^}]*\btools\b")
+
+
+def declares_tools(template: str | None) -> bool:
+    """True when the template renders a `tools` list, i.e. supports tool calling."""
+    return bool(template and _TOOLS_REFERENCE.search(template))
 
 
 def available_patches(model: AIModel) -> list[ChatTemplatePatch]:

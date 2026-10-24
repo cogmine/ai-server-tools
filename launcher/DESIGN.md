@@ -113,6 +113,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `mtp_path` | Absolute path to the companion `mtp-*.gguf` multi-token-prediction draft head. Set automatically by `ingest`/`refresh`. llama.cpp and ooba launch with `--spec-type draft-mtp --model-draft <mtp_path>` unless the `mtp` server param is `false`. Cached alongside the model. Omitted from JSON when empty. |
 | `mtp_embedded` | `True` when the model carries its own MTP (NextN) layers. GGUF: `<arch>.nextn_predict_layers > 0` in its header (`gguf_header.py`). HF checkpoint: `config.json` declares `mtp_num_hidden_layers` / `num_nextn_predict_layers` > 0 **and** the weights include them (`mtp.*` tensors, or a layer index past `num_hidden_layers`) — quantized/abliterated copies often keep the keys but drop the weights. Set by `ingest`/`refresh`. llama.cpp / ooba use it (`--spec-type draft-mtp`, no draft file) only when their `mtp` param is `on` (many GGUFs keep NextN layers a llama.cpp build cannot run, e.g. GLM5-Next); vLLM uses it for `--speculative-config` when its `mtp` param is on (opt-in). Omitted from JSON when false. |
 | `tool_call_parser` | vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, `_build_vllm` emits `--enable-auto-tool-choice --tool-call-parser <name>` and `_build_sglang` emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP`). Omitted from JSON when empty. Editable on the model properties page (a `MODEL_FIELDS` entry, as are `trust_remote_code` and `note`). |
+| `template_tools` | `True` when the chat template renders a `tools` list (`chat_template.declares_tools()`; GGUF: the header's `tokenizer.chat_template`, HF: `chat_template.jinja` → `.json` → `tokenizer_config.json`). That is all llama.cpp needs for tool calling — it picks the tool-call format from the template — whereas vLLM/SGLang also need `tool_call_parser`. Set by `ingest`/`refresh`; stored so the model list needn't read templates. Omitted from JSON when false. |
 | `reasoning_parser` | vLLM reasoning parser name (e.g. `"qwen3"`, `"deepseek_r1"`, `"glm45"`). When set, `_build_vllm` emits `--reasoning-parser <name>` and `_build_sglang` `--reasoning-parser <translated_name>` (via `_SGLANG_REASONING_PARSER_MAP`), so the model's thinking is returned separately as `reasoning_content`. Inherited by quantizations/conversions (`_DERIVED_FIELDS`). Omitted from JSON when empty; a `MODEL_FIELDS` entry. |
 | `disabled_template_patches` | frozenset of `ChatTemplatePatch.id`s the model opts out of; every other patch matching its chat template is applied at launch (see *Chat Template Patches*). Toggled on the model properties page via `save_template_patch_enabled()`. Omitted from JSON when empty. |
 | `family` | Shared by an original model and every copy, conversion and quantization of it (ingest assigns the slug of the model's name; `register_copy()` and `finalize_quantization()` carry it over). Groups related entries without a per-model link chain, so deleting an intermediate (e.g. an F16 GGUF used to make a Q8_0) loses nothing. |
@@ -365,7 +366,7 @@ Groups of rows equal in the primary column cascade to the secondary, then tertia
 
 Sort-direction conventions in `_SORT_KEY`:
 - **Scalars** (`size`, `params`, `ctx`, `moe`): raw value — ascending = smallest first.
-- **Boolean flags** (`fav`, `vision`, `trc`): expressed as `0 if flag else 1` so ascending (default) puts flagged/interesting rows at the top.
+- **Boolean flags** (`fav`, `vision`, `trc`): expressed as `0 if flag else 1` so ascending (default) puts flagged/interesting rows at the top. The tool column ranks parser configured (🔧) → template declares tools (dim ✓) → neither.
 - **Location**: index of the model's location in `[[locations]]` order; paths outside every location sort last.
 - **Text** (`name`, `format`, `note`): lower-cased string, A–Z ascending.
 
@@ -809,7 +810,7 @@ With `--ai-type image_gen`, each `.safetensors` file in the scan directory becom
 
 ### refresh subcommand
 
-`refresh` re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, `moe_experts`, `moe_active`, `vision`, `mmproj_path`, `mtp_path`, `mtp_embedded`) for existing catalog entries. User-curated fields (`id`, `name`, `format`, `path`, `family`, `ctx_override`, `favorite`, `server_status`, `server_params`, `min_sm`, `hw_note`, `comfyui_subdir`, `quant`, `trust_remote_code`, `tool_call_parser`, `reasoning_parser`, `note`) are never touched.
+`refresh` re-detects auto-derived fields (`ctx`, `size_gb`, `params_m`, `arch`, `moe_experts`, `moe_active`, `vision`, `mmproj_path`, `mtp_path`, `mtp_embedded`, `template_tools`) for existing catalog entries. User-curated fields (`id`, `name`, `format`, `path`, `family`, `ctx_override`, `favorite`, `server_status`, `server_params`, `min_sm`, `hw_note`, `comfyui_subdir`, `quant`, `trust_remote_code`, `tool_call_parser`, `reasoning_parser`, `note`) are never touched.
 
 - `--path <path>` limits refresh to a single entry; otherwise all entries are refreshed.
 - Updated entries are written back by catalog position, never by `id` — copies of a model share its id.
