@@ -27,6 +27,7 @@ Adding a new server type:
 from __future__ import annotations
 
 import fcntl
+import getpass
 import json
 import math
 import os
@@ -35,6 +36,7 @@ import shlex
 import shutil
 import struct
 import subprocess
+import tempfile
 import termios
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -47,7 +49,7 @@ from launcher.hf_config import read_parallelism_fields
 from launcher.environments import ENVIRONMENTS, Environment
 from launcher.gpu_power import PowerLimitStep
 from launcher.models import (
-    AIModel, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
+    AIModel, GGUF_FULL_PRECISION, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
     QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key,
     gguf_shard_paths, gguf_split_info,
 )
@@ -682,16 +684,20 @@ def install_quant_tool(tool: QuantizationTool, env: Environment) -> tuple[bool, 
 # Quantization command builders
 # ---------------------------------------------------------------------------
 
-def _strip_gguf_quant(stem: str) -> str:
-    """Strip a known GGUF quant suffix from a filename stem.
+def _strip_gguf_quant(stem: str, quant: str = "") -> str:
+    """Strip the quant suffix from a GGUF filename stem.
+
+    *quant* (the catalog entry's quant, e.g. a converter option such as
+    "FP8-Q8_0") is tried first, then every known GGUF quant type.
 
     "BeMag-123B-v0.1.Q8_0"  →  "BeMag-123B-v0.1"
     "MyModel.IQ3_XXS"        →  "MyModel"
+    "MyModel.FP8-Q8_0"       →  "MyModel"        (quant="FP8-Q8_0")
     "NoQuant"                →  "NoQuant"   (returned unchanged)
     """
     upper = stem.upper()
-    for q in GGUF_QUANTS_LONGEST_FIRST:
-        suffix = f".{q.value}"
+    for q in ([quant] if quant else []) + [q.value for q in GGUF_QUANTS_LONGEST_FIRST]:
+        suffix = f".{q.upper()}"
         if upper.endswith(suffix):
             return stem[: len(stem) - len(suffix)]
     return stem
@@ -712,7 +718,7 @@ def compute_quant_output_path(
     the quant option.  e.g. ~/fast_models/text-generation/BeMag-123B-v0.1-exl2-4.0bpw/
     """
     src = Path(model.path)
-    stem = _strip_gguf_quant(src.stem) if model.format == ModelFormat.GGUF else src.name
+    stem = _strip_gguf_quant(src.stem, model.quant) if model.format == ModelFormat.GGUF else src.name
     name = tool.output_dir_template.format(stem=stem, option=quant_option)
     return dest.root / model.type_subdir / name
 
@@ -726,10 +732,14 @@ def _build_llama_quantize(
 ) -> list[str]:
     # output_dir is the per-job directory; the actual file goes inside it.
     src = Path(model.path)
-    stem = _strip_gguf_quant(src.stem)
+    stem = _strip_gguf_quant(src.stem, model.quant)
     output_file = output_dir / f"{stem}.{quant_option}.gguf"
+    # An already-quantized source (e.g. a Q8_0 / MXFP4 conversion of an FP8 release)
+    # is rounded a second time; llama-quantize refuses that unless asked.
+    requantize = [] if model.quant.upper() in GGUF_FULL_PRECISION else ["--allow-requantize"]
     return [
         str(env.executable("llama-quantize")),
+        *requantize,
         model.path,
         str(output_file),
         quant_option,
@@ -771,13 +781,23 @@ def _build_llama_hf_to_gguf(
     if not source.is_dir():
         raise ValueError(f"HF-to-GGUF conversion requires a model directory: {source}")
     output_file = output_dir / f"{source.name}.{quant_option}.gguf"
-    return [
+    cmd = [
         tool.python_executable or str(env.python),
         str(script),
         "--outfile", str(output_file),
-        "--outtype", quant_option.lower(),
-        str(source),
+        *tool.option(quant_option).args,
     ]
+    if model.size_gb * 1024 > CONFIG.convert_ram_mib:
+        # The converter keeps materialized tensors (e.g. DeepSeek-V4's repacked
+        # experts) in RAM until the end unless spooled; the (anonymous) spool file is
+        # as large as the output, so it goes on the destination volume.  torch's
+        # compile cache would follow TMPDIR into the model directory: keep it put.
+        inductor_cache = Path(tempfile.gettempdir()) / f"torchinductor_{getpass.getuser()}"
+        cmd = [
+            "env", f"TMPDIR={output_dir}", f"TORCHINDUCTOR_CACHE_DIR={inductor_cache}",
+            *cmd, "--use-temp-file",
+        ]
+    return [*cmd, str(source)]
 
 
 _LLMC_SCRIPT = Path(__file__).parent / "scripts" / "llmc-quantize"
@@ -798,12 +818,23 @@ def _build_llmc_quantize(
     ]
 
 
+def _build_llmc_dequantize(
+    tool: QuantizationTool,
+    env: Environment,
+    model: AIModel,
+    quant_option: str,
+    output_dir: Path,
+) -> list[str]:
+    return [str(env.python), str(_LLMC_SCRIPT), "--dequantize-only", model.path, str(output_dir)]
+
+
 _QUANT_BUILDERS: dict[str, Any] = {
     "llama-quantize": _build_llama_quantize,
     "llama-hf-to-gguf": _build_llama_hf_to_gguf,
     "exl2-convert":   _build_exl2_convert,
     "llmc-fp8":       _build_llmc_quantize,
     "llmc-int":       _build_llmc_quantize,
+    "llmc-dequant":   _build_llmc_dequantize,
 }
 
 

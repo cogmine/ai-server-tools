@@ -85,6 +85,7 @@ All system-specific paths live in **`user_data/config.toml`** (gitignored). The 
 | `[paths]` | `cuda_visible_devices` | Explicit GPU list; `""` = auto-derive from `pipeline_parallel` |
 | `[gpu]` | `pipeline_parallel` | GPU count for vLLM pipeline parallelism; `0` = auto-detect via NVML at startup |
 | `[memory]` | `host_cache_ram` | Ceiling for the host-RAM prompt cache (llama.cpp `--cache-ram`): a share of physical RAM (`"60%"`) or integer MiB; omit for the server default (8 GiB) |
+| `[memory]` | `convert_ram` | Host RAM a GGUF conversion may hold (default `"50%"`). Larger models convert with `--use-temp-file`, spooling converted tensors to a temporary file in the output directory (needs about the output's size again in free space there, removed when done). Required for DeepSeek-V4-Pro, whose repacked experts would otherwise all sit in RAM |
 | `[[locations]]` | `label` / `root` / `description` | Storage locations models live on (NAS and local drives alike), in display order. `label` is the short name shown in the model list's Location column; `description` (optional) is shown in destination pickers. Copy, convert and quantize can write to any location. |
 
 `~` and environment variables are expanded in all path values.
@@ -392,7 +393,7 @@ Test results are stored per model, server **and environment** in `models_local.j
 
 ## Converting and quantizing models
 
-Press `z` on any model in the model list to start a conversion or quantization job. Only GGUF, BF16/FP16 safetensors, and PyTorch `.bin` models have an applicable tool.
+Press `z` on any model in the model list to start a conversion or quantization job. GGUF, BF16/FP16 safetensors, PyTorch `.bin`, FP8 and other quantized HF checkpoints (compressed-tensors, GPTQ) all have at least one applicable tool; AWQ, EXL2 and bitsandbytes checkpoints have none.
 
 **Flow:**
 1. If more than one tool supports the model's format, pick a tool. Otherwise this step is skipped.
@@ -408,17 +409,26 @@ The TUI temporarily exits while the conversion runs in your terminal with live o
 
 | Tool | Converts | Prerequisite | Auto-install? |
 |---|---|---|---|
-| `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level) | llama.cpp built binary — co-located with `llama-server` in the chosen llama.cpp environment. No extra install if llama.cpp is set up. | No (requires building llama.cpp with CUDA) |
-| `llama-hf-to-gguf` | BF16 / FP16 safetensors or PyTorch `.bin` → F16 / BF16 GGUF | `convert_hf_to_gguf.py` in the registered llama.cpp source tree and `llama_convert_python` with PyTorch, Transformers, and NumPy. Conversion runs on CPU; it does not need GPUs. Only architectures supported by that llama.cpp converter work; vision models are excluded because their separate projector is not converted by this workflow. | No |
+| `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level; an already-quantized source such as a Q8_0 or FP8-Q8_0 GGUF is re-rounded with `--allow-requantize`) | llama.cpp built binary — co-located with `llama-server` in the chosen llama.cpp environment. No extra install if llama.cpp is set up. | No (requires building llama.cpp with CUDA) |
+| `llama-hf-to-gguf` | BF16 / FP16 safetensors, PyTorch `.bin`, FP8, compressed-tensors or GPTQ checkpoints → BF16 / F16 / Q8_0 / F32 GGUF, and for FP8 sources `FP8-Q8_0` (FP8 tensors as Q8_0, rest BF16 — about the source size) | `convert_hf_to_gguf.py` in the registered llama.cpp source tree and `llama_convert_python` with PyTorch, Transformers, and NumPy. Conversion runs on CPU; it does not need GPUs. Only architectures supported by that llama.cpp converter work; vision models are excluded because their separate projector is not converted by this workflow. | No |
 | `exl2-convert` | BF16 / FP16 / BIN safetensors → EXL2 | `exllamav2` Python package in the chosen tabbyAPI environment. Already present if tabbyAPI is set up. If missing, the launcher offers to `pip install exllamav2` automatically (uses JIT CUDA compilation — no CUDA toolkit needed at install time). | **Yes** — press Enter in the install prompt |
-| `llmc-fp8` | BF16 / FP16 safetensors → FP8: `FP8_BLOCK` (128×128 blocks, the DeepSeek/Qwen layout), `FP8_DYNAMIC` (per-channel), `MXFP8` / `MXFP8A16` (microscaling) | `llmcompressor` in the `llm-compressor` environment (see [Server environments](#server-environments)). | **Yes** |
-| `llmc-int` | BF16 / FP16 safetensors → compressed-tensors integer weights of 2–8 bits, weight-only (`W8A16` … `W2A16`, `W4A16_ASYM`) or with INT8 / INT4 / FP8 activations (`W8A8` … `W2A8`, `W4A4` … `W2A4`, `W4AFP8`), and FP4 (`NVFP4A16`, `MXFP4A16`, `MXFP4`) | Same as `llmc-fp8`. | **Yes** |
+| `llmc-fp8` | BF16 / FP16 or block-FP8 safetensors → FP8: `FP8_BLOCK` (128×128 blocks, the DeepSeek/Qwen layout), `FP8_DYNAMIC` (per-channel), `MXFP8` / `MXFP8A16` (microscaling) | `llmcompressor` in the `llm-compressor` environment (see [Server environments](#server-environments)). | **Yes** |
+| `llmc-int` | BF16 / FP16 or block-FP8 safetensors → compressed-tensors integer weights of 2–8 bits, weight-only (`W8A16` … `W2A16`, `W4A16_ASYM`) or with INT8 / INT4 / FP8 activations (`W8A8` … `W2A8`, `W4A4` … `W2A4`, `W4AFP8`), and FP4 (`NVFP4A16`, `MXFP4A16`, `MXFP4`) | Same as `llmc-fp8`. | **Yes** |
+| `llmc-dequant` | Block-FP8 safetensors → BF16 safetensors (exact dequantization, twice the size) | Same as `llmc-fp8`. | **Yes** |
 
 The llm-compressor tools use no calibration data. They quantize the checkpoint file by file on the selected GPUs, one file per GPU at a time, without loading the whole model, so they work for any architecture and size (select fewer GPUs if host RAM runs short). Every format a server can load is offered, regardless of this machine's GPUs. Each option's label names the servers that load the result, and its GPU column shows what serving it needs: W4AFP8 needs Hopper (sm_90), the MX formats need Blackwell (sm_100). Those show ⛔ on older cards, but you can still convert them, e.g. for another machine. The converted model records the requirement, so the model list flags it (⛔) on GPUs that can't serve it.
 
 vLLM loads all of them; SGLang loads `FP8_DYNAMIC`, `W8A16`, `W8A8`, `W4A16`, `W4A8` and `W4A4`. On GPUs without FP8 compute (RTX 30xx), FP8 and FP4 run with 16-bit math. One upstream bug to watch: on those GPUs an `FP8_DYNAMIC` conversion of an **FP16** model generates garbage on vLLM unless its *dtype* setting is `bfloat16`; `FP8_BLOCK` doesn't have this problem. Integer schemes are plain round-to-nearest: 4-bit and up is usable (GPTQ / AWQ give better 4-bit quality), 3-bit is heavily degraded and 2-bit is unusable without calibration.
 
 Embeddings, the output head, MoE routers and vision/audio encoders stay in full precision, as does any layer whose shape the scheme cannot handle; the log lists those. Only the indexed safetensors shards and top-level config/tokenizer files are carried over, so extra `.bin` weights or `original/` folders don't bloat the output.
+
+### FP8-only releases (DeepSeek, Qwen FP8, …)
+
+Many large models are published only in FP8. They can be converted directly:
+
+- **To GGUF (llama.cpp):** `llama-hf-to-gguf` reads FP8 checkpoints itself. `FP8-Q8_0` keeps the model at about its original size (FP8 tensors become Q8_0, nearly lossless). From that GGUF, `llama-quantize` makes smaller quants (Q4_K_M, Q2_K, …).
+- **DeepSeek-V4 (Flash and Pro):** this is the only route. Their checkpoints already store the routed experts in 4-bit MXFP4 (the catalog's "FP8" is the rest of the model), and the converter repacks those experts losslessly into GGUF MXFP4. A V4 GGUF therefore stays near the release's size (V4-Pro ≈ 865 GB), and `llama-quantize` takes it lower. Large conversions spool to disk (see `convert_ram`), so the destination needs room for about twice the output while converting.
+- **To vLLM/SGLang formats or BF16 (llm-compressor):** standard block-FP8 releases (DeepSeek V3/R1, Qwen, GLM, MiniMax) are dequantized on the fly, so every `llmc-int` / `llmc-fp8` scheme applies (e.g. FP8 → W4A16). `llmc-dequant` writes a plain BF16 copy for tools that need 16-bit input (EXL2). DeepSeek-V4's custom layout is not supported by llm-compressor.
 
 ### Adding a quantization tool
 

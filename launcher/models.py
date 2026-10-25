@@ -144,6 +144,10 @@ GGUF_QUANTS_LONGEST_FIRST: tuple[GGUFQuant, ...] = tuple(
     sorted(GGUFQuant, key=lambda q: -len(q.value))
 )
 
+# Unquantized GGUF types; any other quant means re-quantizing (llama-quantize
+# --allow-requantize: a second rounding on top of the first).
+GGUF_FULL_PRECISION: frozenset[str] = frozenset({GGUFQuant.F32.value, GGUFQuant.F16.value, GGUFQuant.BF16.value})
+
 
 # llama.cpp splits large models into '<base>-00001-of-000NN.gguf' shards.  The
 # first shard carries the metadata and pulls in the rest when loaded, so a split
@@ -885,10 +889,14 @@ class QuantOption:
     requires is the hardware needed to *serve* the output (the conversion itself
     runs anywhere the tool runs); it is shown in the picker and recorded on the
     generated catalog entry (min_sm / hw_note) so the model list flags it.
+    args are the tool arguments selecting this option, for builders that need
+    more than the id; applies_to limits it to some source models (None = all).
     """
     id: str                                  # value passed to the tool (GGUF type, bpw, scheme)
     label: str
     requires: HardwareRequirement = ANY_GPU
+    args: tuple[str, ...] = ()
+    applies_to: "Callable[[AIModel], bool] | None" = None
 
 
 @dataclass
@@ -940,17 +948,30 @@ class QuantizationTool:
     supports_vision: bool = True             # whether the tool preserves vision model functionality
     pip_package: str = ""                    # auto-install package; "" = not auto-installable
     install_note: str = ""                   # shown when unavailable and not auto-installable
+    # Narrower source check than input_formats (e.g. only block-FP8 checkpoints of
+    # the FP8 format); None = every model of an input format.
+    accepts: "Callable[[AIModel], bool] | None" = None
 
     def option(self, option_id: str) -> QuantOption:
         return next(o for o in self.quant_options if o.id == option_id)
 
+    def options_for(self, model: AIModel) -> tuple[QuantOption, ...]:
+        """The options that apply to converting *model*, in picker order."""
+        return tuple(o for o in self.quant_options if o.applies_to is None or o.applies_to(model))
+
+    def converts(self, model: AIModel) -> bool:
+        """True if this tool can take *model* as its source."""
+        return (
+            model.format in self.input_formats
+            and (not model.vision or self.supports_vision)
+            and (self.accepts is None or self.accepts(model))
+            and bool(self.options_for(model))
+        )
+
 
 def tools_for_model(tools: "list[QuantizationTool]", model: AIModel) -> "list[QuantizationTool]":
-    """All quantization tools that can accept the given model's format as input."""
-    return [
-        t for t in tools
-        if model.format in t.input_formats and (not model.vision or t.supports_vision)
-    ]
+    """All quantization tools that can take the given model as their source."""
+    return [t for t in tools if t.converts(model)]
 
 
 def available_ai_types(models: list[AIModel]) -> list[AIType]:

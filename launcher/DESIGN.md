@@ -69,6 +69,8 @@ user_data/environments.json (gitignored, written by the TUI)
 
 `[memory] host_cache_ram` (a share of physical RAM such as `"60%"`, or integer MiB) is resolved once at load into `CONFIG.host_cache_ram_mib` (`None` when unset) and becomes llama.cpp's `cache_ram_mib` default (`--cache-ram`). It is a host-level budget rather than a per-server one because it is sized against the machine's RAM; other servers' host-side KV caches (SGLang hierarchical cache, vLLM KV offload) can draw on the same setting.
 
+`[memory] convert_ram` (same syntax, default `"50%"`) → `CONFIG.convert_ram_mib`: `_build_llama_hf_to_gguf` adds `--use-temp-file` for sources larger than it, with `TMPDIR` = the output directory (the anonymous spool file is as large as the output, so it lives on the destination volume) and `TORCHINDUCTOR_CACHE_DIR` pinned to the normal temp dir so torch's compile cache stays out of the model directory. Without it the converter keeps materialized tensors in RAM until the end — DeepSeek-V4's repacked MXFP4 experts are all materialized (~3 GB per V4-Flash layer, ~820 GB for V4-Pro).
+
 **Why TOML, not envvars or a Python file?** TOML is structured and typed without being executable. Envvars are awkward for multi-key sections (storage locations) and invisible at a glance. A Python file would need `exec()` or an import that could shadow package modules.
 
 ---
@@ -133,7 +135,8 @@ Describes an offline conversion/requantization tool.  Instance data lives in `da
 | `label` | Display label in the TUI picker |
 | `input_formats` | `frozenset[ModelFormat]` — formats this tool accepts as input |
 | `output_format` | `ModelFormat` — the format it produces |
-| `quant_options` | `tuple[QuantOption, ...]` — what the tool can produce, in picker order: `id` (the value passed to the tool — GGUF type, bpw, scheme), `label`, and `requires` (`HardwareRequirement` needed to *serve* the output; see *Hardware requirements*). `option(id)` looks one up |
+| `quant_options` | `tuple[QuantOption, ...]` — what the tool can produce, in picker order: `id` (the value passed to the tool — GGUF type, bpw, scheme), `label`, `requires` (`HardwareRequirement` needed to *serve* the output; see *Hardware requirements*), `args` (tool arguments selecting it, for builders that need more than the id) and `applies_to` (limits it to some sources, e.g. FP8-only). `option(id)` looks one up, `options_for(model)` lists those applying to a source |
+| `accepts` | Optional source check narrower than `input_formats` (e.g. only block-FP8 checkpoints of the FP8 format); `None` = every model of an input format |
 | `output_dir_template` | Output directory name — `{stem}` (source directory name, or a GGUF source's stem without its quant suffix) and `{option}`; default `"{stem}-{option}"` (GGUF tools `"{stem}-GGUF-{option}"`, EXL2 `"{stem}-exl2-{option}bpw"`) |
 | `quant_label_template` | The generated entry's `quant` field — `{option}`; default `"{option}"` (EXL2 `"{option} bpw"`) |
 | `cuda_home` | `CUDA_HOME` override injected at run time (non-empty to set) |
@@ -143,7 +146,7 @@ Describes an offline conversion/requantization tool.  Instance data lives in `da
 | `pip_package` | Package `pip install`ed into that environment by the auto-install prompt; `""` = not auto-installable |
 | `install_note` | Shown when the tool is unavailable and not auto-installable |
 
-`tools_for_model(tools, model)` mirrors `servers_for_model` — returns tools whose `input_formats` contains `model.format`.
+`tools_for_model(tools, model)` mirrors `servers_for_model` — returns the tools whose `converts(model)` holds: format in `input_formats`, vision supported, `accepts` passes and at least one option applies.
 
 ### ServerSoftware
 
@@ -488,19 +491,20 @@ Initial tools:
 
 | id | Input | Output | Binary |
 |---|---|---|---|
-| `llama-quantize` | `GGUF` | `GGUF` | `llama-quantize` in the default `llamacpp` environment (built alongside `llama-server`) |
-| `llama-hf-to-gguf` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `GGUF` (`F16` or `BF16`) | `convert_hf_to_gguf.py` in the registered llama.cpp source tree; Python interpreter configured by `llama_convert_python` |
+| `llama-quantize` | `GGUF` | `GGUF` | `llama-quantize` in the chosen `llamacpp` environment (built alongside `llama-server`); `--allow-requantize` is added when the source's `quant` is not F32/F16/BF16 (`GGUF_FULL_PRECISION`) |
+| `llama-hf-to-gguf` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN`, `SAFETENSORS_FP8`, `COMPRESSED_TENSORS`, `GPTQ` | `GGUF` (`BF16`, `F16`, `Q8_0`, `F32`; FP8 sources also `FP8-Q8_0`) | `convert_hf_to_gguf.py` in the registered llama.cpp source tree; Python interpreter configured by `llama_convert_python` |
 | `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | default `tabby` environment's Python: `CONFIG.exl2_convert_script` or `-m exllamav2.conversion.convert_exl2` |
-| `llmc-fp8` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16` | `SAFETENSORS_FP8` (`FP8_BLOCK`, `FP8_DYNAMIC`, `MXFP8`, `MXFP8A16`) | `scripts/llmc-quantize` run by the `llm-compressor` environment's Python (`llmcompressor` package; auto-installable) |
-| `llmc-int` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16` | `COMPRESSED_TENSORS` (`W{2–8}A16`, `W{2–8}A8`, `W{2–4}A4`, `W4A16_ASYM`, `W4AFP8`, `NVFP4A16`, `MXFP4A16`, `MXFP4`) | same |
+| `llmc-fp8` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, block-FP8 `SAFETENSORS_FP8` | `SAFETENSORS_FP8` (`FP8_BLOCK`, `FP8_DYNAMIC`, `MXFP8`, `MXFP8A16`) | `scripts/llmc-quantize` run by the `llm-compressor` environment's Python (`llmcompressor` package; auto-installable) |
+| `llmc-int` | same | `COMPRESSED_TENSORS` (`W{2–8}A16`, `W{2–8}A8`, `W{2–4}A4`, `W4A16_ASYM`, `W4AFP8`, `NVFP4A16`, `MXFP4A16`, `MXFP4`) | same |
+| `llmc-dequant` | block-FP8 `SAFETENSORS_FP8` | `SAFETENSORS_BF16` (`BF16`) | same (`--dequantize-only`) |
 
 Tools run from one of their `env_group`'s registered environments (`quant_tool_envs(tool)`), chosen on `QuantizeEnvScreen` and passed through the flow to `quant_tool_available(tool, env)`, `install_quant_tool(tool, env)`, `build_quantize_cmd(tool, env, …)` and `quantize(tool, env, …)`; builders take `(tool, env, model, quant_option, output_path)`. This lets a newer build (e.g. `llama.cpp-next-patched`) convert architectures the default build lacks. A tool may use a separate configured Python interpreter and declare the modules needed to run its script. Availability is cached per tool, environment location, and interpreter.
 
 Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matching `_build_<id>` builder in `launch.py` registered in `_QUANT_BUILDERS` (several tools may share a builder).
 
-### llm-compressor tools (`llmc-fp8`, `llmc-int`)
+### llm-compressor tools (`llmc-fp8`, `llmc-int`, `llmc-dequant`)
 
-Both are built by `_llmc_tool()` in `data.py` and share `_build_llmc_quantize`; they differ only in output format and options (compressed-tensors preset scheme names). The split exists because a tool has one `output_format`: FP8 schemes produce `SAFETENSORS_FP8`, integer / FP4 schemes `COMPRESSED_TENSORS`. Every **data-free** preset some server can load is offered — weight-only, or with dynamic activation scales. Presets with static activation scales (`FP8`, `NVFP4`) need calibration data, which `model_free_ptq` cannot do. Server support differs per scheme, so each label names the servers that load it; `requires` holds what serving needs. All were converted (Llama-2-7B FP16) and served on sm_86 with vLLM 0.26 and SGLang 0.5.9:
+All are built by `_llmc_tool()` in `data.py`; the quantizers share `_build_llmc_quantize` and differ only in output format and options (compressed-tensors preset scheme names). The split exists because a tool has one `output_format`: FP8 schemes produce `SAFETENSORS_FP8`, integer / FP4 schemes `COMPRESSED_TENSORS`. Every **data-free** preset some server can load is offered — weight-only, or with dynamic activation scales. Presets with static activation scales (`FP8`, `NVFP4`) need calibration data, which `model_free_ptq` cannot do. Server support differs per scheme, so each label names the servers that load it; `requires` holds what serving needs. All were converted (Llama-2-7B FP16) and served on sm_86 with vLLM 0.26 and SGLang 0.5.9:
 
 | Scheme | vLLM | SGLang | `requires` |
 |---|---|---|---|
@@ -508,6 +512,8 @@ Both are built by `_llmc_tool()` in `data.py` and share `_build_llmc_quantize`; 
 | `FP8_DYNAMIC` | ✓ — below sm_89 an FP16 model under `dtype auto` generates garbage (per-channel FP8 Marlin + FP16 bug); set `dtype bfloat16` | ✓ | — (note) |
 | `W4AFP8` | ✗ here — vLLM's W4A8-FP8 kernel matches sm_90 exactly | — | sm_90+ |
 | `MXFP8`, `MXFP8A16`, `MXFP4`, `MXFP4A16` | ✗ here — the Marlin fallback rejects group size 32; native MX kernels need Blackwell | — | sm_100+ |
+
+**FP8 sources.** Standard block-FP8 checkpoints — `quant_method: "fp8"` with a `weight_block_size` and a `<module>.weight_scale_inv` per FP8 weight (DeepSeek V3/R1, Qwen, GLM, MiniMax releases) — are accepted (`_llmc_accepts` → `hf_config.fp8_block_size()`, which reads config.json and the safetensors index, cached). The wrapper dequantizes them to BF16 on the fly with a subclass of compressed-tensors' `FP8BlockDequantizer` that handles exactly the weights carrying a scale (the stock class expects a scale on every targeted module, and listing tens of thousands of expert modules as targets is quadratic). `llmc-dequant` stops there (`--dequantize-only`): a plain BF16 checkpoint, exact (verified bit-identical to a manual dequantization), twice the FP8 size, usable by every 16-bit tool. Checkpoints with their own layout (DeepSeek-V4: MXFP4 routed experts in `I8` with `.scale` tensors) are left to `llama-hf-to-gguf`.
 
 Weight-only schemes run through Marlin / Humming kernels; `W8A8` uses INT8 tensor cores. Integer weights are round-to-nearest: 4-bit and up are usable, 3-bit is heavily degraded and 2-bit produces gibberish without calibration (they are offered because servers load them).
 
@@ -520,7 +526,7 @@ llm-compressor pins transformers and compressed-tensors versions that conflict w
 `compute_quant_output_path(tool, model, quant_option, dest)` in `launch.py` always returns a **directory**. Every job gets its own uniquely-named directory so that removal is always consistent: delete the directory and its contents, regardless of format.
 
 - **GGUF output**: `<dest.root>/<model.type_subdir>/<source_stem>-GGUF-<quant>/`
-  — GGUF re-quantization strips the source quant suffix; HF conversion keeps the source directory name. The builder writes a `.gguf` file inside the directory.
+  — GGUF re-quantization strips the source quant suffix (the entry's `quant` first, e.g. `FP8-Q8_0`, then any known GGUF type); HF conversion keeps the source directory name. The builder writes a `.gguf` file inside the directory.
   Example: `<dest>/text-generation/MyModel-GGUF-Q4_K_M/MyModel.Q4_K_M.gguf` or `<dest>/text-generation/MyModel-GGUF-F16/MyModel.F16.gguf`
 
 - **EXL2 convert**: `<dest.root>/<model.type_subdir>/<source_dirname>-exl2-<bpw>bpw/`
@@ -548,7 +554,7 @@ Follows the same PTY + log structure as `launch()`:
 - If yes → `<tabby env python> <script> -i ... -o ... -b ...`
 - If no → `<tabby env python> -m exllamav2.conversion.convert_exl2 -i ... -o ... -b ...`
 
-`llama-hf-to-gguf` invokes llama.cpp's `convert_hf_to_gguf.py` with `--outtype f16|bf16`. It accepts full-precision, non-vision HF directories only; vision checkpoints are filtered out because this flow does not convert their separate projector. Conversion runs without CUDA/GPU selection and uses `CONFIG.llama_convert_python` (from `config.toml` key `llama_convert_python`; defaults to the Python running the launcher). That interpreter needs PyTorch, Transformers, and NumPy. The output GGUF and source config/tokenizer files are stored together; the normal GGUF ingest path detects the new model and records its F16/BF16 type.
+`llama-hf-to-gguf` invokes llama.cpp's `convert_hf_to_gguf.py` with each option's `args` (`--outtype bf16|f16|q8_0|f32`). It accepts non-vision HF directories at full precision, or quantized ones the converter dequantizes itself: FP8 (block, per-tensor, Mistral `qscale`), ModelOpt, single-group compressed-tensors and GPTQ. FP8 sources also get `FP8-Q8_0` (`--outtype bf16 --fp8-as-q8`): FP8 tensors become Q8_0 (near-lossless), the rest BF16 — about the source's size. DeepSeek-V4's routed experts (MXFP4 in the checkpoint) are repacked losslessly to GGUF MXFP4 whatever the outtype; all three registered llama.cpp builds carry that converter and the `deepseek4` architecture. Large sources spool to disk — see `[memory] convert_ram` under *Configuration Layering*. vision checkpoints are filtered out because this flow does not convert their separate projector. Conversion runs without CUDA/GPU selection and uses `CONFIG.llama_convert_python` (from `config.toml` key `llama_convert_python`; defaults to the Python running the launcher). That interpreter needs PyTorch, Transformers, and NumPy. The output GGUF and source config/tokenizer files are stored together; the normal GGUF ingest path detects the new model and records its F16/BF16 type.
 
 ---
 

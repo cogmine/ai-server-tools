@@ -1956,6 +1956,7 @@ class QuantizeOptionScreen(DataTableScreen):
         self._model = model
         self._tool  = tool
         self._env   = env
+        self._options = tool.options_for(model)
         self._system_sm = system_min_sm()
 
     def compose(self) -> ComposeResult:
@@ -1969,7 +1970,7 @@ class QuantizeOptionScreen(DataTableScreen):
         table = DataTable(id="option-list", cursor_type="row", show_header=False)
         table.add_column("Option", key="label")
         table.add_column("GPU to serve", key="hw")
-        for opt in self._tool.quant_options:
+        for opt in self._options:
             met = opt.requires.met_by(self._system_sm)
             table.add_row(opt.label if met else f"[dim]{opt.label}[/]", _hw_cell(opt.requires, self._system_sm))
         yield table
@@ -1981,7 +1982,7 @@ class QuantizeOptionScreen(DataTableScreen):
 
     def _focused_option(self) -> QuantOption | None:
         idx = self.query_one("#option-list", DataTable).cursor_row
-        options = self._tool.quant_options
+        options = self._options
         return options[idx] if 0 <= idx < len(options) else None
 
     def _update_detail(self) -> None:

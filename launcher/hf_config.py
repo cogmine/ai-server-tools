@@ -3,7 +3,8 @@ hf_config.py — Launch-planning facts read from a model's HF config.json.
 
 Used by the parallelism planner (launch.compute_parallelism) and by "auto" launch
 parameters (data.py) that depend on model dimensions, e.g. whether vLLM needs
-expert parallelism.  Results are cached per model path.
+expert parallelism, and by quantization tools that need to know a checkpoint's
+quantization layout.  Results are cached per model path.
 """
 from __future__ import annotations
 
@@ -90,3 +91,31 @@ def expert_parallel_needed(model: "AIModel | None", tp: int) -> tuple[bool, str]
         if shard % block:
             return True, f"expert shard {width}/TP{tp} = {shard} not aligned to quantization block {block}"
     return False, f"experts shard evenly at TP{tp}"
+
+
+@functools.lru_cache(maxsize=64)
+def fp8_block_size(model_path: str) -> tuple[int, int] | None:
+    """Block shape of a standard block-FP8 checkpoint, else None.
+
+    Standard = quantization_config quant_method "fp8" with a weight_block_size,
+    and each FP8 weight paired with a "<module>.weight_scale_inv" tensor (DeepSeek
+    V3, Qwen, MiniMax, GLM FP8 releases) — the layout generic dequantizers
+    handle.  Checkpoints with their own layout (e.g. DeepSeek-V4's FP4 experts
+    with ".scale" tensors) return None.  Reads config.json and the safetensors
+    index only.
+    """
+    path = Path(model_path)
+    try:
+        cfg = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        quant = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
+        block = quant.get("weight_block_size")
+        if quant.get("quant_method") != "fp8" or not block or len(block) != 2:
+            return None
+        index = path / "model.safetensors.index.json"
+        if index.is_file():
+            names = json.loads(index.read_text(encoding="utf-8"))["weight_map"].keys()
+            if not any(n.endswith(".weight_scale_inv") for n in names):
+                return None
+    except (OSError, ValueError, KeyError):
+        return None
+    return int(block[0]), int(block[1])

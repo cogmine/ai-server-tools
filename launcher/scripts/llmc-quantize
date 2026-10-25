@@ -2,6 +2,7 @@
 """llmc-quantize — data-free quantization of an HF safetensors checkpoint with llm-compressor.
 
 Usage: llmc-quantize --scheme SCHEME [--max-workers N] SOURCE_DIR OUTPUT_DIR
+       llmc-quantize --dequantize-only [--max-workers N] SOURCE_DIR OUTPUT_DIR
 
 SCHEME is a compressed-tensors preset (FP8_DYNAMIC, FP8_BLOCK, W8A16, W8A8, W4A16,
 W4A16_ASYM, NVFP4A16, MXFP4A16, …) that needs no calibration data.  Runs
@@ -9,6 +10,11 @@ llm-compressor's model_free_ptq, which quantizes the safetensors shards one by
 one on every visible GPU without instantiating the model, so any architecture
 and size works.  Non-weight files (config, tokenizer, …) are copied and
 config.json gains a compressed-tensors quantization_config that vLLM / SGLang load.
+
+The source may be BF16 / FP16, or a standard block-FP8 checkpoint (quant_method
+"fp8" with weight_scale_inv tensors — DeepSeek V3, Qwen, GLM, MiniMax FP8
+releases): its weights are dequantized to BF16 on the fly before quantizing.
+--dequantize-only stops there and writes a plain BF16 checkpoint.
 
 model_free_ptq converts every *.safetensors file under its source and copies
 everything else, recursively — legacy .bin / .pth weights, original/ folders,
@@ -80,6 +86,62 @@ def _matches(patterns: tuple[str, ...], name: str) -> bool:
         re.match(p[3:], name) is not None if p.startswith("re:") else p == name
         for p in patterns
     )
+
+
+def _source_quant_config(source: Path) -> tuple[dict, bool]:
+    """(quantization_config, nested under text_config?) of the source checkpoint."""
+    cfg = json.loads((source / "config.json").read_text())
+    if cfg.get("quantization_config"):
+        return cfg["quantization_config"], False
+    nested = (cfg.get("text_config") or {}).get("quantization_config")
+    return (nested or {}), bool(nested)
+
+
+def _fp8_dequantizer(source: Path, shapes: dict[str, list[int]]):
+    """A converter dequantizing a block-FP8 source to BF16; None for 16-bit sources.
+
+    Exactly the weights that come with a "<module>.weight_scale_inv" are
+    dequantized: compressed-tensors' FP8BlockDequantizer (whose block math this
+    reuses) expects every *targeted* module to have a scale, and naming each FP8
+    module as a target is quadratic on large MoE checkpoints.
+    """
+    import torch
+    from compressed_tensors.entrypoints.convert.converters.fp8block_dequantizer import (
+        FP8BlockDequantizer,
+    )
+
+    quant, _ = _source_quant_config(source)
+    if not quant:
+        return None
+    block = quant.get("weight_block_size")
+    if quant.get("quant_method") != "fp8" or not block:
+        sys.exit(f"llmc-quantize: unsupported source quantization {quant.get('quant_method')!r} "
+                 "(only BF16/FP16 and block-FP8 checkpoints with weight_scale_inv)")
+    suffix = ".weight_scale_inv"
+    scaled = frozenset(name[: -len(suffix)] for name in shapes if name.endswith(suffix))
+
+    class ScaleInvDequantizer(FP8BlockDequantizer):
+        def get_dependencies(self, weight_name: str) -> set[str]:
+            module, _, param = weight_name.rpartition(".")
+            return {module + suffix} if param == "weight" and module in scaled else set()
+
+        def process(self, tensors: dict) -> dict:
+            for name in [n for n in tensors if n.endswith(suffix)]:
+                module = name[: -len(suffix)]
+                tensors[module + ".weight"] = self._create_dequantized_weight(
+                    tensors[module + ".weight"], tensors.pop(name),
+                )
+            return tensors
+
+    return ScaleInvDequantizer(weight_block_size=tuple(block), dtype=torch.bfloat16)
+
+
+def _drop_nested_quant_config(output: Path) -> None:
+    """Remove a text_config.quantization_config the conversion left behind (multimodal FP8)."""
+    path = output / "config.json"
+    cfg = json.loads(path.read_text())
+    if (cfg.get("text_config") or {}).pop("quantization_config", None) is not None:
+        path.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
 def _weight_shards(source: Path) -> list[Path]:
@@ -182,7 +244,10 @@ def _with_fused_siblings(ignored: set[str], shapes: dict[str, list[int]]) -> set
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--scheme", required=True, help="compressed-tensors preset scheme name")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--scheme", help="compressed-tensors preset scheme name")
+    mode.add_argument("--dequantize-only", action="store_true",
+                      help="dequantize a block-FP8 checkpoint to BF16 without re-quantizing")
     ap.add_argument("--max-workers", type=int, default=0,
                     help="concurrent shard jobs (default: one per visible GPU — lower it if host "
                          "RAM runs out)")
@@ -191,37 +256,53 @@ def main() -> None:
     args = ap.parse_args()
 
     import torch
+    from compressed_tensors.entrypoints.convert import convert_checkpoint
     from compressed_tensors.quantization import QuantizationConfig, QuantizationStatus
     from llmcompressor import model_free_ptq
 
     shards = _weight_shards(args.source)
     shapes = _tensor_shapes(shards)
-    scheme = _scheme(args.scheme)
-    shape_ignored = _shape_ignores(shapes, scheme)
-    ignore = [*_ROLE_IGNORE, *sorted(_with_fused_siblings(shape_ignored, shapes))]
+    dequantizer = _fp8_dequantizer(args.source, shapes)
+    if args.dequantize_only and dequantizer is None:
+        sys.exit("llmc-quantize: --dequantize-only needs a block-FP8 source")
     max_workers = args.max_workers or max(1, torch.cuda.device_count())
-    print(f"llmc-quantize: {args.scheme}  {args.source} → {args.output}  ({max_workers} worker(s))")
-    print(f"llmc-quantize: role-based ignore patterns: {', '.join(_ROLE_IGNORE)}")
-    print(f"llmc-quantize: {len(ignore) - len(_ROLE_IGNORE)} module(s) kept in full precision "
-          f"for shape reasons{': ' + ', '.join(sorted(shape_ignored)[:10]) if shape_ignored else ''}"
-          f"{' …' if len(shape_ignored) > 10 else ''}", flush=True)
+    action = "dequantize → BF16" if args.dequantize_only else args.scheme
+    source_kind = "block-FP8 source, dequantized on the fly" if dequantizer else "16-bit source"
+    print(f"llmc-quantize: {action}  {args.source} → {args.output}  "
+          f"({source_kind}; {max_workers} worker(s))")
 
     with tempfile.TemporaryDirectory(prefix="llmc-source-") as staging:
         skipped = _stage_source(args.source, shards, Path(staging))
         if skipped:
             print(f"llmc-quantize: not carried over: {', '.join(skipped)}", flush=True)
-        model_free_ptq(
-            model_stub=staging,
-            save_directory=str(args.output),
-            # A config (rather than scheme=) keeps the preset name as the group name,
-            # which ingest records as the entry's quant.
-            config=QuantizationConfig(
-                config_groups={args.scheme: scheme},
-                quantization_status=QuantizationStatus.INITIALIZED,
-                ignore=ignore,
-            ),
-            max_workers=max_workers,
-        )
+        if args.dequantize_only:
+            convert_checkpoint(
+                model_stub=staging, save_directory=str(args.output),
+                converter=dequantizer, max_workers=max_workers,
+            )
+        else:
+            scheme = _scheme(args.scheme)
+            shape_ignored = _shape_ignores(shapes, scheme)
+            ignore = [*_ROLE_IGNORE, *sorted(_with_fused_siblings(shape_ignored, shapes))]
+            print(f"llmc-quantize: role-based ignore patterns: {', '.join(_ROLE_IGNORE)}")
+            print(f"llmc-quantize: {len(ignore) - len(_ROLE_IGNORE)} module(s) kept in full precision "
+                  f"for shape reasons{': ' + ', '.join(sorted(shape_ignored)[:10]) if shape_ignored else ''}"
+                  f"{' …' if len(shape_ignored) > 10 else ''}", flush=True)
+            model_free_ptq(
+                model_stub=staging,
+                save_directory=str(args.output),
+                # A config (rather than scheme=) keeps the preset name as the group name,
+                # which ingest records as the entry's quant.
+                config=QuantizationConfig(
+                    config_groups={args.scheme: scheme},
+                    quantization_status=QuantizationStatus.INITIALIZED,
+                    ignore=ignore,
+                ),
+                max_workers=max_workers,
+                converter=dequantizer,
+            )
+    if dequantizer is not None:
+        _drop_nested_quant_config(args.output)
     print("llmc-quantize: done", flush=True)
 
 

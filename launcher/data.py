@@ -20,7 +20,7 @@ from pathlib import Path
 
 from typing import Any
 
-from launcher.hf_config import expert_parallel_needed
+from launcher.hf_config import expert_parallel_needed, fp8_block_size
 from launcher.models import (
     AIModel, AIType, GGUFQuant, ModelFormat,
     HardwareRequirement, QuantizationTool, QuantOption, RuntimeQuant, RuntimeQuantOption,
@@ -495,22 +495,35 @@ def _options(labels: dict[str, str]) -> tuple[QuantOption, ...]:
     return tuple(QuantOption(option_id, label) for option_id, label in labels.items())
 
 
+def _is_fp8_source(model: AIModel) -> bool:
+    return model.format == ModelFormat.SAFETENSORS_FP8
+
+
+def _llmc_accepts(model: AIModel) -> bool:
+    """16-bit checkpoints, and standard block-FP8 ones (dequantized while converting)."""
+    return not _is_fp8_source(model) or fp8_block_size(model.path) is not None
+
+
 def _llmc_tool(
     id: str, label: str, output_format: ModelFormat, options: tuple[QuantOption, ...],
 ) -> QuantizationTool:
-    """An llm-compressor model-free PTQ tool (launcher/scripts/llmc-quantize).
+    """An llm-compressor tool (launcher/scripts/llmc-quantize).
 
-    Options are compressed-tensors preset scheme names; only data-free schemes
-    (weight-only, or dynamic activations) apply, since nothing is calibrated.
-    It quantizes safetensors shard by shard on the selected GPUs without
-    instantiating the model, so any architecture and size works.  llm-compressor
-    pins its own transformers / compressed-tensors versions, so it runs from a
-    dedicated environment group rather than a server's environment.
+    Quantization options are compressed-tensors preset scheme names; only data-free
+    schemes (weight-only, or dynamic activations) apply, since nothing is calibrated.
+    It processes safetensors shard by shard on the selected GPUs without
+    instantiating the model, so any architecture and size works; block-FP8 sources
+    are dequantized on the fly.  llm-compressor pins its own transformers /
+    compressed-tensors versions, so it runs from a dedicated environment group
+    rather than a server's environment.
     """
     return QuantizationTool(
         id=id,
         label=label,
-        input_formats=frozenset({ModelFormat.SAFETENSORS_BF16, ModelFormat.SAFETENSORS_FP16}),
+        input_formats=frozenset({
+            ModelFormat.SAFETENSORS_BF16, ModelFormat.SAFETENSORS_FP16, ModelFormat.SAFETENSORS_FP8,
+        }),
+        accepts=_llmc_accepts,
         output_format=output_format,
         quant_options=options,
         env_group="llm-compressor",
@@ -565,16 +578,28 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
     QuantizationTool(
         id="llama-hf-to-gguf",
         label="llama.cpp (HF → GGUF)",
+        # convert_hf_to_gguf.py dequantizes FP8 (block, per-tensor, Mistral), ModelOpt,
+        # single-group compressed-tensors and GPTQ checkpoints itself; DeepSeek-V4's
+        # FP4 routed experts are repacked losslessly to MXFP4 whatever the outtype.
         input_formats=frozenset({
             ModelFormat.SAFETENSORS_BF16,
             ModelFormat.SAFETENSORS_FP16,
             ModelFormat.PYTORCH_BIN,
+            ModelFormat.SAFETENSORS_FP8,
+            ModelFormat.COMPRESSED_TENSORS,
+            ModelFormat.GPTQ,
         }),
         output_format=ModelFormat.GGUF,
-        quant_options=_options({
-            "F16": "F16 — 16-bit floating point",
-            "BF16": "BF16 — brain floating point",
-        }),
+        quant_options=(
+            QuantOption("BF16", "BF16 — brain floating point", args=("--outtype", "bf16")),
+            QuantOption("F16", "F16 — 16-bit floating point", args=("--outtype", "f16")),
+            QuantOption(
+                "FP8-Q8_0", "FP8 tensors as Q8_0, the rest BF16 — ≈ source size, near-lossless",
+                args=("--outtype", "bf16", "--fp8-as-q8"), applies_to=_is_fp8_source,
+            ),
+            QuantOption("Q8_0", "Q8_0 — 8-bit (~8.5 bpw), every tensor", args=("--outtype", "q8_0")),
+            QuantOption("F32", "F32 — 32-bit floating point (2× BF16 size)", args=("--outtype", "f32")),
+        ),
         output_dir_template="{stem}-GGUF-{option}",
         env_group="llamacpp",
         avail_script="convert_hf_to_gguf.py",
@@ -671,6 +696,15 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             QuantOption("W2A8", "INT2 weights + INT8 activations (~2.1 bpw; unusable)  ·  vLLM"),
             QuantOption("W2A4", "INT2 weights + INT4 activations (~2.1 bpw; unusable)  ·  vLLM"),
         ),
+    ),
+
+    # Plain dequantization — makes FP8-only releases usable by every 16-bit tool
+    # (EXL2, older llama.cpp builds, …) and servers; output is twice the FP8 size.
+    _llmc_tool(
+        id="llmc-dequant",
+        label="llm-compressor (dequantize FP8 → BF16)",
+        output_format=ModelFormat.SAFETENSORS_BF16,
+        options=(QuantOption("BF16", "BF16 — exact dequantization (2× the FP8 size)", applies_to=_is_fp8_source),),
     ),
 ]
 

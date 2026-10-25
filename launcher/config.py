@@ -79,6 +79,9 @@ class SiteConfig:
     # Ceiling (MiB) for a server's host-RAM prompt cache (llama.cpp --cache-ram);
     # None = not configured, servers keep their own default.
     host_cache_ram_mib:   int | None = None
+    # Host RAM (MiB) a model conversion may hold; larger sources spool converted
+    # tensors to disk instead (llama.cpp convert_hf_to_gguf --use-temp-file).
+    convert_ram_mib:      int = 0
     server_ports:         dict[str, int] = field(default_factory=dict)  # per-server port overrides from [ports]
     locations:            list[LocationConfig] = field(default_factory=list)  # in config order
 
@@ -151,6 +154,7 @@ def _load() -> SiteConfig:
         comfyui_models_dir=expand_path(
             paths.get("comfyui_models_dir", "~/ComfyUI/models")),
         host_cache_ram_mib=_parse_ram_mib(memory.get("host_cache_ram")),
+        convert_ram_mib=_parse_ram_mib(memory.get("convert_ram", "50%")) or 0,
         server_ports=ports,
         locations=locations,
     )

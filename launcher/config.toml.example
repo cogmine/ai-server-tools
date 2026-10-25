@@ -76,6 +76,13 @@ pipeline_parallel = 0
 # default (8 GiB for llama.cpp — less than one full 128K slot of a large model).
 host_cache_ram = "60%"
 
+# Host RAM a model conversion may hold.  Converting a larger model (by its size on
+# disk) to GGUF spools the converted tensors to a temporary file beside the output
+# instead — needed when the converter materializes tensors (e.g. DeepSeek-V4's
+# repacked MXFP4 experts), at the cost of writing the output twice.  Share of
+# physical RAM or integer MiB; default "50%".
+convert_ram = "50%"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Storage locations

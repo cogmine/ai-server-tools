@@ -214,5 +214,80 @@ class LlmcQuantizeScriptTests(unittest.TestCase):
                                   "m.l.in_proj_a", "m.l.in_proj_b"})
 
 
+class Fp8SourceTests(unittest.TestCase):
+    """Converting FP8-only releases (e.g. DeepSeek V3/V4)."""
+
+    @staticmethod
+    def _checkpoint(tmp: str, scale_suffix: str | None) -> AIModel:
+        import json
+        root = Path(tmp)
+        (root / "config.json").write_text(json.dumps({"quantization_config": {
+            "quant_method": "fp8", "weight_block_size": [128, 128]}}))
+        weights = {"model.layers.0.mlp.down_proj.weight": "model-1.safetensors"}
+        if scale_suffix:
+            weights[f"model.layers.0.mlp.down_proj.{scale_suffix}"] = "model-1.safetensors"
+        (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weights}))
+        return AIModel(
+            id="fp8", name="FP8", path=tmp, format=ModelFormat.SAFETENSORS_FP8,
+            ai_types=frozenset({AIType.TEXT_GEN}),
+        )
+
+    def test_block_fp8_gets_every_tool_family(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self._checkpoint(tmp, "weight_scale_inv")
+            tools = {t.id for t in tools_for_model(QUANTIZATION_TOOLS, model)}
+        self.assertEqual(tools, {"llama-hf-to-gguf", "llmc-fp8", "llmc-int", "llmc-dequant"})
+
+    def test_native_layouts_get_llama_cpp_only(self) -> None:
+        """DeepSeek-V4-style checkpoints (".scale" tensors, FP4 experts): llama.cpp converts them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self._checkpoint(tmp, "scale")
+            tools = {t.id for t in tools_for_model(QUANTIZATION_TOOLS, model)}
+        self.assertEqual(tools, {"llama-hf-to-gguf"})
+
+    def test_fp8_only_options(self) -> None:
+        gguf = _tool("llama-hf-to-gguf")
+        self.assertIn("FP8-Q8_0", [o.id for o in gguf.options_for(_hf_model(ModelFormat.SAFETENSORS_FP8))])
+        self.assertNotIn("FP8-Q8_0", [o.id for o in gguf.options_for(_hf_model())])
+        self.assertEqual(gguf.option("FP8-Q8_0").args, ("--outtype", "bf16", "--fp8-as-q8"))
+        self.assertFalse(_tool("llmc-dequant").converts(_hf_model()))
+
+    def test_requantize_flag_follows_source_precision(self) -> None:
+        from launcher.environments import NativeEnvironment
+        env = NativeEnvironment(server_id="llamacpp", name="t", bin_dir="/bin")
+        tool, out = _tool("llama-quantize"), Path("/out")
+
+        def cmd(quant: str) -> list[str]:
+            model = AIModel(id="g", name="g", path=f"/m/M.{quant}.gguf", format=ModelFormat.GGUF,
+                            ai_types=frozenset({AIType.TEXT_GEN}), quant=quant)
+            return launch._QUANT_BUILDERS[tool.id](tool, env, model, "Q4_K_M", out)
+
+        self.assertNotIn("--allow-requantize", cmd("BF16"))
+        self.assertIn("--allow-requantize", cmd("FP8-Q8_0"))
+        self.assertEqual(Path(cmd("FP8-Q8_0")[-2]).name, "M.Q4_K_M.gguf")  # source quant stripped
+
+    def test_large_conversions_spool_to_the_destination(self) -> None:
+        from unittest.mock import patch
+        from launcher.environments import NativeEnvironment
+        tool, out = _tool("llama-hf-to-gguf"), Path("/dest/text-generation/X-GGUF-BF16")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "build" / "bin").mkdir(parents=True)
+            (root / "convert_hf_to_gguf.py").touch()
+            (root / "src").mkdir()
+            env = NativeEnvironment(server_id="llamacpp", name="t", bin_dir=str(root / "build" / "bin"))
+
+            def cmd(size_gb: float) -> list[str]:
+                model = AIModel(id="m", name="m", path=str(root / "src"), format=ModelFormat.SAFETENSORS_FP8,
+                                ai_types=frozenset({AIType.TEXT_GEN}), size_gb=size_gb)
+                return launch._build_llama_hf_to_gguf(tool, env, model, "BF16", out)
+
+            with patch.object(launch.CONFIG, "convert_ram_mib", 100 * 1024):
+                self.assertNotIn("--use-temp-file", cmd(50))
+                large = cmd(865)
+        self.assertIn("--use-temp-file", large)
+        self.assertEqual(large[:2], ["env", f"TMPDIR={out}"])
+
+
 if __name__ == "__main__":
     unittest.main()
