@@ -214,6 +214,7 @@ _FORMAT_WEIGHT_GLOBS: dict[str, list[str]] = {
     "safetensors_bf16": ["*.safetensors"],
     "safetensors_fp16": ["*.safetensors"],
     "safetensors_fp8":  ["*.safetensors"],
+    "compressed_tensors": ["*.safetensors"],
     "gptq":             ["*.safetensors"],
     "awq":              ["*.safetensors"],
     "exl2":             ["*.safetensors"],
@@ -461,6 +462,16 @@ def _detect_all_hf_formats(model_dir: Path, cfg: dict[str, Any]) -> list[str]:
     # (quant_method=modelopt, quant_algo=fp8)
     if quant_method == "fp8" or quant_type == "fp8" or quant_algo == "fp8":
         return ["safetensors_fp8"]
+    # llm-compressor / compressed-tensors: FP8 weight schemes are FP8; integer and FP4
+    # weight schemes (W8A16, W4A16, NVFP4A16, …) are their own format.
+    if quant_method == "compressed-tensors":
+        weights = [
+            group.get("weights") or {}
+            for group in (quant_cfg.get("config_groups") or {}).values()
+        ]
+        if weights and all(w.get("type") == "float" and w.get("num_bits") == 8 for w in weights):
+            return ["safetensors_fp8"]
+        return ["compressed_tensors"]
 
     # torch_dtype may be at the top level, or nested inside text_config for multimodal models
     torch_dtype = str(
@@ -703,6 +714,19 @@ def _detect_trust_remote_code(cfg: dict[str, Any]) -> bool:
     return bool(cfg.get("auto_map"))
 
 
+def _detect_compressed_tensors_scheme(cfg: dict[str, Any]) -> str:
+    """Preset scheme of a single-scheme compressed-tensors checkpoint (e.g. 'W4A16'), or ''.
+
+    llm-compressor names the config group after the preset it was given; generic
+    group names ("group_0", "config_group_0") carry no scheme information.
+    """
+    qcfg = cfg.get("quantization_config") or {}
+    groups = list((qcfg.get("config_groups") or {}).keys())
+    if qcfg.get("quant_method") != "compressed-tensors" or len(groups) != 1:
+        return ""
+    return "" if re.fullmatch(r"(config_)?group_\d+", groups[0]) else groups[0].upper()
+
+
 def _detect_fp8_min_sm(cfg: dict[str, Any]) -> int:
     """Return the minimum sm level required by an FP8 quantization scheme, or 0.
 
@@ -726,6 +750,7 @@ _FORMAT_SHORT: dict[str, str] = {
     "safetensors_bf16": "bf16",
     "safetensors_fp16": "fp16",
     "safetensors_fp8":  "fp8",
+    "compressed_tensors": "ct",
     "int8_bnb":         "int8",
     "pytorch_bin":      "bin",
     "awq":              "awq",
@@ -1157,6 +1182,7 @@ def detect_hf_dir(
     template_tools = declares_tools(read_template_at(model_dir))
     trust_rc      = _detect_trust_remote_code(cfg)
     fp8_min_sm    = _detect_fp8_min_sm(cfg)
+    ct_scheme     = _detect_compressed_tensors_scheme(cfg)
     display_name  = _dir_to_display_name(model_dir.name)
     fmt_short     = _FORMAT_SHORT.get(fmt, fmt)
     entry_id      = f"{_slugify(display_name)}-{fmt_short}"
@@ -1193,6 +1219,7 @@ def detect_hf_dir(
     if template_tools: entry["template_tools"] = True
     if trust_rc:    entry["trust_remote_code"] = True
     if fp8_min_sm:  entry["min_sm"]      = fp8_min_sm
+    if ct_scheme:   entry["quant"]       = ct_scheme
     return entry
 
 

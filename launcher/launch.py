@@ -376,9 +376,7 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd += ["--trust-remote-code"]
     if not p.get("log_requests"):
         cmd += ["--no-enable-log-requests"]
-    rq = p.get("_runtime_quant")
-    if rq == RuntimeQuant.BNB_INT8:
-        cmd += ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"]
+    cmd += server.runtime_quant_args(p.get("_runtime_quant"))
     if model.tool_call_parser:
         cmd += ["--enable-auto-tool-choice", "--tool-call-parser", model.tool_call_parser]
     if model.reasoning_parser:
@@ -547,11 +545,7 @@ def _build_ooba(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd += ["--extra-flags", shlex.join(_llamacpp_rope_args(model))]
     if p.get("cache_type"):
         cmd += ["--cache-type", p["cache_type"]]
-    rq = p.get("_runtime_quant")
-    if rq == RuntimeQuant.BNB_INT8:
-        cmd.append("--load-in-8bit")
-    elif rq == RuntimeQuant.BNB_NF4:
-        cmd.append("--load-in-4bit")
+    cmd += server.runtime_quant_args(p.get("_runtime_quant"))
     cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
@@ -574,11 +568,9 @@ def _build_sglang(server: ServerSoftware, env: Environment, model: AIModel, p: d
     ]
     if model.format == ModelFormat.GGUF:
         cmd += ["--load-format", "gguf"]
-    elif (
-        model.format == ModelFormat.INT8_BNB
-        or p.get("_runtime_quant") == RuntimeQuant.BNB_INT8
-    ):
+    elif model.format == ModelFormat.INT8_BNB:
         cmd += ["--load-format", "bitsandbytes", "--quantization", "bitsandbytes"]
+    cmd += server.runtime_quant_args(p.get("_runtime_quant"))
     if model.tool_call_parser:
         sglang_name = _SGLANG_TOOL_PARSER_MAP.get(model.tool_call_parser, model.tool_call_parser)
         cmd += ["--tool-call-parser", sglang_name]
@@ -624,8 +616,8 @@ _tool_avail_cache: dict[tuple[str, ...], bool] = {}
 
 
 def quant_tool_envs(tool: QuantizationTool) -> list[Environment]:
-    """The environments a quantization tool can run from: those registered for its server."""
-    return ENVIRONMENTS.for_server(tool.env_server_id)
+    """The environments a quantization tool can run from: those registered under its env_group."""
+    return ENVIRONMENTS.for_server(tool.env_group)
 
 
 def quant_tool_available(tool: QuantizationTool, env: Environment) -> bool:
@@ -714,24 +706,15 @@ def compute_quant_output_path(
     """Derive the output *directory* for a quantization job.
 
     Every job produces its own uniquely-named directory so that removal
-    is always consistent: delete the directory and its contents.
-
-    GGUF output:
-        <dest.root>/<model.type_subdir>/<stem_no_quant>-GGUF-<quant>/
-        Existing GGUF inputs have their quant suffix removed; HF directory
-        inputs keep their source directory name.
-
-    EXL2 convert:
-        <dest.root>/<model.type_subdir>/<source_dirname>-exl2-<bpw>bpw/
-        e.g. ~/fast_models/text-generation/BeMag-123B-v0.1-exl2-4.0bpw/
+    is always consistent: delete the directory and its contents.  The name
+    comes from tool.output_dir_template: {stem} is the source directory name,
+    or for a GGUF source its file stem without the quant suffix; {option} is
+    the quant option.  e.g. ~/fast_models/text-generation/BeMag-123B-v0.1-exl2-4.0bpw/
     """
     src = Path(model.path)
-    output_root = dest.root / model.type_subdir
-    if tool.output_format == ModelFormat.GGUF:
-        stem = _strip_gguf_quant(src.stem) if model.format == ModelFormat.GGUF else src.name
-        return output_root / f"{stem}-GGUF-{quant_option}"
-    else:
-        return output_root / f"{src.name}-exl2-{quant_option}bpw"
+    stem = _strip_gguf_quant(src.stem) if model.format == ModelFormat.GGUF else src.name
+    name = tool.output_dir_template.format(stem=stem, option=quant_option)
+    return dest.root / model.type_subdir / name
 
 
 def _build_llama_quantize(
@@ -797,10 +780,30 @@ def _build_llama_hf_to_gguf(
     ]
 
 
+_LLMC_SCRIPT = Path(__file__).parent / "scripts" / "llmc-quantize"
+
+
+def _build_llmc_quantize(
+    tool: QuantizationTool,
+    env: Environment,
+    model: AIModel,
+    quant_option: str,
+    output_dir: Path,
+) -> list[str]:
+    return [
+        str(env.python), str(_LLMC_SCRIPT),
+        "--scheme", quant_option,
+        model.path,
+        str(output_dir),
+    ]
+
+
 _QUANT_BUILDERS: dict[str, Any] = {
     "llama-quantize": _build_llama_quantize,
     "llama-hf-to-gguf": _build_llama_hf_to_gguf,
     "exl2-convert":   _build_exl2_convert,
+    "llmc-fp8":       _build_llmc_quantize,
+    "llmc-int":       _build_llmc_quantize,
 }
 
 
@@ -1227,12 +1230,12 @@ def finalize_quantization(job: QuantizeJob) -> AIModel:
         **job.model.derived_entry_fields(),
         "id": job.output_path.name.lower().replace(".", "-"),
         "name": job.model.name,
-        "quant": (
-            f"{job.quant_option} bpw"
-            if job.tool.output_format == ModelFormat.EXL2
-            else job.quant_option.upper()
-        ),
+        "quant": job.tool.quant_label_template.format(option=job.quant_option),
     }
+    requires = job.tool.option(job.quant_option).requires
+    if requires.min_sm:  # the model list flags the entry on GPUs that cannot serve it
+        entry_overrides["min_sm"] = requires.min_sm
+        entry_overrides["hw_note"] = f"{job.quant_option} {requires.summary}"
     entry = ingest_model(
         ingest_path,
         fmt=job.tool.output_format.value,

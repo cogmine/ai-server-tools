@@ -23,7 +23,8 @@ from typing import Any
 from launcher.hf_config import expert_parallel_needed
 from launcher.models import (
     AIModel, AIType, GGUFQuant, ModelFormat,
-    QuantizationTool, RuntimeQuant, ServerSoftware, VersionProbe,
+    HardwareRequirement, QuantizationTool, QuantOption, RuntimeQuant, RuntimeQuantOption,
+    ServerSoftware, VersionProbe,
 )
 from launcher.params import (
     AutoBoolParam, BoolParam, ChoiceParam, FlagsParam, FloatParam, IntParam, TextParam,
@@ -88,11 +89,53 @@ _HF_CONFIG_FORMATS: frozenset[ModelFormat] = frozenset({
     ModelFormat.SAFETENSORS_BF16,
     ModelFormat.SAFETENSORS_FP16,
     ModelFormat.SAFETENSORS_FP8,
+    ModelFormat.COMPRESSED_TENSORS,
     ModelFormat.AWQ,
     ModelFormat.GPTQ,
     ModelFormat.INT8_BNB,
     ModelFormat.PYTORCH_BIN,
 })
+
+# vLLM and SGLang quantize unquantized checkpoints in flight through bitsandbytes —
+# always to 4-bit NF4 (their loaders call quantize_4bit; 8-bit only loads pre-quantized
+# checkpoints).
+_BNB_NF4_INFLIGHT = RuntimeQuantOption(
+    RuntimeQuant.BNB_NF4, ("--quantization", "bitsandbytes", "--load-format", "bitsandbytes"),
+)
+
+# vLLM online quantization (--quantization <shorthand>): weights are quantized layer by
+# layer as they load, so the full-precision model never has to fit.  Requirements come
+# from vLLM 0.26's kernel checks; on sm_86 FP8 per-tensor, INT8 experts (MoE) and
+# bitsandbytes were verified, the others fail as their requirement predicts.
+_VLLM_RUNTIME_QUANTS: tuple[RuntimeQuantOption, ...] = (
+    RuntimeQuantOption(
+        RuntimeQuant.FP8_BLOCK, ("--quantization", "fp8_per_block"),
+        requires=HardwareRequirement(89, "FP8 block kernels (Triton has no FP8 type below sm_89)"),
+    ),
+    RuntimeQuantOption(
+        RuntimeQuant.FP8_CHANNEL, ("--quantization", "fp8_per_channel"),
+        requires=HardwareRequirement(89, "per-token FP8 activations need FP8 tensor cores"),
+    ),
+    RuntimeQuantOption(
+        RuntimeQuant.FP8, ("--quantization", "fp8"),
+        note="below sm_89 it runs weight-only (Marlin W8A16)",
+    ),
+    RuntimeQuantOption(
+        RuntimeQuant.MXFP8, ("--quantization", "mxfp8"),
+        requires=HardwareRequirement(100, "native MX kernels; the Marlin fallback failed on sm_86"),
+    ),
+    RuntimeQuantOption(
+        RuntimeQuant.INT8_EXPERTS, ("--quantization", "int8_per_channel_weight_only"),
+        note="attention and shared layers stay BF16",
+        applies_to=_is_moe,
+    ),
+    RuntimeQuantOption(
+        RuntimeQuant.NVFP4_EXPERTS, ("--quantization", "nvfp4_per_token"),
+        requires=HardwareRequirement(100, "Blackwell FlashInfer TRT-LLM MoE kernels only"),
+        applies_to=_is_moe,
+    ),
+    _BNB_NF4_INFLIGHT,
+)
 
 SERVERS: list[ServerSoftware] = [
 
@@ -172,7 +215,7 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.SAFETENSORS_FP16,
             ModelFormat.PYTORCH_BIN,
         }),
-        supported_runtime_quants=(RuntimeQuant.BNB_INT8,),
+        runtime_quants=_VLLM_RUNTIME_QUANTS,
         # Prevent the vllm source tree (if present in PYTHONPATH) from shadowing
         # the installed package.  CWD /tmp ensures no local vllm/ dir is on sys.path.
         version_packages=("vllm",),
@@ -343,7 +386,10 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.SAFETENSORS_FP16,
             ModelFormat.PYTORCH_BIN,
         }),
-        supported_runtime_quants=(RuntimeQuant.BNB_INT8, RuntimeQuant.BNB_NF4),
+        runtime_quants=(
+            RuntimeQuantOption(RuntimeQuant.BNB_INT8, ("--load-in-8bit",)),
+            RuntimeQuantOption(RuntimeQuant.BNB_NF4, ("--load-in-4bit",)),
+        ),
         # ooba's server.py uses relative paths for Gradio's allowed_paths, which
         # Gradio resolves against CWD — must run from the TGW installation directory.
         launch_cwd=str(CONFIG.ooba_main.parent),
@@ -410,7 +456,17 @@ SERVERS: list[ServerSoftware] = [
             ModelFormat.SAFETENSORS_FP16,
             ModelFormat.PYTORCH_BIN,
         }),
-        supported_runtime_quants=(RuntimeQuant.BNB_INT8,),
+        runtime_quants=(
+            # SGLang materializes the full-precision weights before quantizing them:
+            # it frees memory for KV cache afterwards but cannot make a model fit.
+            RuntimeQuantOption(
+                RuntimeQuant.FP8, ("--quantization", "fp8"),
+                requires=HardwareRequirement(89, "SGLang's online FP8 uses Triton FP8 kernels (fails on sm_86)"),
+                note="loads full precision first — needs the unquantized footprint to load",
+                full_precision_load=True,
+            ),
+            _BNB_NF4_INFLIGHT,
+        ),
         version_packages=("sglang",),
         # flashinfer JIT-compiles CUDA kernels; CUDA_HOME points to the nvcc
         # compatible with gcc-13 (cuda-12.5 vs the bundled cuda-12.1 headers).
@@ -431,7 +487,49 @@ SERVERS: list[ServerSoftware] = [
 # ---------------------------------------------------------------------------
 # These tools perform offline model conversion / requantization.
 # input_formats gates which source formats each tool accepts.
-# quant_options lists the option identifiers shown in the TUI picker.
+# quant_options lists what each can produce (QuantOption), in picker order.
+
+
+def _options(labels: dict[str, str]) -> tuple[QuantOption, ...]:
+    """QuantOptions without hardware requirements, from {id: label}."""
+    return tuple(QuantOption(option_id, label) for option_id, label in labels.items())
+
+
+def _llmc_tool(
+    id: str, label: str, output_format: ModelFormat, options: tuple[QuantOption, ...],
+) -> QuantizationTool:
+    """An llm-compressor model-free PTQ tool (launcher/scripts/llmc-quantize).
+
+    Options are compressed-tensors preset scheme names; only data-free schemes
+    (weight-only, or dynamic activations) apply, since nothing is calibrated.
+    It quantizes safetensors shard by shard on the selected GPUs without
+    instantiating the model, so any architecture and size works.  llm-compressor
+    pins its own transformers / compressed-tensors versions, so it runs from a
+    dedicated environment group rather than a server's environment.
+    """
+    return QuantizationTool(
+        id=id,
+        label=label,
+        input_formats=frozenset({ModelFormat.SAFETENSORS_BF16, ModelFormat.SAFETENSORS_FP16}),
+        output_format=output_format,
+        quant_options=options,
+        env_group="llm-compressor",
+        avail_module="llmcompressor",
+        pip_package="llmcompressor",
+        install_note=(
+            "llm-compressor needs its own environment (it pins transformers and "
+            "compressed-tensors versions that conflict with vLLM): create a conda env "
+            "(e.g. `conda create -n llm-compressor python=3.11`), register it under "
+            "\"llm-compressor\" in user_data/environments.json, then pick this tool "
+            "again to install the llmcompressor package."
+        ),
+    )
+
+
+# Hardware needed to *serve* llm-compressor outputs (vLLM 0.26 kernel checks).
+_SM89_FP8 = HardwareRequirement(89, "FP8 activations need FP8 tensor cores")
+_SM90_W4AFP8 = HardwareRequirement(90, "vLLM's W4A8-FP8 kernel targets Hopper (sm_90); no fallback below")
+_SM100_MX = HardwareRequirement(100, "native MX kernels; vLLM's Marlin fallback failed on sm_86")
 
 QUANTIZATION_TOOLS: list[QuantizationTool] = [
 
@@ -440,15 +538,7 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
         label="llama.cpp (GGUF re-quantize)",
         input_formats=frozenset({ModelFormat.GGUF}),
         output_format=ModelFormat.GGUF,
-        quant_options=(
-            GGUFQuant.Q2_K.value,
-            GGUFQuant.Q3_K_S.value, GGUFQuant.Q3_K_M.value,
-            GGUFQuant.Q4_K_S.value, GGUFQuant.Q4_K_M.value,
-            GGUFQuant.Q5_K_S.value, GGUFQuant.Q5_K_M.value,
-            GGUFQuant.Q6_K.value,
-            GGUFQuant.Q8_0.value,
-        ),
-        quant_option_labels={
+        quant_options=_options({
             GGUFQuant.Q2_K.value:   "Q2_K   (~2.6 bpw)",
             GGUFQuant.Q3_K_S.value: "Q3_K_S (~3.4 bpw)",
             GGUFQuant.Q3_K_M.value: "Q3_K_M (~3.9 bpw)",
@@ -458,11 +548,12 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             GGUFQuant.Q5_K_M.value: "Q5_K_M (~5.7 bpw)",
             GGUFQuant.Q6_K.value:   "Q6_K   (~6.6 bpw) ← near-lossless",
             GGUFQuant.Q8_0.value:   "Q8_0   (~8.5 bpw) ← reference",
-        },
+        }),
         # llama-quantize is a binary co-located with llama-server (same llama.cpp build).
         # No separate installation is needed — it runs from a registered llamacpp
         # environment, so if llama.cpp is set up this tool is available.
-        env_server_id="llamacpp",
+        output_dir_template="{stem}-GGUF-{option}",
+        env_group="llamacpp",
         avail_executable="llama-quantize",
         install_note=(
             "llama-quantize not found in the llama.cpp environment. "
@@ -480,12 +571,12 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             ModelFormat.PYTORCH_BIN,
         }),
         output_format=ModelFormat.GGUF,
-        quant_options=("F16", "BF16"),
-        quant_option_labels={
+        quant_options=_options({
             "F16": "F16 — 16-bit floating point",
             "BF16": "BF16 — brain floating point",
-        },
-        env_server_id="llamacpp",
+        }),
+        output_dir_template="{stem}-GGUF-{option}",
+        env_group="llamacpp",
         avail_script="convert_hf_to_gguf.py",
         python_executable=str(CONFIG.llama_convert_python),
         avail_modules=("torch", "transformers", "numpy"),
@@ -507,8 +598,7 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             ModelFormat.PYTORCH_BIN,
         }),
         output_format=ModelFormat.EXL2,
-        quant_options=("2.5", "3.0", "3.5", "4.0", "4.5", "5.0", "6.0", "8.0"),
-        quant_option_labels={
+        quant_options=_options({
             "2.5": "2.5 bpw — very aggressive",
             "3.0": "3.0 bpw — aggressive",
             "3.5": "3.5 bpw",
@@ -517,17 +607,71 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             "5.0": "5.0 bpw — high quality",
             "6.0": "6.0 bpw — near-lossless",
             "8.0": "8.0 bpw — reference quality",
-        },
+        }),
+        output_dir_template="{stem}-exl2-{option}bpw",
+        quant_label_template="{option} bpw",
         cuda_home=CONFIG.cuda_home_tabby,
         # exllamav2 is a pip-installable Python package (uses JIT CUDA compilation at
         # runtime, so no CUDA toolkit is required at install time).  It is already
         # installed in the default tabby environment as a dependency of tabbyAPI — if
         # tabbyAPI is set up, this tool is available with no further action.
-        env_server_id="tabby",
+        env_group="tabby",
         avail_module="exllamav2",
         pip_package="exllamav2",
     ),
 
+    # Every data-free compressed-tensors preset some server can load is offered,
+    # whatever the local GPUs; requires records what serving the output needs.
+    # Labels name the servers that load each (vLLM 0.26, SGLang 0.5.9).  All were
+    # converted and served on sm_86 except where requires says otherwise (their
+    # requirement comes from vLLM's kernel checks, and they failed there as predicted).
+    # Integer weights are RTN (no calibration): 4-bit is usable, 3-bit and below is not
+    # without GPTQ/AWQ-style calibration.
+    _llmc_tool(
+        id="llmc-fp8",
+        label="llm-compressor (FP8, data-free)",
+        output_format=ModelFormat.SAFETENSORS_FP8,
+        options=(
+            QuantOption("FP8_BLOCK", "FP8 block — 128×128 weight blocks (~8 bpw)  ·  vLLM"),
+            QuantOption(
+                "FP8_DYNAMIC", "FP8 per-channel + per-token activations (~8 bpw)  ·  vLLM, SGLang",
+                HardwareRequirement(0, "below sm_89 vLLM runs it weight-only (Marlin); FP16 models "
+                                       "then need dtype bfloat16 — FP16 compute gives garbage"),
+            ),
+            QuantOption("MXFP8", "MXFP8 — FP8 weights + activations, 32-wide blocks  ·  vLLM", _SM100_MX),
+            QuantOption("MXFP8A16", "MXFP8 weight-only — 32-wide blocks  ·  vLLM", _SM100_MX),
+        ),
+    ),
+
+    _llmc_tool(
+        id="llmc-int",
+        label="llm-compressor (INT 2–8 bit / FP4, data-free)",
+        output_format=ModelFormat.COMPRESSED_TENSORS,
+        options=(
+            QuantOption("W8A16", "INT8 weight-only — group 128 (~8.1 bpw)  ·  vLLM, SGLang"),
+            QuantOption("W8A8", "INT8 weights + per-token INT8 activations (~8 bpw)  ·  vLLM, SGLang"),
+            QuantOption("W7A16", "INT7 weight-only (~7.1 bpw)  ·  vLLM"),
+            QuantOption("W7A8", "INT7 weights + INT8 activations (~7.1 bpw)  ·  vLLM"),
+            QuantOption("W6A16", "INT6 weight-only (~6.1 bpw)  ·  vLLM"),
+            QuantOption("W6A8", "INT6 weights + INT8 activations (~6.1 bpw)  ·  vLLM"),
+            QuantOption("W5A16", "INT5 weight-only (~5.1 bpw)  ·  vLLM"),
+            QuantOption("W5A8", "INT5 weights + INT8 activations (~5.1 bpw)  ·  vLLM"),
+            QuantOption("W4A16", "INT4 weight-only, symmetric (~4.25 bpw)  ·  vLLM, SGLang"),
+            QuantOption("W4A16_ASYM", "INT4 weight-only, asymmetric (~4.5 bpw)  ·  vLLM"),
+            QuantOption("W4A8", "INT4 weights + INT8 activations (~4.25 bpw)  ·  vLLM, SGLang"),
+            QuantOption("W4A4", "INT4 weights + INT4 activations (~4.25 bpw)  ·  vLLM, SGLang"),
+            QuantOption("W4AFP8", "INT4 weights + FP8 activations (~4.25 bpw)  ·  vLLM", _SM90_W4AFP8),
+            QuantOption("NVFP4A16", "NVFP4 weight-only — group 16 (~4.5 bpw)  ·  vLLM"),
+            QuantOption("MXFP4A16", "MXFP4 weight-only — group 32 (~4.25 bpw)  ·  vLLM", _SM100_MX),
+            QuantOption("MXFP4", "MXFP4 weights + activations — group 32 (~4.25 bpw)  ·  vLLM", _SM100_MX),
+            QuantOption("W3A16", "INT3 weight-only (~3.1 bpw; heavily degraded without calibration)  ·  vLLM"),
+            QuantOption("W3A8", "INT3 weights + INT8 activations (~3.1 bpw; heavily degraded)  ·  vLLM"),
+            QuantOption("W3A4", "INT3 weights + INT4 activations (~3.1 bpw; heavily degraded)  ·  vLLM"),
+            QuantOption("W2A16", "INT2 weight-only (~2.1 bpw; unusable without calibration)  ·  vLLM"),
+            QuantOption("W2A8", "INT2 weights + INT8 activations (~2.1 bpw; unusable)  ·  vLLM"),
+            QuantOption("W2A4", "INT2 weights + INT4 activations (~2.1 bpw; unusable)  ·  vLLM"),
+        ),
+    ),
 ]
 
 

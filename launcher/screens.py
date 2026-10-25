@@ -64,14 +64,14 @@ from launcher.models import (
     AIType,
     AI_TYPE_LABELS,
     FORMAT_SHORT,
+    HardwareRequirement,
     MODEL_FIELDS,
     ModelFormat,
+    QuantOption,
     QuantizationTool,
     RopeScaling,
     RuntimeQuant,
-    RUNTIME_QUANT_LABEL,
-    RUNTIME_QUANT_SHORT,
-    RUNTIME_QUANT_VRAM_RATIO,
+    RuntimeQuantOption,
     ServerSoftware,
     available_ai_types,
     fmt_ctx,
@@ -294,7 +294,7 @@ def _continue_launch(screen: Screen, model: "AIModel | None", server: ServerSoft
             severity="error", timeout=5,
         )
         return
-    if model is not None and server.available_runtime_quants(model.format):
+    if model is not None and server.runtime_quant_options(model):
         # Let the user optionally choose a runtime quantization mode first.
         screen.app.push_screen(QuantSelectScreen(model, server, env))
         return
@@ -378,7 +378,7 @@ class ServerSelectScreen(DataTableScreen):
                 return False
             env = self._single_env(server)
             # Multi-env or quant-capable servers are marked on the deeper screens.
-            if env is None or server.available_runtime_quants(self._model.format):
+            if env is None or server.runtime_quant_options(self._model):
                 return False
             current = self._model.status_for(server.id, env.name)
             if action == "mark_good":    return current != "good"
@@ -569,7 +569,7 @@ class EnvSelectScreen(DataTableScreen):
             env = self._focused_env()
             if self._model is None or env is None:
                 return False
-            if self._server.available_runtime_quants(self._model.format):
+            if self._server.runtime_quant_options(self._model):
                 return False
             current = self._model.status_for(self._server.id, env.name)
             if action == "mark_good":    return current != "good"
@@ -1074,11 +1074,33 @@ class EnvManageScreen(DataTableScreen):
 # Level 3b (optional) — Runtime quantization selection
 # ---------------------------------------------------------------------------
 
+def _hw_cell(requires: HardwareRequirement, system_sm: int) -> str:
+    """Compact hardware column: the minimum compute capability, ⛔ when this system lacks it."""
+    if not requires.min_sm:
+        return ""
+    if requires.met_by(system_sm):
+        return f"[dim]sm_{requires.min_sm}+[/]"
+    return f"[red]⛔ sm_{requires.min_sm}+[/]"
+
+
+def _hw_detail(requires: HardwareRequirement, system_sm: int, *notes: str) -> str:
+    """Detail line for a focused option: notes plus its requirement vs this system."""
+    parts = [escape(n) for n in notes if n]
+    if requires.summary:
+        text = escape(requires.summary)
+        if not requires.met_by(system_sm):
+            text = f"[red]⛔ {text} — this system: sm_{system_sm}[/]"
+        parts.append(text)
+    return "   ·   ".join(parts)
+
+
 class QuantSelectScreen(DataTableScreen):
     """Optional step: choose a runtime quantization mode for the selected model+server.
 
-    Only pushed when server.available_runtime_quants(model.format) is non-empty.
-    The first option is always "None (full precision)".
+    Only pushed when server.runtime_quant_options(model) is non-empty.
+    The first option is always "None (full precision)".  Every option the server
+    offers is listed; those whose hardware requirement this system does not meet
+    are flagged (⛔) but remain selectable (mixed GPUs, or newer drivers/kernels).
     Use g/x/? to mark the focused option good/bad/unknown without launching.
     """
 
@@ -1096,21 +1118,25 @@ class QuantSelectScreen(DataTableScreen):
         self._model  = model
         self._server = server
         self._env    = env
-        # None at index 0 = load at full precision; then the available quant modes.
-        quants = server.available_runtime_quants(model.format)
-        self._options: list[RuntimeQuant | None] = [None, *quants]
+        # None at index 0 = load at full precision; then the server's quant options.
+        self._options: list[RuntimeQuantOption | None] = [None, *server.runtime_quant_options(model)]
+        self._system_sm = system_min_sm()
         self._total_gb: float | None = None   # populated by _fetch_vram
 
-    def _quant_at_cursor(self) -> "tuple[bool, RuntimeQuant | None]":
-        """Return (valid, quant) for the current DataTable cursor.
+    def _option_at_cursor(self) -> "tuple[bool, RuntimeQuantOption | None]":
+        """Return (valid, option) for the current DataTable cursor.
 
         valid is False when the cursor is not on a valid option.
-        quant is None when 'full precision' (index 0) is focused.
+        option is None when 'full precision' (index 0) is focused.
         """
         idx = self.query_one("#quant-list", DataTable).cursor_row
         if 0 <= idx < len(self._options):
             return True, self._options[idx]
         return False, None
+
+    def _quant_at_cursor(self) -> "tuple[bool, RuntimeQuant | None]":
+        valid, option = self._option_at_cursor()
+        return valid, option.quant if option is not None else None
 
     def compose(self) -> ComposeResult:
         color, _ = self._model.composite_status(SERVERS)
@@ -1124,7 +1150,10 @@ class QuantSelectScreen(DataTableScreen):
         table = DataTable(id="quant-list", cursor_type="row", show_header=False)
         table.add_column("", key="status")
         table.add_column("Quantization", key="label")
+        table.add_column("Load", key="load")
+        table.add_column("GPU", key="hw")
         yield table
+        yield Label("", id="option-detail")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1143,35 +1172,50 @@ class QuantSelectScreen(DataTableScreen):
         self._total_gb = total
         self._populate()
 
+    def _load_cell(self, load_gb: float) -> str:
+        """Estimated weight footprint, green when it fits in total VRAM."""
+        if not self._model.size_gb:
+            return ""
+        text = f"~{load_gb:.0f} GB"
+        if self._total_gb is not None and load_gb <= self._total_gb:
+            return f"[bright_green]{text}[/]"
+        return f"[dim]{text}[/]"
+
     def _populate(self) -> None:
         table = self.query_one("#quant-list", DataTable)
         saved_row = table.cursor_row
         table.clear()
-
-        # Determine fit status for each option (None = unknown, not yet loaded)
-        if self._total_gb is not None and self._model.size_gb:
-            fits_full = self._model.size_gb <= self._total_gb
-            fit_quants = {rq for rq, _ in self._model.vram_fit_hints(self._total_gb, SERVERS)}
-        else:
-            fits_full = None
-            fit_quants: set[RuntimeQuant] = set()
-
-        def _label(text: str, fits: bool | None) -> str:
-            return f"[bright_green]{text}[/]" if fits is True else text
-
+        size = self._model.size_gb
         table.add_row(
             SERVER_STATUS_DOT[self._model.status_for(self._server.id, self._env.name, None)],
-            _label("None (load at full precision)", fits_full),
+            "None (load at full precision)",
+            self._load_cell(size),
+            "",
             key="none",
         )
-        for q in self._options[1:]:
-            if q is not None:
-                table.add_row(
-                    SERVER_STATUS_DOT[self._model.status_for(self._server.id, self._env.name, q)],
-                    _label(RUNTIME_QUANT_LABEL[q], True if q in fit_quants else (None if self._total_gb is None else False)),
-                    key=q.value,
-                )
+        for option in self._options[1:]:
+            if option is None:
+                continue
+            met = option.requires.met_by(self._system_sm)
+            table.add_row(
+                SERVER_STATUS_DOT[self._model.status_for(self._server.id, self._env.name, option.quant)],
+                option.quant.label if met else f"[dim]{option.quant.label}[/]",
+                self._load_cell(option.load_gb(size)),
+                _hw_cell(option.requires, self._system_sm),
+                key=option.quant.value,
+            )
         table.move_cursor(row=min(saved_row, max(0, len(self._options) - 1)))
+        self._update_detail()
+        self.refresh_bindings()
+
+    def _update_detail(self) -> None:
+        _, option = self._option_at_cursor()
+        detail = "" if option is None else _hw_detail(option.requires, self._system_sm, option.note)
+        self.query_one("#option-detail", Label).update(detail)
+
+    @on(DataTable.RowHighlighted)
+    def on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._update_detail()
         self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -1195,7 +1239,7 @@ class QuantSelectScreen(DataTableScreen):
             self.notify(str(e), severity="error", timeout=5)
             return
         self._populate()
-        quant_label = RUNTIME_QUANT_LABEL[quant] if quant else "None (full precision)"
+        quant_label = quant.label if quant else "None (full precision)"
         self.notify(
             f"{self._model.name} / {self._server.label} / {self._env.name} / {quant_label} \u2192 {status}",
             timeout=2,
@@ -1209,8 +1253,16 @@ class QuantSelectScreen(DataTableScreen):
         idx = self.query_one("#quant-list", DataTable).cursor_row
         if not (0 <= idx < len(self._options)):
             return
-        quant = self._options[idx]
-        self.app.push_screen(GpuSelectScreen(self._server, self._env, self._model, quant))
+        option = self._options[idx]
+        if option is not None and not option.requires.met_by(self._system_sm):
+            self.notify(
+                f"{option.quant.label} {option.requires.summary} (this system: sm_{self._system_sm}) "
+                "— the launch will likely fail unless only newer GPUs are selected",
+                severity="warning", timeout=6,
+            )
+        self.app.push_screen(GpuSelectScreen(
+            self._server, self._env, self._model, option.quant if option is not None else None,
+        ))
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -1647,8 +1699,8 @@ def _open_quant_tool(screen: Screen, model: AIModel, tool: QuantizationTool) -> 
     envs = launcher.quant_tool_envs(tool)
     if not envs:
         screen.notify(
-            f"{tool.label} needs a registered {tool.env_server_id} environment",
-            severity="warning", timeout=5,
+            tool.install_note or f"{tool.label} needs a registered {tool.env_group} environment",
+            severity="warning", timeout=8,
         )
         return
     if len(envs) > 1:
@@ -1734,7 +1786,7 @@ class QuantizeEnvScreen(DataTableScreen):
         super().__init__()
         self._model = model
         self._tool  = tool
-        self._server = next((s for s in SERVERS if s.id == tool.env_server_id), None)
+        self._server = next((s for s in SERVERS if s.id == tool.env_group), None)
         self._envs: list[Environment] = []
 
     def compose(self) -> ComposeResult:
@@ -1753,7 +1805,7 @@ class QuantizeEnvScreen(DataTableScreen):
 
     def on_mount(self) -> None:
         self._populate()
-        default = ENVIRONMENTS.default_for(self._tool.env_server_id)
+        default = ENVIRONMENTS.default_for(self._tool.env_group)
         idx = next((i for i, e in enumerate(self._envs) if e is default), 0)
         self.query_one("#env-list", DataTable).move_cursor(row=idx)
 
@@ -1887,7 +1939,11 @@ class QuantToolInstallScreen(ButtonMenuScreen):
 # ---------------------------------------------------------------------------
 
 class QuantizeOptionScreen(DataTableScreen):
-    """Select a quantization option (e.g. Q4_K_M or 4.0 bpw)."""
+    """Select a quantization option (e.g. Q4_K_M or 4.0 bpw).
+
+    Every option is listed: one whose output needs newer GPUs than this system's
+    is flagged (⛔) but can still be produced — e.g. to serve it on another machine.
+    """
 
     BINDINGS: ClassVar = [
         Binding("q",             "quit_app",       "Quit"),
@@ -1900,6 +1956,7 @@ class QuantizeOptionScreen(DataTableScreen):
         self._model = model
         self._tool  = tool
         self._env   = env
+        self._system_sm = system_min_sm()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1911,17 +1968,42 @@ class QuantizeOptionScreen(DataTableScreen):
         )
         table = DataTable(id="option-list", cursor_type="row", show_header=False)
         table.add_column("Option", key="label")
+        table.add_column("GPU to serve", key="hw")
         for opt in self._tool.quant_options:
-            table.add_row(self._tool.quant_option_labels[opt])
+            met = opt.requires.met_by(self._system_sm)
+            table.add_row(opt.label if met else f"[dim]{opt.label}[/]", _hw_cell(opt.requires, self._system_sm))
         yield table
+        yield Label("", id="option-detail")
         yield Footer()
 
-    def action_dt_select(self) -> None:
+    def on_mount(self) -> None:
+        self._update_detail()
+
+    def _focused_option(self) -> QuantOption | None:
         idx = self.query_one("#option-list", DataTable).cursor_row
-        if not (0 <= idx < len(self._tool.quant_options)):
+        options = self._tool.quant_options
+        return options[idx] if 0 <= idx < len(options) else None
+
+    def _update_detail(self) -> None:
+        option = self._focused_option()
+        detail = "" if option is None else _hw_detail(option.requires, self._system_sm)
+        self.query_one("#option-detail", Label).update(detail)
+
+    @on(DataTable.RowHighlighted)
+    def on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._update_detail()
+
+    def action_dt_select(self) -> None:
+        option = self._focused_option()
+        if option is None:
             return
-        quant_option = self._tool.quant_options[idx]
-        self.app.push_screen(QuantizeDestScreen(self._model, self._tool, self._env, quant_option))
+        if not option.requires.met_by(self._system_sm):
+            self.notify(
+                f"The {option.id} output {option.requires.summary} to serve "
+                f"(this system: sm_{self._system_sm}) — it is flagged ⛔ in the model list here",
+                timeout=6,
+            )
+        self.app.push_screen(QuantizeDestScreen(self._model, self._tool, self._env, option.id))
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -1978,7 +2060,7 @@ class QuantizeDestScreen(ButtonMenuScreen):
         yield Header()
         yield Label(
             f"[bold]Select output destination for:[/]  "
-            f"{self._model.name}  ·  [dim]{self._tool.quant_option_labels[self._quant_option]}[/]",
+            f"{self._model.name}  ·  [dim]{self._tool.option(self._quant_option).label}[/]",
             id="screen-title",
         )
         yield Vertical(id="dest-ops")
@@ -2381,11 +2463,14 @@ class ModelSelectScreen(DataTableScreen):
         if self._avail_gb is not None and model.size_gb:
             if model.size_gb > self._total_gb:
                 base = f"[red]⚠  {model.size_gb:.0f}/{self._total_gb:.0f} GB VRAM[/]"
-                hints = model.vram_fit_hints(self._total_gb, SERVERS)
+                hints = model.vram_fit_hints(self._total_gb, SERVERS, self._system_sm)
                 if hints:
+                    best_per_size: dict[float, RuntimeQuant] = {}
+                    for rq, est in hints:  # best quality first
+                        best_per_size.setdefault(est, rq)
                     hint_str = "  [dim]·[/]  ".join(
-                        f"[bright_green]{RUNTIME_QUANT_SHORT[rq]} ~{est:.0f} GB[/]"
-                        for rq, est in hints
+                        f"[bright_green]{rq.short} ~{est:.0f} GB[/]"
+                        for est, rq in best_per_size.items()
                     )
                     base += f"  [dim]·[/]  {hint_str}"
                 return base

@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""llmc-quantize — data-free quantization of an HF safetensors checkpoint with llm-compressor.
+
+Usage: llmc-quantize --scheme SCHEME [--max-workers N] SOURCE_DIR OUTPUT_DIR
+
+SCHEME is a compressed-tensors preset (FP8_DYNAMIC, FP8_BLOCK, W8A16, W8A8, W4A16,
+W4A16_ASYM, NVFP4A16, MXFP4A16, …) that needs no calibration data.  Runs
+llm-compressor's model_free_ptq, which quantizes the safetensors shards one by
+one on every visible GPU without instantiating the model, so any architecture
+and size works.  Non-weight files (config, tokenizer, …) are copied and
+config.json gains a compressed-tensors quantization_config that vLLM / SGLang load.
+
+model_free_ptq converts every *.safetensors file under its source and copies
+everything else, recursively — legacy .bin / .pth weights, original/ folders,
+stray GGUFs — and aborts on a safetensors file missing from the index (e.g.
+Mistral's consolidated.safetensors).  So it is pointed at a staging directory
+of symlinks: the indexed safetensors shards plus the top-level files that are
+not weights.
+
+model_free_ptq quantizes every "<module>.weight" tensor except norms and aborts
+on any tensor the scheme cannot handle, so this wrapper builds the ignore list
+first: modules that must stay in full precision by role (below), plus every
+module whose weight shape the scheme rejects (non-2D, or a dimension not
+divisible by the scheme's group / block size).  Fused siblings (q/k/v,
+gate/up) are kept consistent — vLLM loads them as one layer.
+
+Run with the Python of an environment that has llmcompressor installed (the
+launcher's "llm-compressor" environment group).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import struct
+import sys
+import tempfile
+from pathlib import Path
+
+_SAFETENSORS_INDEX = "model.safetensors.index.json"
+
+# Weight / index files of other formats: never carried into the output.
+_OTHER_WEIGHT_SUFFIXES = (
+    ".bin", ".pt", ".pth", ".ckpt", ".h5", ".msgpack", ".gguf", ".onnx", ".onnx_data", ".index.json",
+)
+
+# Kept in full precision by role: embeddings and output head (high accuracy impact;
+# vLLM loads them unquantized anyway), MoE routers / shared-expert gates (tiny,
+# precision-critical), and vision / audio encoders and projectors.
+_ROLE_IGNORE = (
+    r"re:(.*\.)?(lm_head|embed_out)$",
+    r"re:.*(embed_tokens|embed_in|word_embeddings|wte|wpe)$",
+    r"re:.*\.mlp\.gate$",
+    r"re:.*\.(router|shared_expert_gate)$",
+    r"re:(.*\.)?(visual|vision_tower|vision_model|vision_encoder|multi_modal_projector"
+    r"|mm_projector|audio_tower|audio_model|audio_encoder)\..*",
+)
+
+# Sibling projections vLLM fuses into one layer (its models' packed_modules_mapping):
+# all quantized or none.
+_FUSED_SIBLINGS = (
+    ("q_proj", "k_proj", "v_proj", "g_proj"),
+    ("gate_proj", "up_proj"),
+    ("in_proj_qkv", "in_proj_z"),
+    ("in_proj_a", "in_proj_b"),
+    ("q_a_proj", "kv_a_proj_with_mqa"),
+    ("w1", "w3"),
+    ("wq", "wk", "wv"),
+    ("query", "key", "value"),
+    ("c_fc_0", "c_fc_1"),
+)
+
+# 3-D fused-expert tensors that model_free_ptq splits into per-expert 2-D weights.
+_SPLIT_EXPERT_KEYS = ("gate_up_proj", "down_proj")
+
+
+def _matches(patterns: tuple[str, ...], name: str) -> bool:
+    """compressed-tensors semantics: "re:" = re.match, else exact name."""
+    return any(
+        re.match(p[3:], name) is not None if p.startswith("re:") else p == name
+        for p in patterns
+    )
+
+
+def _weight_shards(source: Path) -> list[Path]:
+    """The safetensors shards making up the model: those in the index, else all."""
+    index = source / _SAFETENSORS_INDEX
+    if index.is_file():
+        names = sorted(set(json.loads(index.read_text())["weight_map"].values()))
+        return [source / name for name in names]
+    shards = sorted(source.glob("*.safetensors"))
+    if not shards:
+        sys.exit(f"llmc-quantize: no .safetensors files in {source}")
+    return shards
+
+
+def _stage_source(source: Path, shards: list[Path], staging: Path) -> list[str]:
+    """Symlink the shards, their index and the top-level non-weight files into *staging*.
+
+    Returns the names of the entries left out.
+    """
+    keep = {s.name for s in shards} | {_SAFETENSORS_INDEX}
+    skipped: list[str] = []
+    for entry in sorted(source.iterdir()):
+        name = entry.name
+        wanted = name in keep or (
+            entry.is_file() and not name.startswith(".")
+            and not name.endswith((".safetensors", *_OTHER_WEIGHT_SUFFIXES))
+        )
+        if wanted:
+            (staging / name).symlink_to(entry.resolve())
+        else:
+            skipped.append(name + ("/" if entry.is_dir() else ""))
+    return skipped
+
+
+def _tensor_shapes(shards: list[Path]) -> dict[str, list[int]]:
+    """Every tensor's shape, read from the safetensors headers only."""
+    shapes: dict[str, list[int]] = {}
+    for path in shards:
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_len))
+        for name, info in header.items():
+            if name != "__metadata__":
+                shapes[name] = info["shape"]
+    return shapes
+
+
+def _scheme(scheme_name: str):
+    """The preset's QuantizationScheme, with the storage format servers can load.
+
+    compressed-tensors stores sub-8-bit integer weights unpacked ("int-quantized")
+    whenever activations are quantized too (W4A8, W4A4, W4AFP8, …), but vLLM's
+    kernels for those load only packed int32 weights ("pack-quantized").
+    """
+    from compressed_tensors.quantization import preset_name_to_scheme
+
+    scheme = preset_name_to_scheme(scheme_name, ["Linear"])
+    weights = scheme.weights
+    if weights is not None and weights.type == "int" and weights.num_bits < 8:
+        scheme.format = "pack-quantized"
+    return scheme
+
+
+def _shape_ignores(shapes: dict[str, list[int]], scheme) -> set[str]:
+    """Modules whose weight the scheme cannot quantize (model_free_ptq would abort)."""
+    import torch
+    from llmcompressor.entrypoints.model_free.lifecycle import validate_weight_for_quantization
+
+    # llm-compressor pads partial blocks, but vLLM rejects block-quantized weights
+    # whose dimensions do not divide by the block (e.g. Qwen3.5 in_proj_a: 32 rows).
+    block = scheme.weights.block_structure if scheme.weights else None
+    ignored: set[str] = set()
+    for name, shape in shapes.items():
+        module, _, param = name.rpartition(".")
+        if param != "weight" or module.endswith("norm") or _matches(_ROLE_IGNORE, module):
+            continue
+        if len(shape) == 3 and any(key in module for key in _SPLIT_EXPERT_KEYS):
+            continue
+        if block and len(shape) == 2 and any(dim % b for dim, b in zip(shape, block)):
+            ignored.add(module)
+            continue
+        weight = torch.empty(shape, dtype=torch.bfloat16, device="meta")
+        try:
+            validate_weight_for_quantization(weight, scheme, name)
+        except ValueError:
+            ignored.add(module)
+    return ignored
+
+
+def _with_fused_siblings(ignored: set[str], shapes: dict[str, list[int]]) -> set[str]:
+    modules = {name.rpartition(".")[0] for name in shapes}
+    result = set(ignored)
+    for module in ignored:
+        parent, _, leaf = module.rpartition(".")
+        for group in _FUSED_SIBLINGS:
+            if leaf in group:
+                result.update(f"{parent}.{s}" for s in group if f"{parent}.{s}" in modules)
+    return result
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--scheme", required=True, help="compressed-tensors preset scheme name")
+    ap.add_argument("--max-workers", type=int, default=0,
+                    help="concurrent shard jobs (default: one per visible GPU — lower it if host "
+                         "RAM runs out)")
+    ap.add_argument("source", type=Path)
+    ap.add_argument("output", type=Path)
+    args = ap.parse_args()
+
+    import torch
+    from compressed_tensors.quantization import QuantizationConfig, QuantizationStatus
+    from llmcompressor import model_free_ptq
+
+    shards = _weight_shards(args.source)
+    shapes = _tensor_shapes(shards)
+    scheme = _scheme(args.scheme)
+    shape_ignored = _shape_ignores(shapes, scheme)
+    ignore = [*_ROLE_IGNORE, *sorted(_with_fused_siblings(shape_ignored, shapes))]
+    max_workers = args.max_workers or max(1, torch.cuda.device_count())
+    print(f"llmc-quantize: {args.scheme}  {args.source} → {args.output}  ({max_workers} worker(s))")
+    print(f"llmc-quantize: role-based ignore patterns: {', '.join(_ROLE_IGNORE)}")
+    print(f"llmc-quantize: {len(ignore) - len(_ROLE_IGNORE)} module(s) kept in full precision "
+          f"for shape reasons{': ' + ', '.join(sorted(shape_ignored)[:10]) if shape_ignored else ''}"
+          f"{' …' if len(shape_ignored) > 10 else ''}", flush=True)
+
+    with tempfile.TemporaryDirectory(prefix="llmc-source-") as staging:
+        skipped = _stage_source(args.source, shards, Path(staging))
+        if skipped:
+            print(f"llmc-quantize: not carried over: {', '.join(skipped)}", flush=True)
+        model_free_ptq(
+            model_stub=staging,
+            save_directory=str(args.output),
+            # A config (rather than scheme=) keeps the preset name as the group name,
+            # which ingest records as the entry's quant.
+            config=QuantizationConfig(
+                config_groups={args.scheme: scheme},
+                quantization_status=QuantizationStatus.INITIALIZED,
+                ignore=ignore,
+            ),
+            max_workers=max_workers,
+        )
+    print("llmc-quantize: done", flush=True)
+
+
+if __name__ == "__main__":
+    main()

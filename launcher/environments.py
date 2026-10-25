@@ -8,7 +8,9 @@ registered per server (e.g. a stable "vllm" and an experimental "vllm-next"); th
 user picks one at launch time.
 
 The registry is persisted in launcher/user_data/environments.json (gitignored;
-copy from environments.json.example).  It is keyed by ServerSoftware.id:
+copy from environments.json.example).  It is keyed by ServerSoftware.id, or by a
+quantization tool's env_group when the tool needs an environment of its own
+(e.g. "llm-compressor"):
 
     {"environments": {"vllm": [{"kind": "conda", "name": "vllm", "default": true}, …]}}
 
@@ -286,7 +288,7 @@ def env_kind(kind: str) -> type[Environment]:
 # ---------------------------------------------------------------------------
 
 class EnvironmentRegistry:
-    """All registered environments, grouped by ServerSoftware.id, persisted as JSON."""
+    """All registered environments, grouped by ServerSoftware.id (or tool env_group), persisted as JSON."""
 
     def __init__(self, path: Path, envs: dict[str, list[Environment]]) -> None:
         self._path = path

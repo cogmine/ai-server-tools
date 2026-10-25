@@ -110,6 +110,8 @@ Press `e` on the server list or the environment picker to **manage environments*
 
 Conda operations run in the TUI with live output. Upgrading packages inside an environment is done by hand (e.g. `conda activate vllm-next && pip install -U vllm`); the launcher picks up the new version automatically. For vLLM, a pip-bundled CUDA toolkit (`nvidia/cu13/`) is detected per environment and wired into `CUDA_HOME` / library paths at launch.
 
+Quantization tools normally run from their server's environments (llama.cpp tools from a llama.cpp build, EXL2 from tabbyAPI). The llm-compressor tools need an environment of their own, because llm-compressor pins transformers and compressed-tensors versions that would break vLLM. Register it in `user_data/environments.json` under `"llm-compressor"` (see `environments.json.example`). Create it with `conda create -n llm-compressor python=3.11`; the launcher offers to `pip install llmcompressor` the first time you pick one of its tools.
+
 ## Adding models
 
 Edit **`user_data/models_local.json`**. Each entry in the `"models"` array is a JSON object. See `models_local.json.example` for the full field schema and documentation.
@@ -241,6 +243,24 @@ Notable settings:
 - **MTP (llama.cpp / ooba GGUF)** — `auto` uses a sidecar `mtp-*.gguf` head; `on` also uses an embedded head (opt-in, as llama.cpp may not implement MTP for the architecture).
 - Prefix caching needs no setting: vLLM enables it by default.
 
+## Runtime quantization
+
+Full-precision models (BF16 / FP16 safetensors, PyTorch `.bin`) can be quantized by the server as it loads them. Servers that support it show a quantization picker after the environment step, with each option's estimated load size (green when it fits in total VRAM). The model list's note bar suggests options for models that don't fit at full precision.
+
+Every option a server supports is listed, whatever GPUs this machine has. Options that need a newer GPU show `⛔ sm_89+` (compute capability) in red, and the line under the table explains why. You can still pick them, for example when you'll select only newer cards in a mixed system.
+
+| Option | Servers | VRAM | GPU | Notes |
+|---|---|---|---|---|
+| FP8 per-tensor | vLLM | ~½ | any | Quantized layer by layer as it loads, so the BF16 model never has to fit. Below sm_89 (e.g. RTX 30xx) it runs as FP8 weights with 16-bit math (Marlin), still much faster than bitsandbytes |
+| FP8 per-tensor | SGLang | ~½ after load | sm_89+ | Loads full precision first, so it frees memory for KV cache but can't make a model fit |
+| FP8 block-wise / per-channel | vLLM | ~½ | sm_89+ | Real FP8 compute (RTX 40xx, H100, …) |
+| MXFP8 | vLLM | ~½ | sm_100+ | Blackwell |
+| INT8 / NVFP4, MoE experts only | vLLM (MoE models) | ~0.55 / ~0.35 | any / sm_100+ | Attention and shared layers stay BF16 |
+| INT8 (bitsandbytes) | text-generation-webui | ~½ | any | `--load-in-8bit` |
+| INT4 NF4 (bitsandbytes) | vLLM, SGLang, text-generation-webui | ~¼ | any | vLLM and SGLang can only quantize to 4-bit NF4 in flight |
+
+For a permanent smaller copy that loads faster, [convert the model](#converting-and-quantizing-models) with an llm-compressor tool instead.
+
 ## Navigation
 
 | Key | Action |
@@ -336,6 +356,7 @@ launcher/
   gpu_power.py         Per-GPU power limits — remembered choices + launch-command step
   scripts/
     gpu-power-limit    Applies power limits (sudo nvidia-smi -pl) only where they differ
+    llmc-quantize      llm-compressor data-free quantization (FP8 / INT8 / INT4 / FP4) wrapper
   config.py            Config loader — reads user_data/config.toml at import time
   config.toml.example  Documented template (copy to user_data/config.toml)
   user_data/           ← gitignored; machine-specific and personal data
@@ -375,8 +396,8 @@ Press `z` on any model in the model list to start a conversion or quantization j
 
 **Flow:**
 1. If more than one tool supports the model's format, pick a tool. Otherwise this step is skipped.
-2. If the tool's server has more than one registered environment, pick the one to run it from (the default is pre-selected; `e` manages environments). Use a newer llama.cpp build to convert architectures the default build does not support yet.
-3. Pick a target quant level (e.g. Q4_K_M for GGUF re-quantization, F16/BF16 for HF-to-GGUF conversion, or 4.0 bpw for EXL2).
+2. If the tool has more than one registered environment, pick the one to run it from (the default is pre-selected; `e` manages a server's environments). Use a newer llama.cpp build to convert architectures the default build does not support yet.
+3. Pick a target quant level (e.g. Q4_K_M for GGUF re-quantization, F16/BF16 for HF-to-GGUF conversion, 4.0 bpw for EXL2, or FP8_BLOCK / W4A16 for llm-compressor).
 4. Pick an output destination — one of the configured `[[locations]]`, with current free space shown (offline locations are disabled).
 5. For CUDA quantizers, choose the GPUs to expose to the tool. The list shows current VRAM usage; all available GPUs start selected. Use Space to toggle a GPU, `a` to select all, and Enter / `→` to continue. At least one GPU must be selected; if GPU polling is unavailable, return and retry after restoring it. CPU-only converters skip this step.
 6. Review the full command and output path, then confirm. For CUDA tools, the command includes `CUDA_VISIBLE_DEVICES`; Back returns to the GPU picker with your selection intact.
@@ -390,9 +411,17 @@ The TUI temporarily exits while the conversion runs in your terminal with live o
 | `llama-quantize` | GGUF → GGUF (re-quantize to a different quant level) | llama.cpp built binary — co-located with `llama-server` in the chosen llama.cpp environment. No extra install if llama.cpp is set up. | No (requires building llama.cpp with CUDA) |
 | `llama-hf-to-gguf` | BF16 / FP16 safetensors or PyTorch `.bin` → F16 / BF16 GGUF | `convert_hf_to_gguf.py` in the registered llama.cpp source tree and `llama_convert_python` with PyTorch, Transformers, and NumPy. Conversion runs on CPU; it does not need GPUs. Only architectures supported by that llama.cpp converter work; vision models are excluded because their separate projector is not converted by this workflow. | No |
 | `exl2-convert` | BF16 / FP16 / BIN safetensors → EXL2 | `exllamav2` Python package in the chosen tabbyAPI environment. Already present if tabbyAPI is set up. If missing, the launcher offers to `pip install exllamav2` automatically (uses JIT CUDA compilation — no CUDA toolkit needed at install time). | **Yes** — press Enter in the install prompt |
+| `llmc-fp8` | BF16 / FP16 safetensors → FP8: `FP8_BLOCK` (128×128 blocks, the DeepSeek/Qwen layout), `FP8_DYNAMIC` (per-channel), `MXFP8` / `MXFP8A16` (microscaling) | `llmcompressor` in the `llm-compressor` environment (see [Server environments](#server-environments)). | **Yes** |
+| `llmc-int` | BF16 / FP16 safetensors → compressed-tensors integer weights of 2–8 bits, weight-only (`W8A16` … `W2A16`, `W4A16_ASYM`) or with INT8 / INT4 / FP8 activations (`W8A8` … `W2A8`, `W4A4` … `W2A4`, `W4AFP8`), and FP4 (`NVFP4A16`, `MXFP4A16`, `MXFP4`) | Same as `llmc-fp8`. | **Yes** |
+
+The llm-compressor tools use no calibration data. They quantize the checkpoint file by file on the selected GPUs, one file per GPU at a time, without loading the whole model, so they work for any architecture and size (select fewer GPUs if host RAM runs short). Every format a server can load is offered, regardless of this machine's GPUs. Each option's label names the servers that load the result, and its GPU column shows what serving it needs: W4AFP8 needs Hopper (sm_90), the MX formats need Blackwell (sm_100). Those show ⛔ on older cards, but you can still convert them, e.g. for another machine. The converted model records the requirement, so the model list flags it (⛔) on GPUs that can't serve it.
+
+vLLM loads all of them; SGLang loads `FP8_DYNAMIC`, `W8A16`, `W8A8`, `W4A16`, `W4A8` and `W4A4`. On GPUs without FP8 compute (RTX 30xx), FP8 and FP4 run with 16-bit math. One upstream bug to watch: on those GPUs an `FP8_DYNAMIC` conversion of an **FP16** model generates garbage on vLLM unless its *dtype* setting is `bfloat16`; `FP8_BLOCK` doesn't have this problem. Integer schemes are plain round-to-nearest: 4-bit and up is usable (GPTQ / AWQ give better 4-bit quality), 3-bit is heavily degraded and 2-bit is unusable without calibration.
+
+Embeddings, the output head, MoE routers and vision/audio encoders stay in full precision, as does any layer whose shape the scheme cannot handle; the log lists those. Only the indexed safetensors shards and top-level config/tokenizer files are carried over, so extra `.bin` weights or `original/` folders don't bloat the output.
 
 ### Adding a quantization tool
 
-1. Add a `QuantizationTool(...)` entry to `QUANTIZATION_TOOLS` in `data.py`.
-2. Write `_build_<id>(tool, env, model, quant_option, output_path) → list[str]` in `launch.py` (`env` is the environment chosen for the tool's `env_server_id`).
+1. Add a `QuantizationTool(...)` entry to `QUANTIZATION_TOOLS` in `data.py` — including its `env_group` (a server id to share that server's environments, or a new group registered in `environments.json`), its `output_dir_template`, and its `quant_options` (`QuantOption(id, label, requires)` — set `requires=HardwareRequirement(min_sm, note)` when serving the output needs newer GPUs; never leave an option out just because this machine can't run it).
+2. Write `_build_<id>(tool, env, model, quant_option, output_path) → list[str]` in `launch.py` (`env` is the environment chosen from the tool's `env_group`).
 3. Register it in `_QUANT_BUILDERS`.

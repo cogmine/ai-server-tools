@@ -34,6 +34,7 @@ app.py                      Top-level App class, entry to screen stack
 gpu.py                      NVML polling via pynvml (shared with gpu_monitor)
 gpu_power.py                Per-GPU power limits — PowerLimitStore (per-card choices) + PowerLimitStep (launch-command step)
 scripts/gpu-power-limit     Idempotent applier: sudo nvidia-smi -pl only for GPUs whose limit differs
+scripts/llmc-quantize       llm-compressor model-free PTQ wrapper (runs in the llm-compressor env) — builds the ignore list
 ingest.py                   CLI tool — scans a directory for new models and appends entries to models_local.json
 user_data/                  Gitignored — all machine-specific and personal data
     chat_templates/           Patched chat templates, <model.id>.jinja (written at launch; regenerable)
@@ -117,7 +118,7 @@ Represents one deployable artefact (a specific file or directory). Key fields:
 | `reasoning_parser` | vLLM reasoning parser name (e.g. `"qwen3"`, `"deepseek_r1"`, `"glm45"`). When set, `_build_vllm` emits `--reasoning-parser <name>` and `_build_sglang` `--reasoning-parser <translated_name>` (via `_SGLANG_REASONING_PARSER_MAP`), so the model's thinking is returned separately as `reasoning_content`. Inherited by quantizations/conversions (`_DERIVED_FIELDS`). Omitted from JSON when empty; a `MODEL_FIELDS` entry. |
 | `disabled_template_patches` | frozenset of `ChatTemplatePatch.id`s the model opts out of; every other patch matching its chat template is applied at launch (see *Chat Template Patches*). Toggled on the model properties page via `save_template_patch_enabled()`. Omitted from JSON when empty. |
 | `family` | Shared by an original model and every copy, conversion and quantization of it (ingest assigns the slug of the model's name; `register_copy()` and `finalize_quantization()` carry it over). Groups related entries without a per-model link chain, so deleting an intermediate (e.g. an F16 GGUF used to make a Q8_0) loses nothing. |
-| `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"bnb_int8"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
+| `server_status` | `{server_id: {env_name: {quant_key: status}}}` — server id → registered environment name → `"none"` (full precision) or a `RuntimeQuant.value` (e.g. `"fp8"`, `"bnb_nf4"`) → `"good"` / `"bad"` / `"unknown"`. See *Server Status Persistence*. |
 | `server_params` | Per-server overrides merged on top of server defaults at launch time |
 
 Multiple `AIModel` entries for the same model family (BF16 / INT8 / Q8_0) are intentional — each format has different servers, VRAM footprint, and launch flags.
@@ -132,10 +133,11 @@ Describes an offline conversion/requantization tool.  Instance data lives in `da
 | `label` | Display label in the TUI picker |
 | `input_formats` | `frozenset[ModelFormat]` — formats this tool accepts as input |
 | `output_format` | `ModelFormat` — the format it produces |
-| `quant_options` | `tuple[str, ...]` — ordered option identifiers shown in the quant picker |
-| `quant_option_labels` | `dict[str, str]` — human-readable label per option |
+| `quant_options` | `tuple[QuantOption, ...]` — what the tool can produce, in picker order: `id` (the value passed to the tool — GGUF type, bpw, scheme), `label`, and `requires` (`HardwareRequirement` needed to *serve* the output; see *Hardware requirements*). `option(id)` looks one up |
+| `output_dir_template` | Output directory name — `{stem}` (source directory name, or a GGUF source's stem without its quant suffix) and `{option}`; default `"{stem}-{option}"` (GGUF tools `"{stem}-GGUF-{option}"`, EXL2 `"{stem}-exl2-{option}bpw"`) |
+| `quant_label_template` | The generated entry's `quant` field — `{option}`; default `"{option}"` (EXL2 `"{option} bpw"`) |
 | `cuda_home` | `CUDA_HOME` override injected at run time (non-empty to set) |
-| `env_server_id` | Server whose **environments** can run the tool (`"llamacpp"` → llama-quantize binary; `"tabby"` → exllamav2 Python); chosen per job, default pre-selected |
+| `env_group` | Environment-registry key whose **environments** can run the tool: a server id, sharing that server's environments (`"llamacpp"` → llama-quantize binary; `"tabby"` → exllamav2 Python), or a tool-specific group (`"llm-compressor"` — its pinned dependencies conflict with every server env); chosen per job, default pre-selected |
 | `avail_executable` | Executable that must exist in that environment's bin dir |
 | `avail_module` | Python module that must be importable in that environment |
 | `pip_package` | Package `pip install`ed into that environment by the auto-install prompt; `""` = not auto-installable |
@@ -170,31 +172,35 @@ Launch-time process setup is encoded as fields on `ServerSoftware` (set in `data
 | `max_gpus` | `int` | Maximum GPUs selectable in `GpuSelectScreen`: `0` = unlimited (all GPUs, multi-select); `1` = single GPU only (radio-button) |
 | `gpu_count_param` | `str \| None` | When set, `GpuSelectScreen` injects `{gpu_count_param: selected_count}` as a `param_overrides` entry so parallelism flags (e.g. `pipeline_parallel` for vLLM/SGLang) stay consistent with the selected GPU count. `None` for servers that handle variable GPU counts automatically (tabbyAPI `--gpu-split-auto`, llama.cpp layer distribution) |
 | `concurrency_param` | `str \| None` | Param key holding the number of concurrently processed requests (llama.cpp: `"parallel"` slots). When set, `GpuSelectScreen` adjusts it with `+`/`-`, injects it into `param_overrides`, and remembers the launched value per model (`save_server_param`). The catalog `ctx` stays the per-request context; each builder translates (llama.cpp multiplies `--ctx-size` by the slot count) |
+| `quantizable_formats` | `frozenset[ModelFormat]` | Formats this server can quantize at load time (full precision: BF16 / FP16 / BIN) |
+| `runtime_quants` | `tuple[RuntimeQuantOption, ...]` | Runtime quant modes offered for `quantizable_formats`, in picker order — see *Runtime quantization*. `runtime_quant_options(model)` lists those applying to a model, `runtime_quant_option(quant)` looks one up, `runtime_quant_args(quant)` returns its flags (builders append them) |
 
 Defined once per server type in `data.py`. The `params` specs establish baseline launch parameters; per-model `server_params` only specify deltas.
 
-### Launch Parameters (`params.py`)
+### Hardware requirements
 
-Each server parameter is a `ParamSpec` — the single source of truth for its default, help text, how a value is shown and edited, which models it applies to and (for auto parameters) how it is resolved. Kinds are classes, so the properties page and launch resolution never branch on a parameter's type:
+Options are offered by what the software supports, never filtered by the local GPUs: the tools are shared across machines, a system may mix GPU generations, and an offline conversion may target another machine. `HardwareRequirement(min_sm, note)` (`models.py`) records what an option needs — `min_sm` is the lowest compute capability with a path expected to work, `note` why. Where an option could not be tested here, `min_sm` comes from the server's own kernel checks; `met_by(system_sm)` / `summary` feed the UI. `sm_supported(min_sm, system_sm)` is the single comparison, shared with `AIModel.hw_compat()` (unknown = 0 never flags).
 
-| Kind | Values | Edited by |
-|---|---|---|
-| `BoolParam` | `False` / `True` | picker (Space toggles) |
-| `AutoBoolParam` | `None` (auto) / `True` / `False` — auto is resolved per launch by its `resolve(model, merged_params) → (value, reason)` | picker (Space cycles) |
-| `ChoiceParam` | one of `choices`; `labels` names special values (e.g. `""` → "auto") | picker (Space cycles) |
-| `IntParam` / `FloatParam` | numbers within `minimum`/`maximum`; `IntParam` optionally allows `None` (`none_label`) and keywords such as `"auto"` | text prompt with validation |
-| `TextParam` | free text (`empty_label` names the blank value) | text prompt |
-| `FlagsParam` | a list of extra command-line arguments | text prompt (shell syntax) |
+The pickers (`QuantSelectScreen`, `QuantizeOptionScreen`) list every option with a GPU column (`sm_89+`, or `⛔ sm_89+` in red when `system_min_sm()` falls short) and a detail line (`#option-detail`) with the focused option's notes and requirement. Unmet options stay selectable with a warning toast. `finalize_quantization()` stores an output's requirement on its catalog entry (`min_sm`, `hw_note`), so the model list flags it on GPUs that cannot serve it.
 
-Common fields: `hidden` (internal plumbing such as staging directories — never shown per model), `managed_by` (set elsewhere in the flow, e.g. TP/PP "set from the GPU selection" — shown read-only), `applies_to(model)` (e.g. MoE-only or MTP-only parameters). `default_value()` returns a fresh, comparable copy (lists for `FlagsParam`).
+### Runtime quantization (`RuntimeQuant`)
 
-**Auto resolution**: `launch_params()` merges defaults, the model's `server_params` and `param_overrides`, then replaces every auto parameter still `None` with its resolved value — builders, the fit probe and the GPU screen only ever see booleans. `auto_param_states(server, model, overrides)` returns `(spec, value, reason)` for display (the GPU screen shows auto parameters that resolve on, e.g. `expert parallel: on (auto)`).
+Quantization applied by the server while loading a full-precision checkpoint, picked on `QuantSelectScreen`. `RuntimeQuant` members are the modes (and status keys); each has a label, short label and approximate VRAM ratio (`.label` / `.short` / `.vram_ratio`, one `_RuntimeQuantInfo` per member). A server offers a mode as a `RuntimeQuantOption`: `flags`, `requires` (`HardwareRequirement`), `note`, `applies_to` (e.g. MoE-only) and `full_precision_load` (the server materializes BF16 weights before quantizing, so loading needs the unquantized footprint). `load_gb(size)` estimates the footprint for the picker's *Load* column and `AIModel.vram_fit_hints(total, servers, system_sm)`, which only suggests options this system can run.
 
-Current auto parameters:
-- vLLM `expert_parallel` → `hf_config.expert_parallel_needed(model, tp)`: on when the expert width (`moe_intermediate_size`) does not divide by TP, or a TP shard does not align to the checkpoint's `weight_block_size` (Qwen3.8-Flash-Next FP8: 640 / 8 = 80 vs 128). Off at TP=1 (no effect there) and for dense models.
-- llama.cpp / ooba `mtp` → on only for a sidecar `mtp_path` head; an embedded head needs an explicit on.
+| Mode | vLLM | SGLang | ooba (Transformers) |
+|---|---|---|---|
+| `FP8_BLOCK` (~0.5×) | `--quantization fp8_per_block` · sm_89+ | — | — |
+| `FP8_CHANNEL` (~0.5×) | `--quantization fp8_per_channel` · sm_89+ | — | — |
+| `FP8` (~0.5×) | `--quantization fp8` · any (weight-only Marlin below sm_89) | `--quantization fp8` · sm_89+, full-precision load | — |
+| `MXFP8` (~0.53×) | `--quantization mxfp8` · sm_100+ | — | — |
+| `BNB_INT8` (~0.5×) | — | — | `--load-in-8bit` |
+| `INT8_EXPERTS` (~0.55×, MoE only) | `--quantization int8_per_channel_weight_only` · any | — | — |
+| `NVFP4_EXPERTS` (~0.35×, MoE only) | `--quantization nvfp4_per_token` · sm_100+ | — | — |
+| `BNB_NF4` (~0.25×) | `--quantization bitsandbytes --load-format bitsandbytes` | same | `--load-in-4bit` |
 
-`MODEL_FIELDS` (`models.py`) reuses the same kinds for the simple user-editable `AIModel` fields (`tool_call_parser`, `reasoning_parser`, `trust_remote_code`, `note`), persisted with `save_model_field()`.
+- **Verified on sm_86** (vLLM 0.26 / SGLang 0.5.9): vLLM `FP8` (dense and MoE), `INT8_EXPERTS` (Qwen3.6-35B-A3B), bitsandbytes. The rest failed there exactly as their requirement predicts — `fp8_per_block` and SGLang's online FP8 hit Triton's missing `fp8e4nv` type, `fp8_per_channel` needs SM89 per-token FP8 kernels, `mxfp8` the Marlin fallback's group-32 thread-config error, `nvfp4_per_token` is Blackwell-only by vLLM's own check.
+- **vLLM** quantizes each layer as its BF16 weights load (meta-device materialization), so it never needs the full BF16 footprint. `INT8_EXPERTS` / `NVFP4_EXPERTS` leave attention and shared layers in BF16.
+- **vLLM / SGLang bitsandbytes** is always 4-bit NF4 for unquantized checkpoints (their loaders call `quantize_4bit`; 8-bit only loads pre-quantized checkpoints), hence `BNB_NF4`.
 
 ---
 
@@ -219,7 +225,7 @@ Common interface: `exists()`, `bin_dir`, `executable(name)`, `python`, `find_pac
                   "llamacpp": [{"kind": "native", "name": "llama.cpp", "bin_dir": "~/llama.cpp/build/bin", "default": true}]}}
 ```
 
-Keyed by `ServerSoftware.id`. Names follow conda's rule (`[A-Za-z0-9_.-]+`) and are unique per server. `default_for(server_id)` returns the entry flagged `default` (else the first) — used to pre-focus the picker and to run quantization tools. Every mutation (`add`, `remove`, `rename`, `set_default`, `set_note`) persists immediately. One conda env may be registered for several servers; `sharing(env)` finds those entries so a rename updates them all and a delete is refused while others still use it.
+Keyed by `ServerSoftware.id`, or by a quantization tool's `env_group` when the tool needs an environment of its own (`"llm-compressor"`; such groups have no `EnvManageScreen` — register them in the JSON). Names follow conda's rule (`[A-Za-z0-9_.-]+`) and are unique per server. `default_for(server_id)` returns the entry flagged `default` (else the first) — used to pre-focus the picker and to run quantization tools. Every mutation (`add`, `remove`, `rename`, `set_default`, `set_note`) persists immediately. One conda env may be registered for several servers; `sharing(env)` finds those entries so a rename updates them all and a delete is refused while others still use it.
 
 **Launch resolution** — builders take the chosen environment: `str(env.python)` for Python servers, `env.executable("llama-server")` for llama.cpp. Environment-dependent setup (bundled CUDA toolkit, `lib_symlinks`) is resolved per environment at launch, so a second vLLM env with a different cu13 toolkit works without configuration.
 
@@ -232,7 +238,8 @@ Keyed by `ServerSoftware.id`. Names follow conda's rule (`[A-Za-z0-9_.-]+`) and 
 | `GGUF` | `"gguf"` | llamacpp, ooba, sglang |
 | `SAFETENSORS_BF16` | `"safetensors_bf16"` | vllm, tabby, ooba, sglang, comfyui |
 | `SAFETENSORS_FP16` | `"safetensors_fp16"` | vllm, tabby, ooba, sglang, comfyui |
-| `SAFETENSORS_FP8` | `"safetensors_fp8"` | vllm, ooba, sglang, comfyui |
+| `SAFETENSORS_FP8` | `"safetensors_fp8"` | vllm, sglang, comfyui |
+| `COMPRESSED_TENSORS` | `"compressed_tensors"` | vllm, sglang — llm-compressor integer / FP4 weight schemes (`quant` = scheme, e.g. `W4A16`); FP8 compressed-tensors checkpoints are `SAFETENSORS_FP8` |
 | `AWQ` | `"awq"` | vllm, ooba, sglang |
 | `GPTQ` | `"gptq"` | vllm, tabby, ooba, sglang |
 | `INT8_BNB` | `"int8_bnb"` | vllm, ooba, sglang |
@@ -484,10 +491,29 @@ Initial tools:
 | `llama-quantize` | `GGUF` | `GGUF` | `llama-quantize` in the default `llamacpp` environment (built alongside `llama-server`) |
 | `llama-hf-to-gguf` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `GGUF` (`F16` or `BF16`) | `convert_hf_to_gguf.py` in the registered llama.cpp source tree; Python interpreter configured by `llama_convert_python` |
 | `exl2-convert` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16`, `PYTORCH_BIN` | `EXL2` | default `tabby` environment's Python: `CONFIG.exl2_convert_script` or `-m exllamav2.conversion.convert_exl2` |
+| `llmc-fp8` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16` | `SAFETENSORS_FP8` (`FP8_BLOCK`, `FP8_DYNAMIC`, `MXFP8`, `MXFP8A16`) | `scripts/llmc-quantize` run by the `llm-compressor` environment's Python (`llmcompressor` package; auto-installable) |
+| `llmc-int` | `SAFETENSORS_BF16`, `SAFETENSORS_FP16` | `COMPRESSED_TENSORS` (`W{2–8}A16`, `W{2–8}A8`, `W{2–4}A4`, `W4A16_ASYM`, `W4AFP8`, `NVFP4A16`, `MXFP4A16`, `MXFP4`) | same |
 
-Tools run from one of their `env_server_id`'s registered environments (`quant_tool_envs(tool)`), chosen on `QuantizeEnvScreen` and passed through the flow to `quant_tool_available(tool, env)`, `install_quant_tool(tool, env)`, `build_quantize_cmd(tool, env, …)` and `quantize(tool, env, …)`; builders take `(tool, env, model, quant_option, output_path)`. This lets a newer build (e.g. `llama.cpp-next-patched`) convert architectures the default build lacks. A tool may use a separate configured Python interpreter and declare the modules needed to run its script. Availability is cached per tool, environment location, and interpreter.
+Tools run from one of their `env_group`'s registered environments (`quant_tool_envs(tool)`), chosen on `QuantizeEnvScreen` and passed through the flow to `quant_tool_available(tool, env)`, `install_quant_tool(tool, env)`, `build_quantize_cmd(tool, env, …)` and `quantize(tool, env, …)`; builders take `(tool, env, model, quant_option, output_path)`. This lets a newer build (e.g. `llama.cpp-next-patched`) convert architectures the default build lacks. A tool may use a separate configured Python interpreter and declare the modules needed to run its script. Availability is cached per tool, environment location, and interpreter.
 
-Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matching `_build_<id>` builder in `launch.py` registered in `_QUANT_BUILDERS`.
+Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matching `_build_<id>` builder in `launch.py` registered in `_QUANT_BUILDERS` (several tools may share a builder).
+
+### llm-compressor tools (`llmc-fp8`, `llmc-int`)
+
+Both are built by `_llmc_tool()` in `data.py` and share `_build_llmc_quantize`; they differ only in output format and options (compressed-tensors preset scheme names). The split exists because a tool has one `output_format`: FP8 schemes produce `SAFETENSORS_FP8`, integer / FP4 schemes `COMPRESSED_TENSORS`. Every **data-free** preset some server can load is offered — weight-only, or with dynamic activation scales. Presets with static activation scales (`FP8`, `NVFP4`) need calibration data, which `model_free_ptq` cannot do. Server support differs per scheme, so each label names the servers that load it; `requires` holds what serving needs. All were converted (Llama-2-7B FP16) and served on sm_86 with vLLM 0.26 and SGLang 0.5.9:
+
+| Scheme | vLLM | SGLang | `requires` |
+|---|---|---|---|
+| `FP8_BLOCK`, `W8A16`…`W2A16`, `W8A8`…`W2A8`, `W4A4`…`W2A4`, `W4A16_ASYM`, `NVFP4A16` | ✓ | `W8A16`, `W8A8`, `W4A16`, `W4A8`, `W4A4` only | — |
+| `FP8_DYNAMIC` | ✓ — below sm_89 an FP16 model under `dtype auto` generates garbage (per-channel FP8 Marlin + FP16 bug); set `dtype bfloat16` | ✓ | — (note) |
+| `W4AFP8` | ✗ here — vLLM's W4A8-FP8 kernel matches sm_90 exactly | — | sm_90+ |
+| `MXFP8`, `MXFP8A16`, `MXFP4`, `MXFP4A16` | ✗ here — the Marlin fallback rejects group size 32; native MX kernels need Blackwell | — | sm_100+ |
+
+Weight-only schemes run through Marlin / Humming kernels; `W8A8` uses INT8 tensor cores. Integer weights are round-to-nearest: 4-bit and up are usable, 3-bit is heavily degraded and 2-bit produces gibberish without calibration (they are offered because servers load them).
+
+`scripts/llmc-quantize` calls llm-compressor's `model_free_ptq`, which streams the safetensors shards through the selected GPUs (one worker per visible GPU) without instantiating the model (any architecture, any size; host RAM ≈ one shard per worker). It writes a compressed-tensors `quantization_config` into `config.json`. `model_free_ptq` converts every `*.safetensors` file under its source and copies everything else recursively (legacy `.bin` weights, `original/` folders, …), aborting on safetensors files missing from the index (Mistral's `consolidated.safetensors`), so the wrapper points it at a temporary staging directory of symlinks: the indexed shards plus top-level non-weight files. compressed-tensors stores sub-8-bit integer weights unpacked (`int-quantized`) whenever activations are quantized too, which vLLM cannot load, so the wrapper sets `pack-quantized` for them and passes the scheme as a `QuantizationConfig` group named after the preset (ingest records it as `quant`). It also targets every `<module>.weight` except names ending in `norm` and aborts on a shape the scheme cannot handle, so the wrapper derives the ignore list from the safetensors headers first: role-based patterns (embeddings, `lm_head`, MoE routers / shared-expert gates, vision and audio towers) plus every module whose weight the scheme's own validator rejects on a meta tensor (non-2D, or not divisible by the group / block size); fused siblings (q/k/v, gate/up) are then ignored together because vLLM loads them as one layer.
+
+llm-compressor pins transformers and compressed-tensors versions that conflict with the server envs, so it lives in its own conda env registered under the `llm-compressor` group (`environments.json`). `hf_config.read_parallelism_fields` reads `FP8_BLOCK`'s `block_structure` like native FP8's `weight_block_size`, so expert-parallel auto-resolution works for its MoE outputs.
 
 ### Output path convention
 
@@ -501,7 +527,10 @@ Adding a new tool: add a `QuantizationTool(...)` entry in `data.py` and a matchi
   — `source_dirname` is `Path(model.path).name`.
   Example: `<dest>/text-generation/MyModel-exl2-4.0bpw/`
 
-The output directory is shown to the user in `ConfirmQuantize` before they confirm.
+- **llm-compressor**: `<dest.root>/<model.type_subdir>/<source_dirname>-<scheme>/`
+  Example: `<dest>/text-generation/MyModel-FP8_DYNAMIC/`
+
+Each layout is the tool's `output_dir_template`, so a new tool declares its own without touching `compute_quant_output_path()`. The output directory is shown to the user in `ConfirmQuantize` before they confirm.
 
 ### `quantize()` function
 
@@ -510,7 +539,7 @@ Follows the same PTY + log structure as `launch()`:
 - Output directory created before spawn
 - `build_quantize_cmd(tool, env, model, quant_option, dest, cuda_devices=None)` includes an explicit `env CUDA_VISIBLE_DEVICES=…` prefix and `CUDA_HOME` from `tool.cuda_home` when non-empty. The picker passes its selected devices through confirmation to `quantize()`; non-TUI callers default to `CONFIG.resolved_cuda_devices`. Preview, log, and execution use the same builder.
 - Same PTY window-size stamping and bash wrapper
-- On exit code 0, `finalize_quantization()` copies the source's config/tokenizer files (from `ingest.model_metadata_dir()` — the HF directory itself, or the directory beside / one level above a GGUF) into the output, removes EXL2 work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), resolves the first shard of GGUF outputs, and registers the generated model through `ingest_model()`. The entry overrides start from `AIModel.derived_entry_fields()` — model-intrinsic facts and behaviour settings (`_DERIVED_FIELDS` in `models.py` plus `rope_scaling` and `disabled_template_patches`) — so values ingest cannot re-detect (e.g. a GGUF source without `config.json`) or that the user curated survive. Format-, size- and launch-specific fields (note, favorite, status, server params, ctx override, hardware requirements) are not inherited.
+- On exit code 0, `finalize_quantization()` copies the source's config/tokenizer files (from `ingest.model_metadata_dir()` — the HF directory itself, or the directory beside / one level above a GGUF) into the output when missing (the generated `config.json` is kept), removes EXL2 work artifacts (`out_tensor`, calibration/hidden tensors, and job/measurement state), resolves the first shard of GGUF outputs, and registers the generated model through `ingest_model()`. The entry overrides start from `AIModel.derived_entry_fields()` — model-intrinsic facts and behaviour settings (`_DERIVED_FIELDS` in `models.py` plus `rope_scaling` and `disabled_template_patches`) — so values ingest cannot re-detect (e.g. a GGUF source without `config.json`) or that the user curated survive. Format-, size- and launch-specific fields (note, favorite, status, server params, ctx override, hardware requirements) are not inherited.
 - The launcher then reopens with the generated model focused; failed or interrupted outputs remain on disk for inspection/resume but are not registered
 
 ### `exl2_convert_script` config field
@@ -596,12 +625,12 @@ This is fully driven by catalog entries. Adding a model to the catalog (via `ing
 
 Statuses are stored as a nested dict: `server_status[server_id][env_name][quant_key] = status`.
 
-`env_name` is a registered `Environment.name` for that server — results are per environment because a model may work on one install (e.g. `vllm-next`) and fail on another. `quant_key` is `"none"` (full/stored precision — no additional quantization) or a `RuntimeQuant.value` string (e.g. `"bnb_int8"`). The helper `_quant_key(quant)` in `models.py` handles the conversion. Several quant keys may be `"good"` at once.
+`env_name` is a registered `Environment.name` for that server — results are per environment because a model may work on one install (e.g. `vllm-next`) and fail on another. `quant_key` is `"none"` (full/stored precision — no additional quantization) or a `RuntimeQuant.value` string (e.g. `"fp8"`, `"bnb_nf4"`). The helper `_quant_key(quant)` in `models.py` handles the conversion. Several quant keys may be `"good"` at once.
 
 **Lookups** (`AIModel`): `status_for(server_id, env_name, quant)` for one combo; `env_best_status(server_id, env_name)` across quants (EnvSelectScreen dots); `best_status_for(server_id)` across environments and quants (ServerSelectScreen dots, composite model-list status). All collapse with priority good > bad > unknown.
 
 **Where marks are set** — always on the deepest selection screen for that launch, so a mark is never ambiguous:
-- `ServerSelectScreen` (`g` / `x` / `?`) — only when the server has exactly one environment and `available_runtime_quants(model.format)` is empty. Calls `save_server_status(model, server_id, env_name, status, quant=None)`.
+- `ServerSelectScreen` (`g` / `x` / `?`) — only when the server has exactly one environment and `runtime_quant_options(model)` is empty. Calls `save_server_status(model, server_id, env_name, status, quant=None)`.
 - `EnvSelectScreen` (`g` / `x` / `?`) — servers with several environments and no runtime quants for this model; marks the focused environment.
 - `QuantSelectScreen` (`g` / `x` / `?`) — quant-capable servers; marks the focused quant/precision option for the chosen environment.
   Shallower screens disable `g`/`x`/`?` in those cases (the bindings return `False` from `check_action`).
@@ -788,7 +817,8 @@ Directories with no `config.json` and no weight files are skipped.
 
 Reads `config.json`:
 
-- **`format`**: `quantization_config.quant_type` first (gptq / awq / exl2 / int8_bnb), then `quant_method` (fp8, bitsandbytes, modelopt), then `torch_dtype` for bf16/fp16/fp8, then file-type presence for pytorch_bin. Legacy GPTQ files detected by `4bit`/`8bit`/`gptq` patterns in safetensors filenames.
+- **`format`**: `quantization_config.quant_type` first (gptq / awq / exl2 / int8_bnb), then `quant_method` (fp8, bitsandbytes, modelopt; `compressed-tensors` → `safetensors_fp8` when every config group's weights are 8-bit float, else `compressed_tensors`), then `torch_dtype` for bf16/fp16/fp8, then file-type presence for pytorch_bin. Legacy GPTQ files detected by `4bit`/`8bit`/`gptq` patterns in safetensors filenames.
+- **`quant`** (compressed-tensors only): the single config group's name when it is a preset scheme (llm-compressor names the group after it, e.g. `W4A16`); generic `group_N` names are ignored.
 - **`ctx`**: first of `max_position_embeddings`, `max_seq_len`, `seq_length`, `context_length`, `n_positions`; `model_max_length` preferred when strictly larger (covers RoPE-extended models). Falls back to `text_config` for multimodal models.
 - **`params_m`**: from `num_parameters` in `config.json`, or regex extraction from directory name.
 - **`arch`**: from `architectures[0]` in `config.json`.

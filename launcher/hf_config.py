@@ -16,6 +16,15 @@ if TYPE_CHECKING:
     from launcher.models import AIModel
 
 
+def _compressed_tensors_block(quant: dict[str, Any]) -> list[int]:
+    """Weight block shape of a compressed-tensors block scheme (e.g. FP8_BLOCK [128, 128])."""
+    for group in (quant.get("config_groups") or {}).values():
+        block = (group.get("weights") or {}).get("block_structure")
+        if block:
+            return list(block)
+    return []
+
+
 @functools.lru_cache(maxsize=64)
 def read_parallelism_fields(model_path: str) -> dict[str, Any] | None:
     """Read parallelism-relevant fields from a model's HF config.json.
@@ -40,7 +49,7 @@ def read_parallelism_fields(model_path: str) -> dict[str, Any] | None:
         return None
     architectures = raw.get("architectures", [])
     quant = raw.get("quantization_config") or text.get("quantization_config") or {}
-    block = quant.get("weight_block_size") or []
+    block = quant.get("weight_block_size") or _compressed_tensors_block(quant)
     return {
         "num_attention_heads":    n_heads,
         "num_key_value_heads":    field("num_key_value_heads", n_heads),

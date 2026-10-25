@@ -55,7 +55,7 @@ class QuantizeCommandTests(unittest.TestCase):
                 model = model_for(next(iter(tool.input_formats)))
                 with self.subTest(tool=tool.id):
                     cmd, _ = launch.build_quantize_cmd(
-                        tool, env, model, tool.quant_options[0], dest, "2,7",
+                        tool, env, model, tool.quant_options[0].id, dest, "2,7",
                     )
                     if tool.uses_cuda:
                         self.assertEqual(cmd[:3], [
@@ -64,7 +64,7 @@ class QuantizeCommandTests(unittest.TestCase):
                     else:
                         self.assertEqual(cmd, ["quant-tool"])
                     cmd, _ = launch.build_quantize_cmd(
-                        tool, env, model, tool.quant_options[0], dest,
+                        tool, env, model, tool.quant_options[0].id, dest,
                     )
                     if tool.uses_cuda:
                         self.assertEqual(

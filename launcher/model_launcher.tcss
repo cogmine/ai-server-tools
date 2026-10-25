@@ -114,6 +114,16 @@ ModelPropertiesScreen > .props--section {
     color: $text-muted;
 }
 
+/* Detail line under option pickers (runtime / offline quantization). */
+#option-detail {
+    height: auto;
+    min-height: 1;
+    margin: 0 1;
+    padding: 0 1;
+    background: $panel;
+    color: $text-muted;
+}
+
 /* ── Dialogs: choice / command run ───────────────────────────────────────── */
 #choice-message {
     margin: 0 1 1 1;

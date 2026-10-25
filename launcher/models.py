@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 import re
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 from launcher.config import CONFIG
 from launcher.params import AutoBoolParam, BoolParam, ParamSpec, TextParam
@@ -62,6 +62,9 @@ class ModelFormat(str, Enum):
     SAFETENSORS_BF16 = "safetensors_bf16" # HF Transformers BF16 safetensors — vLLM, tabbyAPI
     SAFETENSORS_FP16 = "safetensors_fp16" # HF Transformers FP16 safetensors — vLLM, tabbyAPI
     SAFETENSORS_FP8  = "safetensors_fp8"  # FP8 safetensors — vLLM only (dequants on sm_86)
+    # llm-compressor compressed-tensors checkpoint with integer / FP4 weights
+    # (W8A16, W8A8, W4A16, NVFP4A16, …); FP8 compressed-tensors is SAFETENSORS_FP8.
+    COMPRESSED_TENSORS = "compressed_tensors"
     AWQ              = "awq"              # Activation-Aware Weight Quant (int4) — vLLM, sglang, ooba
     GPTQ             = "gptq"             # GPTQ quantised safetensors — vLLM, tabbyAPI, ooba
     INT8_BNB         = "int8_bnb"         # bitsandbytes INT8 pre-saved checkpoint — vLLM only
@@ -172,37 +175,117 @@ def gguf_shard_paths(gguf_path: Path) -> list[Path]:
     ]
 
 
+def sm_supported(min_sm: int, system_sm: int) -> bool:
+    """True unless both are known and the system's compute capability is below min_sm.
+
+    min_sm / system_sm are compute capabilities as ints (86 = sm_8.6); 0 = unknown
+    / no constraint.  With mixed GPUs, system_sm is the lowest card's.
+    """
+    return min_sm == 0 or system_sm == 0 or system_sm >= min_sm
+
+
+@dataclass(frozen=True)
+class HardwareRequirement:
+    """GPU capability something needs: a quant option to run, or its output to load.
+
+    Options stay offered on any hardware — they may target another machine — and
+    the UI flags them (⛔) where the requirement is not met.  min_sm is the lowest
+    compute capability with a path expected to work (taken from the server's own
+    kernel checks where it could not be tested); note says why.
+    """
+    min_sm: int = 0
+    note: str = ""
+
+    def met_by(self, system_sm: int) -> bool:
+        return sm_supported(self.min_sm, system_sm)
+
+    @property
+    def summary(self) -> str:
+        """e.g. 'needs sm_89+ — FP8 activations need FP8 tensor cores' ('' = no requirement)."""
+        need = f"needs sm_{self.min_sm}+" if self.min_sm else ""
+        return " — ".join(p for p in (need, self.note) if p)
+
+
+ANY_GPU = HardwareRequirement()
+
+
 class RuntimeQuant(str, Enum):
     """Runtime quantization mode applied by a server at model-load time.
 
-    Only applicable to full-precision formats (BF16/FP16/BIN). Each
-    ServerSoftware advertises which modes it supports via
-    `supported_runtime_quants` and which input formats qualify via
-    `quantizable_formats`.
+    Only applicable to full-precision formats (BF16/FP16/BIN).  Each
+    ServerSoftware lists the modes it offers as RuntimeQuantOptions (flags,
+    hardware requirement, applicability) and declares which input formats
+    qualify via `quantizable_formats`.  The value is the status key.
+    Declaration order = best quality first.
     """
-    BNB_INT8 = "bnb_int8"  # bitsandbytes 8-bit (INT8)  — ~half VRAM of BF16/FP16
-    BNB_NF4  = "bnb_nf4"   # bitsandbytes 4-bit NF4      — ~quarter VRAM of BF16/FP16
+    FP8_BLOCK     = "fp8_block"      # FP8 weights, 128×128 block scales
+    FP8_CHANNEL   = "fp8_channel"    # FP8 weights per-channel + FP8 activations per-token
+    FP8           = "fp8"            # FP8 weights, per-tensor scale
+    MXFP8         = "mxfp8"          # microscaling FP8 (block-32 scales)
+    BNB_INT8      = "bnb_int8"       # bitsandbytes 8-bit (INT8)
+    INT8_EXPERTS  = "int8_experts"   # INT8 weight-only, MoE experts only
+    NVFP4_EXPERTS = "nvfp4_experts"  # NVFP4, MoE experts only
+    BNB_NF4       = "bnb_nf4"        # bitsandbytes 4-bit NF4
+
+    @property
+    def label(self) -> str:
+        """Display label (quant picker, notifications)."""
+        return _RUNTIME_QUANT_INFO[self].label
+
+    @property
+    def short(self) -> str:
+        """Compact label (note-bar fit hints)."""
+        return _RUNTIME_QUANT_INFO[self].short
+
+    @property
+    def vram_ratio(self) -> float:
+        """Approximate weight VRAM relative to the stored BF16/FP16 size."""
+        return _RUNTIME_QUANT_INFO[self].vram_ratio
 
 
-# Human-readable display label for each runtime quant option.
-RUNTIME_QUANT_LABEL: dict[RuntimeQuant, str] = {
-    RuntimeQuant.BNB_INT8: "INT8 (bitsandbytes)",
-    RuntimeQuant.BNB_NF4:  "INT4 NF4 (bitsandbytes)",
+@dataclass(frozen=True)
+class _RuntimeQuantInfo:
+    label: str
+    short: str
+    # Weight-only estimate used for "would fit" hints; KV cache and activations
+    # add ~5–15% on top.  Experts-only modes assume experts are ~90% of a MoE.
+    vram_ratio: float
+
+
+_RUNTIME_QUANT_INFO: dict[RuntimeQuant, _RuntimeQuantInfo] = {
+    RuntimeQuant.FP8_BLOCK:     _RuntimeQuantInfo("FP8 block-wise (128×128 weight scales)", "FP8", 0.50),
+    RuntimeQuant.FP8_CHANNEL:   _RuntimeQuantInfo(
+        "FP8 per-channel weights + per-token FP8 activations", "FP8", 0.50),
+    RuntimeQuant.FP8:           _RuntimeQuantInfo("FP8 per-tensor", "FP8", 0.50),
+    RuntimeQuant.MXFP8:         _RuntimeQuantInfo("MXFP8 (microscaling, 32-wide blocks)", "MXFP8", 0.53),
+    RuntimeQuant.BNB_INT8:      _RuntimeQuantInfo("INT8 (bitsandbytes)", "INT8", 0.50),
+    RuntimeQuant.INT8_EXPERTS:  _RuntimeQuantInfo(
+        "INT8 weight-only — MoE experts only (rest stays BF16)", "INT8 experts", 0.55),
+    RuntimeQuant.NVFP4_EXPERTS: _RuntimeQuantInfo(
+        "NVFP4 — MoE experts only (rest stays BF16)", "NVFP4 experts", 0.35),
+    RuntimeQuant.BNB_NF4:       _RuntimeQuantInfo(
+        "INT4 NF4 (bitsandbytes)", "NF4", 0.25),  # ~0.5 bytes/param (4-bit + double-quant)
 }
 
-# Short label for compact display contexts (note bar hints, etc.).
-RUNTIME_QUANT_SHORT: dict[RuntimeQuant, str] = {
-    RuntimeQuant.BNB_INT8: "INT8",
-    RuntimeQuant.BNB_NF4:  "NF4",
-}
 
-# Approximate VRAM multiplier relative to stored (BF16/FP16) size for each
-# runtime quant mode.  Used for "would fit" hints in the model list.
-# These are weight-only estimates; KV cache and activations add ~5–15% overhead.
-RUNTIME_QUANT_VRAM_RATIO: dict[RuntimeQuant, float] = {
-    RuntimeQuant.BNB_INT8: 0.50,   # INT8: ~1 byte/param vs 2 bytes for BF16
-    RuntimeQuant.BNB_NF4:  0.25,   # NF4:  ~0.5 bytes/param (4-bit + double-quant)
-}
+@dataclass(frozen=True)
+class RuntimeQuantOption:
+    """One runtime quant mode as a particular server offers it.
+
+    full_precision_load: the server materializes the full-precision weights
+    before quantizing them (SGLang), so loading needs the unquantized footprint —
+    the quantization only frees memory afterwards (for KV cache).
+    """
+    quant: RuntimeQuant
+    flags: tuple[str, ...]
+    requires: HardwareRequirement = ANY_GPU
+    note: str = ""                                     # caveat shown in the picker
+    applies_to: "Callable[[AIModel], bool] | None" = None  # None = every quantizable model
+    full_precision_load: bool = False
+
+    def load_gb(self, size_gb: float) -> float:
+        """Approximate weight VRAM needed to load a *size_gb* full-precision model."""
+        return size_gb if self.full_precision_load else size_gb * self.quant.vram_ratio
 
 
 def _quant_key(quant: "RuntimeQuant | None") -> str:
@@ -231,6 +314,7 @@ FORMAT_SHORT: dict[ModelFormat, str] = {
     ModelFormat.SAFETENSORS_BF16: "BF16",
     ModelFormat.SAFETENSORS_FP16: "FP16",
     ModelFormat.SAFETENSORS_FP8:  "FP8",
+    ModelFormat.COMPRESSED_TENSORS: "CT",  # overridden by quant (scheme) when set
     ModelFormat.AWQ:              "AWQ",
     ModelFormat.GPTQ:             "GPTQ",
     ModelFormat.INT8_BNB:         "INT8",
@@ -476,16 +560,14 @@ class AIModel:
         self,
         total_gb: float,
         servers: "list[ServerSoftware]",
+        system_sm: int = 0,
     ) -> list[tuple[RuntimeQuant, float]]:
-        """Return runtime quants that would fit within total_gb, with estimated sizes.
+        """Return runtime quants that would let this model load within total_gb.
 
-        Only considers quants that at least one compatible server supports for
-        this model's format.  Returned list is ordered by VRAM ratio (largest
-        first, i.e. best quality first).
-
-        Args:
-            total_gb: total available VRAM in GB.
-            servers:  full server list to consult for quant support.
+        Considers the options compatible servers offer for this model whose
+        hardware requirement *system_sm* meets; the estimate per quant is the
+        smallest load footprint among its servers (a server that loads full
+        precision first does not help a model fit).  Ordered best quality first.
 
         Returns:
             List of (RuntimeQuant, estimated_gb) pairs for quants that would fit.
@@ -493,18 +575,18 @@ class AIModel:
         """
         if not self.size_gb:
             return []
-        compatible = [s for s in servers if self.compatible_with(s)]
-        supported: set[RuntimeQuant] = set()
-        for s in compatible:
-            supported.update(s.available_runtime_quants(self.format))
-        result: list[tuple[RuntimeQuant, float]] = []
-        for rq in RuntimeQuant:  # enum declaration order = best quality first
-            if rq not in supported:
+        best: dict[RuntimeQuant, float] = {}
+        for server in servers:
+            if not self.compatible_with(server):
                 continue
-            est = round(self.size_gb * RUNTIME_QUANT_VRAM_RATIO[rq], 0)
-            if est <= total_gb:
-                result.append((rq, est))
-        return result
+            for opt in server.runtime_quant_options(self):
+                if opt.requires.met_by(system_sm):
+                    est = round(opt.load_gb(self.size_gb), 0)
+                    best[opt.quant] = min(est, best.get(opt.quant, est))
+        return [
+            (rq, best[rq]) for rq in RuntimeQuant  # declaration order = best quality first
+            if rq in best and best[rq] <= total_gb
+        ]
 
     def hw_compat(self, system_sm: int) -> bool:
         """True if this model can run on hardware with the given compute capability.
@@ -513,7 +595,7 @@ class AIModel:
             system_sm: minimum sm across all GPUs as an int (e.g. 86 for sm_8.6).
                        Pass 0 to indicate unknown — returns True (no gate).
         """
-        return self.min_sm == 0 or system_sm == 0 or system_sm >= self.min_sm
+        return sm_supported(self.min_sm, system_sm)
 
     @property
     def hw_compat_note(self) -> str:
@@ -639,8 +721,9 @@ class ServerSoftware:
     params: tuple[ParamSpec, ...] = ()
     # Formats for which this server can apply runtime quantization (full-precision only).
     quantizable_formats: frozenset[ModelFormat] = field(default_factory=frozenset)
-    # Ordered tuple of runtime quant options available for quantizable formats.
-    supported_runtime_quants: tuple[RuntimeQuant, ...] = field(default_factory=tuple)
+    # Runtime quant modes this server offers for quantizable formats (flags, hardware
+    # requirement, applicability).  Order = picker order.
+    runtime_quants: tuple[RuntimeQuantOption, ...] = ()
     # Launch-time environment / process setup — set in data.py, consumed by launch.py.
     # The interpreter / binaries come from the Environment chosen at launch
     # (see environments.py); these fields describe what the server needs on top.
@@ -731,16 +814,27 @@ class ServerSoftware:
         if model.rope_scaling is not None and not self.applies_rope_scaling(model):
             return min(model.effective_ctx, model.ctx)
         return model.effective_ctx
-    def available_runtime_quants(self, fmt: ModelFormat) -> tuple[RuntimeQuant, ...]:
-        """Return ordered runtime quant options for the given input format.
 
-        Returns an empty tuple when no runtime quantization is available for
-        this server+format combination (already-quantized formats, or servers
-        that never support runtime quantization).
+    def runtime_quant_options(self, model: AIModel) -> tuple[RuntimeQuantOption, ...]:
+        """Runtime quant options this server offers for *model*, in picker order.
+
+        Empty for formats it cannot quantize (already-quantized checkpoints) and
+        servers without runtime quantization.  Hardware is not filtered here —
+        callers flag options whose requirement the system does not meet.
         """
-        if fmt not in self.quantizable_formats:
+        if model.format not in self.quantizable_formats:
             return ()
-        return self.supported_runtime_quants
+        return tuple(o for o in self.runtime_quants if o.applies_to is None or o.applies_to(model))
+
+    def runtime_quant_option(self, quant: RuntimeQuant) -> RuntimeQuantOption:
+        option = next((o for o in self.runtime_quants if o.quant == quant), None)
+        if option is None:
+            raise ValueError(f"{self.label} does not support runtime quantization {quant.label}")
+        return option
+
+    def runtime_quant_args(self, quant: RuntimeQuant | None) -> tuple[str, ...]:
+        """Command-line flags enabling *quant* on this server (empty for None)."""
+        return () if quant is None else self.runtime_quant_option(quant).flags
 
     def env_version_label(self, env: Any) -> str:
         """Installed version(s) of this server in *env*, e.g. 'vllm 0.26.0' ('' if unknown)."""
@@ -784,22 +878,37 @@ def uses_hub_flow(servers: list[ServerSoftware], ai_type: AIType) -> bool:
 # Quantization Tool
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class QuantOption:
+    """One output a QuantizationTool can produce.
+
+    requires is the hardware needed to *serve* the output (the conversion itself
+    runs anywhere the tool runs); it is shown in the picker and recorded on the
+    generated catalog entry (min_sm / hw_note) so the model list flags it.
+    """
+    id: str                                  # value passed to the tool (GGUF type, bpw, scheme)
+    label: str
+    requires: HardwareRequirement = ANY_GPU
+
+
 @dataclass
 class QuantizationTool:
     """Describes an offline quantization / conversion tool.
 
     Each tool converts models from one or more input formats to a single
-    output format.  The quant_options tuple lists the option identifiers
-    that the tool accepts (e.g. GGUFQuant values or bpw strings for EXL2).
-    quant_option_labels provides a human-readable display string for each.
+    output format.  quant_options lists what it can produce (QuantOption:
+    the identifier the tool accepts, e.g. a GGUFQuant value or EXL2 bpw, a
+    display label and the hardware needed to serve the result).
 
     Instance data (the actual registered tools) lives in data.py alongside
     SERVERS.  Only tool-agnostic logic belongs here.
 
     Dependency management fields (populated in data.py):
-      env_server_id     — ServerSoftware.id whose registered Environments can run the tool
-                          (e.g. "llamacpp" for llama-quantize, "tabby" for exllamav2);
-                          the user picks one when several are registered.
+      env_group         — environment-registry key whose Environments can run the tool: a
+                          ServerSoftware.id (shares that server's environments, e.g.
+                          "llamacpp" for llama-quantize, "tabby" for exllamav2) or a
+                          tool-specific group (e.g. "llm-compressor"); the user picks one
+                          when several are registered.
       avail_executable  — executable name that must exist in that environment's bin dir.
       avail_script      — script name under the source root above that environment's bin dir.
       avail_module(s)   — Python module(s) that must be importable in the selected interpreter.
@@ -808,14 +917,19 @@ class QuantizationTool:
       pip_package       — pip package installed into that environment for auto-install;
                           "" = not auto-installable.
       install_note      — shown to the user when the tool is unavailable and cannot be auto-installed.
+
+    Output naming: output_dir_template names the job's output directory
+    ({stem} = source name without a GGUF quant suffix, {option} = quant option);
+    quant_label_template formats the generated catalog entry's quant field.
     """
     id: str                                  # unique slug, e.g. "llama-quantize", "exl2-convert"
     label: str                               # display label, e.g. "llama.cpp (GGUF requantize)"
     input_formats: frozenset[ModelFormat]    # model formats this tool accepts as input
     output_format: ModelFormat               # the format it produces
-    quant_options: tuple[str, ...]           # ordered list of option identifiers
-    quant_option_labels: dict[str, str]      # human-readable label per option identifier
-    env_server_id: str = ""                  # server whose environments provide the tool
+    quant_options: tuple[QuantOption, ...]   # what it can produce, in picker order
+    output_dir_template: str = "{stem}-{option}"
+    quant_label_template: str = "{option}"
+    env_group: str = ""                      # environment-registry key providing the tool
     cuda_home: str = ""                      # CUDA_HOME override injected at run time (if non-empty)
     avail_executable: str = ""               # executable in the env's bin dir; must exist
     avail_module: str = ""                   # module importable in the env's python
@@ -826,6 +940,9 @@ class QuantizationTool:
     supports_vision: bool = True             # whether the tool preserves vision model functionality
     pip_package: str = ""                    # auto-install package; "" = not auto-installable
     install_note: str = ""                   # shown when unavailable and not auto-installable
+
+    def option(self, option_id: str) -> QuantOption:
+        return next(o for o in self.quant_options if o.id == option_id)
 
 
 def tools_for_model(tools: "list[QuantizationTool]", model: AIModel) -> "list[QuantizationTool]":

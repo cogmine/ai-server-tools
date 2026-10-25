@@ -54,6 +54,14 @@
         "name": "sglang",
         "default": true
       }
+    ],
+    "llm-compressor": [
+      {
+        "kind": "conda",
+        "name": "llm-compressor",
+        "note": "dedicated env for the llm-compressor quantization tools",
+        "default": true
+      }
     ]
   }
 }
