@@ -232,19 +232,21 @@ bundled toolkit. Two constraints must hold, both wired into `launcher/data.py` /
   `flashinfer-cubin` once its version catches up to skip JIT.
 
 ### `vllm-next` environment
-A second vLLM conda env registered in the launcher (cloned from `vllm`) for releases that add new
-architectures — currently vLLM **0.31.0**, torch **2.13.0+cu130**, flashinfer-python **0.7.0.post1**
-(no matching `flashinfer-cubin` → JIT), needed for `Qwen4Exp` (Qwen3.8-Flash-Next). The same
-cu13 rules apply: the 13.0.88 nvcc/nvvm/crt pins survived the upgrade (re-check after any upgrade),
-and the launcher wires the env's own bundled toolkit. vLLM 0.31 itself pins `torchaudio==2.11.0`
-alongside torch 2.13 (no newer torchaudio exists). flashinfer warns that `nvidia-cuda-tileiras`
-13.2.78 mismatches nvcc and falls back to the system tileiras — harmless (no 13.0 build exists;
-cuTile is unused on sm_86; same in the `vllm` env). Smoke-tested end-to-end (serve + completion).
-**Local patch (re-apply after any vLLM reinstall/upgrade until merged upstream)**: vllm-project/vllm#56362
-— the Qwen4Exp pinned-host PLE lookup kernel passes FP8 pointers to Triton, which rejects `fp8e4nv` on
-sm_8x ("type fp8e4nv not supported in this architecture"); the patch passes uint8 views (byte-identical
-copy). Apply from `site-packages/`:
-`curl -sfH "Accept: application/vnd.github.v3.diff" https://api.github.com/repos/vllm-project/vllm/pulls/56362 | patch -p1`.
+A second vLLM conda env registered in the launcher (cloned from `vllm`) tracking vLLM `main` for
+architectures newer than the latest release — currently the nightly **0.32.1rc1.dev467+g444d69110**
+(2026-10-25; needed for `BeamForCausalLM` — vllm-project/vllm#62074 and follow-ups landed after 0.32.0 —
+and `Qwen4Exp` / Qwen3.8-Flash-Next), torch **2.14.0** (PyPI default build is cu130),
+flashinfer-python **0.7.2.post1** (no matching `flashinfer-cubin` → JIT), transformers 5.20.2,
+triton 3.8.0, `torchaudio==2.11.0` (vLLM's own pin). **Update** to the latest main nightly (pin the exact
+version shown at `https://wheels.vllm.ai/nightly/cu130/vllm/` so the install is reproducible):
+`pip install -U --pre "vllm==<version>" --extra-index-url https://wheels.vllm.ai/nightly/cu130`.
+The same cu13 rules apply: the 13.0.88 nvcc/nvvm/crt pins survived (re-check after any upgrade —
+torch's `cuda-toolkit` 13.0.x keeps cudart at 13.0), and the launcher wires the env's own bundled
+toolkit. flashinfer warns that `nvidia-cuda-tileiras` 13.2.78 mismatches nvcc and falls back to the
+system tileiras — harmless (no 13.0 build exists; cuTile is unused on sm_86; same in the `vllm` env).
+Smoke-tested end-to-end (serve + completion, flashinfer JIT sampler, CUDA graphs).
+The Qwen4Exp FP8 PLE lookup no longer needs the former local patch (vllm-project/vllm#56362): upstream's
+refactored kernel takes uint8 byte pointers, verified on sm_86.
 Qwen3.8-Flash-Next-FP8 catalog params: TP8 (expert parallel resolves on automatically), `gpu_mem_util` 0.95, `max_num_seqs` 16,
 `auto_fit_ctx` (at 0.90 / 256 seqs only ~52K ctx fit). Do not use `--kv-cache-dtype fp8` on Ampere — the
 QSA kernels would hit the same Triton fp8e4nv limitation. Loading from the NAS takes ~21 min.
