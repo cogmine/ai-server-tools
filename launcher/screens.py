@@ -2924,6 +2924,8 @@ class ModelPropertiesScreen(DataTableScreen):
         mtp = "sidecar head" if m.mtp_path else ("embedded" if m.mtp_embedded else "")
         if mtp:
             facts.append(f"MTP: {mtp}")
+        if m.draft_path:
+            facts.append(f"draft: {Path(m.draft_path).name}")
         loc = location_of(m.path)
         copies = [c for c in (location_of(c.path) for c in launcher.copies_of(m)) if c is not None]
         where = f"[dim]{escape(loc.label if loc else 'path')}:[/] {escape(m.path)}"

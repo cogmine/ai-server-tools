@@ -65,6 +65,9 @@ class ModelFormat(str, Enum):
     # llm-compressor compressed-tensors checkpoint with integer / FP4 weights
     # (W8A16, W8A8, W4A16, NVFP4A16, …); FP8 compressed-tensors is SAFETENSORS_FP8.
     COMPRESSED_TENSORS = "compressed_tensors"
+    # NVIDIA ModelOpt checkpoint with FP4 / mixed-precision weights (NVFP4, …);
+    # ModelOpt FP8 checkpoints are SAFETENSORS_FP8.
+    MODELOPT         = "modelopt"
     AWQ              = "awq"              # Activation-Aware Weight Quant (int4) — vLLM, sglang, ooba
     GPTQ             = "gptq"             # GPTQ quantised safetensors — vLLM, tabbyAPI, ooba
     INT8_BNB         = "int8_bnb"         # bitsandbytes INT8 pre-saved checkpoint — vLLM only
@@ -177,6 +180,19 @@ def gguf_shard_paths(gguf_path: Path) -> list[Path]:
         gguf_path.parent / f"{base}-{index:05d}-of-{total:05d}{gguf_path.suffix}"
         for index in range(1, total + 1)
     ]
+
+
+# GGUF speculative-draft sidecars shipped in a bundle, by filename prefix → llama.cpp --spec-type.
+GGUF_DRAFT_SPEC_TYPES: dict[str, str] = {
+    "dspark-": "draft-dspark",
+    "dflash-": "draft-dflash",
+}
+
+
+def gguf_draft_spec_type(path: str | Path) -> str:
+    """llama.cpp --spec-type for the GGUF draft sidecar at *path*, or '' when not one."""
+    name = Path(path).name.lower()
+    return next((t for prefix, t in GGUF_DRAFT_SPEC_TYPES.items() if name.startswith(prefix)), "")
 
 
 def sm_supported(min_sm: int, system_sm: int) -> bool:
@@ -319,6 +335,7 @@ FORMAT_SHORT: dict[ModelFormat, str] = {
     ModelFormat.SAFETENSORS_FP16: "FP16",
     ModelFormat.SAFETENSORS_FP8:  "FP8",
     ModelFormat.COMPRESSED_TENSORS: "CT",  # overridden by quant (scheme) when set
+    ModelFormat.MODELOPT:         "ModelOpt",
     ModelFormat.AWQ:              "AWQ",
     ModelFormat.GPTQ:             "GPTQ",
     ModelFormat.INT8_BNB:         "INT8",
@@ -412,6 +429,7 @@ class AIModel:
     vision: bool = False           # model accepts image/vision input
     mmproj_path: str = ""          # path to companion mmproj .gguf file (vision GGUF only)
     mtp_path: str = ""             # path to companion multi-token-prediction draft head .gguf (GGUF only)
+    draft_path: str = ""           # speculative draft companion: HF draft dir (vLLM) or GGUF draft sidecar (llama.cpp)
     mtp_embedded: bool = False     # the model carries its own MTP layers: GGUF nextn_predict_layers > 0, or an HF checkpoint declaring MTP layers that ships their weights
     trust_remote_code: bool = False  # servers must pass --trust-remote-code
     quant: str = ""                # quant suffix for display, e.g. "Q4_K_M" (mainly GGUF)
@@ -471,6 +489,7 @@ class AIModel:
             vision=bool(d.get("vision", False)),
             mmproj_path=d.get("mmproj_path", ""),
             mtp_path=d.get("mtp_path", ""),
+            draft_path=d.get("draft_path", ""),
             mtp_embedded=bool(d.get("mtp_embedded", False)),
             trust_remote_code=bool(d.get("trust_remote_code", False)),
             quant=d.get("quant", ""),
@@ -512,8 +531,8 @@ class AIModel:
 
     @property
     def companion_paths(self) -> list[str]:
-        """Companion files that must sit beside the model (mmproj, MTP head)."""
-        return [p for p in (self.mmproj_path, self.mtp_path) if p]
+        """Companion files / dirs the model needs (mmproj, MTP head, draft model)."""
+        return [p for p in (self.mmproj_path, self.mtp_path, self.draft_path) if p]
 
     def derived_entry_fields(self) -> dict[str, Any]:
         """Catalog fields a converted / quantized model derived from this one inherits.

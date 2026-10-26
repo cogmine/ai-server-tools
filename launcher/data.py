@@ -82,6 +82,10 @@ def _has_embedded_mtp(model: AIModel) -> bool:
     return model.mtp_embedded
 
 
+def _has_draft_model(model: AIModel) -> bool:
+    return bool(model.draft_path)
+
+
 _GPU_SCREEN = "set from the GPU selection"
 
 # Checkpoints described by an HF config.json, which vLLM / SGLang can override at launch.
@@ -90,6 +94,7 @@ _HF_CONFIG_FORMATS: frozenset[ModelFormat] = frozenset({
     ModelFormat.SAFETENSORS_FP16,
     ModelFormat.SAFETENSORS_FP8,
     ModelFormat.COMPRESSED_TENSORS,
+    ModelFormat.MODELOPT,
     ModelFormat.AWQ,
     ModelFormat.GPTQ,
     ModelFormat.INT8_BNB,
@@ -204,6 +209,18 @@ SERVERS: list[ServerSoftware] = [
                      "check \"SpecDecoding metrics\" in the log",
             ),
             BoolParam(
+                key="draft", label="Draft-model speculative decoding", default=False,
+                applies_to=_has_draft_model,
+                help="Run the model's draft checkpoint (e.g. DFlash2) beside it: --speculative-config "
+                     "with the draft's method.  Speeds up decoding, most at low concurrency; the "
+                     "draft costs memory (Beam DFlash2: ~1.7 GB per GPU).  Takes precedence over MTP",
+            ),
+            IntParam(
+                key="draft_tokens", label="Draft tokens", default=7, minimum=1, maximum=15,
+                applies_to=_has_draft_model,
+                help="Tokens drafted per step (Beam DFlash2: 7 recommended, up to 15)",
+            ),
+            BoolParam(
                 key="log_requests", label="Log requests", default=False,
                 help="off = --no-enable-log-requests (quieter logs)",
             ),
@@ -286,6 +303,13 @@ SERVERS: list[ServerSoftware] = [
                 applies_to=_has_mtp_head,
                 help="auto uses a sidecar mtp-*.gguf head; on also uses the model's embedded head "
                      "(opt-in: llama.cpp may not implement MTP for the architecture); off disables",
+            ),
+            BoolParam(
+                key="draft", label="Draft-model speculative decoding", default=False,
+                applies_to=_has_draft_model,
+                help="Use the bundle's draft sidecar (dspark-*.gguf / dflash-*.gguf): --spec-type "
+                     "draft-dspark|draft-dflash --model-draft <file>.  Needs a build with that "
+                     "draft type; takes precedence over MTP",
             ),
             _port("llamacpp", 5000),
             _EXTRA_FLAGS,
@@ -587,6 +611,7 @@ QUANTIZATION_TOOLS: list[QuantizationTool] = [
             ModelFormat.PYTORCH_BIN,
             ModelFormat.SAFETENSORS_FP8,
             ModelFormat.COMPRESSED_TENSORS,
+            ModelFormat.MODELOPT,
             ModelFormat.GPTQ,
         }),
         output_format=ModelFormat.GGUF,

@@ -93,6 +93,27 @@ def expert_parallel_needed(model: "AIModel | None", tp: int) -> tuple[bool, str]
     return False, f"experts shard evenly at TP{tp}"
 
 
+# Speculative-decoding draft checkpoints: config.json key marking them → vLLM method.
+_DRAFT_METHODS: dict[str, str] = {
+    "dflash_config": "dflash",   # DFlash / DFlash2 block drafters
+}
+
+
+def draft_method(cfg: dict[str, Any]) -> str:
+    """vLLM speculative method of a draft-model config, or '' when it is not a known draft."""
+    return next((method for key, method in _DRAFT_METHODS.items() if key in cfg), "")
+
+
+@functools.lru_cache(maxsize=16)
+def draft_method_at(draft_path: str) -> str:
+    """draft_method() of the checkpoint at *draft_path* ('' if unreadable)."""
+    try:
+        cfg = json.loads((Path(draft_path) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return draft_method(cfg)
+
+
 @functools.lru_cache(maxsize=64)
 def fp8_block_size(model_path: str) -> tuple[int, int] | None:
     """Block shape of a standard block-FP8 checkpoint, else None.

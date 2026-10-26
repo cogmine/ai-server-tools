@@ -17,6 +17,8 @@
     "mmproj_path":   "(optional, gguf vision only) Absolute path to the companion mmproj-*.gguf vision encoder. Passed as --mmproj at launch time.",
     "mtp_path":      "(auto, gguf only) Absolute path to the companion mtp-*.gguf multi-token-prediction draft head. llama.cpp/ooba launch with --spec-type draft-mtp --model-draft <path> unless server param mtp is false.",
     "mtp_embedded":  "(auto) true when the model carries its own MTP layers: a GGUF's NextN layers, or an HF checkpoint declaring MTP layers in config.json that ships their weights. Used only when the server's mtp param is on for the model (llama.cpp/ooba: --spec-type draft-mtp; vLLM: --speculative-config).",
+    "draft_path":    "(auto) Speculative draft companion: an HF draft checkpoint dir beside the model (e.g. <model>-DFlash2; vLLM --speculative-config) or a GGUF dspark-*/dflash-*.gguf sidecar in the bundle (llama.cpp --spec-type draft-dspark|draft-dflash). Used when the server's draft param is on.",
+    "template_tools": "(auto) true when the chat template declares tools — enough for llama.cpp tool calling; vLLM/SGLang also need tool_call_parser.",
     "quant":         "(optional) Quantisation label for display, e.g. Q4_K_M — mainly for GGUF",
     "ctx_override":  "(optional) Override the context length at launch time; 0 = use native ctx (scaled by rope_scaling when set). Set with the 'l' key in the TUI.",
     "rope_scaling":  "(optional) RoPE context extension, e.g. {\"factor\": 4.0} for YaRN 256K → 1M; optional \"method\" (default yarn) and \"original_ctx\" (default ctx). Applied by llama.cpp, vLLM, SGLang and ooba (GGUF). Set with the 'l' key in the TUI.",

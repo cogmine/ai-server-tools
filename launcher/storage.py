@@ -79,7 +79,7 @@ def relocated_entry(entry: dict, dest: Location) -> dict:
     """A snapshot of JSON catalog *entry* for its copy at the mirrored path under *dest*."""
     relocated = json.loads(json.dumps(entry))  # deep copy: nested status / params dicts
     relocated["path"] = str(mirrored_path(entry["path"], dest))
-    for key in ("mmproj_path", "mtp_path"):
+    for key in ("mmproj_path", "mtp_path", "draft_path"):
         if relocated.get(key):
             relocated[key] = str(mirrored_path(relocated[key], dest))
     return relocated
@@ -127,13 +127,13 @@ def model_metadata_dir(path: Path) -> Path:
 def model_files(model: AIModel) -> list[Path]:
     """Every path that makes up *model* on disk.
 
-    A directory model is its directory.  A file model is its file (every shard of a
-    split GGUF), its companion files (mmproj, MTP head) and the metadata files
-    describing it.
+    A directory model is its directory plus its companions (draft model).  A file
+    model is its file (every shard of a split GGUF), its companion files (mmproj,
+    MTP head) and the metadata files describing it.
     """
     path = Path(model.path)
     if path.is_dir():
-        return [path]
+        return [path, *(Path(c) for c in model.companion_paths)]
     meta_dir = model_metadata_dir(path)
     return [
         *gguf_shard_paths(path),
@@ -271,13 +271,14 @@ def plan_deletion(model: AIModel, catalog: "list[AIModel]") -> DeletionPlan:
     path = Path(model.path)
     entries = tuple(m for m in catalog if m.path == model.path)
     others = [m for m in catalog if m.path != model.path]
-    if path.is_dir():
-        return DeletionPlan(entries, (), (path,), location)
-
     referenced = {Path(p) for m in others for p in (m.path, *m.companion_paths)}
-    removed = set(gguf_shard_paths(path)) | {
-        Path(c) for m in entries for c in m.companion_paths if Path(c) not in referenced
-    }
+    orphans = {Path(c) for m in entries for c in m.companion_paths if Path(c) not in referenced}
+    if path.is_dir():
+        orphan_dirs = sorted(c for c in orphans if c.is_dir())
+        orphan_files = tuple(sorted(c for c in orphans if not c.is_dir()))
+        return DeletionPlan(entries, orphan_files, (path, *orphan_dirs), location)
+
+    removed = set(gguf_shard_paths(path)) | orphans
     directory = path.parent
     remaining = [
         f for f in directory.iterdir()

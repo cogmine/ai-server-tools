@@ -55,7 +55,10 @@ from typing import Any
 
 from launcher.gguf_header import arch_int, embedded_mtp_layers, read_gguf_metadata
 from launcher.chat_template import declares_tools, read_template_at
-from launcher.models import AIModel, GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info
+from launcher.hf_config import draft_method
+from launcher.models import (
+    AIModel, GGUF_DRAFT_SPEC_TYPES, GGUF_QUANTS_LONGEST_FIRST, gguf_shard_paths, gguf_split_info,
+)
 from launcher.storage import (
     LOCATIONS, METADATA_FILES, fill_missing, location_of, missing_copy_files, model_metadata_dir,
     relocated_entry,
@@ -104,8 +107,8 @@ def _looks_like_model_dir(path: Path) -> bool:
 
 
 # GGUF files shipped inside a bundle that are not standalone models:
-# multimodal projectors and multi-token-prediction draft heads.
-_COMPANION_GGUF_PREFIXES = ("mmproj", "mtp-")
+# multimodal projectors, multi-token-prediction heads and speculative-draft sidecars.
+_COMPANION_GGUF_PREFIXES = ("mmproj", "mtp-", *GGUF_DRAFT_SPEC_TYPES)
 
 
 def _is_companion_gguf(path: Path) -> bool:
@@ -152,6 +155,8 @@ def _iter_candidates(scan_dir: Path):
                         yield gguf_file, "gguf"
             elif _looks_like_model_dir(entry):
                 cfg = _read_hf_config(entry)
+                if draft_method(cfg):
+                    continue  # speculative draft: linked to its target model as draft_path
                 for fmt in _detect_all_hf_formats(entry, cfg):
                     yield entry, fmt
             # else: skip directories that don't look like model dirs
@@ -215,6 +220,7 @@ _FORMAT_WEIGHT_GLOBS: dict[str, list[str]] = {
     "safetensors_fp16": ["*.safetensors"],
     "safetensors_fp8":  ["*.safetensors"],
     "compressed_tensors": ["*.safetensors"],
+    "modelopt":         ["*.safetensors"],
     "gptq":             ["*.safetensors"],
     "awq":              ["*.safetensors"],
     "exl2":             ["*.safetensors"],
@@ -472,6 +478,9 @@ def _detect_all_hf_formats(model_dir: Path, cfg: dict[str, Any]) -> list[str]:
         if weights and all(w.get("type") == "float" and w.get("num_bits") == 8 for w in weights):
             return ["safetensors_fp8"]
         return ["compressed_tensors"]
+    # ModelOpt FP4 / mixed precision (ModelOpt FP8 returned above via quant_algo).
+    if quant_method.startswith("modelopt"):
+        return ["modelopt"]
 
     # torch_dtype may be at the top level, or nested inside text_config for multimodal models
     torch_dtype = str(
@@ -714,15 +723,19 @@ def _detect_trust_remote_code(cfg: dict[str, Any]) -> bool:
     return bool(cfg.get("auto_map"))
 
 
-def _detect_compressed_tensors_scheme(cfg: dict[str, Any]) -> str:
-    """Preset scheme of a single-scheme compressed-tensors checkpoint (e.g. 'W4A16'), or ''.
+def _detect_quant_scheme(cfg: dict[str, Any]) -> str:
+    """Weight scheme of a compressed-tensors or ModelOpt checkpoint (e.g. 'W4A16', 'NVFP4'), or ''.
 
-    llm-compressor names the config group after the preset it was given; generic
-    group names ("group_0", "config_group_0") carry no scheme information.
+    llm-compressor names a single config group after the preset it was given; generic
+    group names ("group_0", "config_group_0") carry no scheme information.  ModelOpt
+    records its algorithm as quant_algo.
     """
     qcfg = cfg.get("quantization_config") or {}
+    method = str(qcfg.get("quant_method", ""))
+    if method.startswith("modelopt"):
+        return str(qcfg.get("quant_algo", "")).upper()
     groups = list((qcfg.get("config_groups") or {}).keys())
-    if qcfg.get("quant_method") != "compressed-tensors" or len(groups) != 1:
+    if method != "compressed-tensors" or len(groups) != 1:
         return ""
     return "" if re.fullmatch(r"(config_)?group_\d+", groups[0]) else groups[0].upper()
 
@@ -746,11 +759,15 @@ def _detect_fp8_min_sm(cfg: dict[str, Any]) -> int:
     return 0
 
 
+# Formats whose name doesn't convey the precision: ids use the weight scheme instead (-w4a16, -nvfp4).
+_SCHEME_NAMED_FORMATS = frozenset({"compressed_tensors", "modelopt"})
+
 _FORMAT_SHORT: dict[str, str] = {
     "safetensors_bf16": "bf16",
     "safetensors_fp16": "fp16",
     "safetensors_fp8":  "fp8",
     "compressed_tensors": "ct",
+    "modelopt":         "modelopt",
     "int8_bnb":         "int8",
     "pytorch_bin":      "bin",
     "awq":              "awq",
@@ -845,7 +862,11 @@ def _names_match(gguf_norm: str, entry_norm: str) -> bool:
         (gguf_tokens, entry_tokens) if len(gguf_tokens) <= len(entry_tokens)
         else (entry_tokens, gguf_tokens)
     )
-    return longer[:len(shorter)] == shorter
+    if longer[:len(shorter)] != shorter:
+        return False
+    # The longer name going on with a version is another generation (DeepSeek vs DeepSeek-V4.1).
+    rest = longer[len(shorter):]
+    return not (rest and re.fullmatch(r"v\d+", rest[0]))
 
 
 def _find_original_model(gguf_dir_name: str, all_roots: list[Path]) -> Path | None:
@@ -982,9 +1003,9 @@ def _find_mmproj(bundle_root: Path) -> Path | None:
     return matches[0] if matches else None
 
 
-def _find_mtp(bundle_root: Path, quant: str) -> Path | None:
-    """Return the mtp-*.gguf draft head in bundle_root, preferring one tagged with *quant*."""
-    matches = sorted(bundle_root.glob("mtp-*.gguf"))
+def _find_sidecar(bundle_root: Path, prefixes: tuple[str, ...], quant: str) -> Path | None:
+    """Return a <prefix>*.gguf sidecar in bundle_root, preferring one tagged with *quant*."""
+    matches = sorted(m for p in prefixes for m in bundle_root.glob(f"{p}*.gguf"))
     for m in matches:
         if quant and _extract_gguf_quant(m.name) == quant:
             return m
@@ -1131,7 +1152,9 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     # Only search for an mmproj file when this is a vision model — non-vision GGUFs
     # never have one, and glob() on slow storage is expensive at catalog-refresh scale.
     mmproj_path = (_find_mmproj(parent) or _find_mmproj(parent.parent)) if vision else None
-    mtp_path = _find_mtp(parent, quant) or _find_mtp(parent.parent, quant)
+    mtp_path = _find_sidecar(parent, ("mtp-",), quant) or _find_sidecar(parent.parent, ("mtp-",), quant)
+    draft_prefixes = tuple(GGUF_DRAFT_SPEC_TYPES)
+    draft_path = _find_sidecar(parent, draft_prefixes, quant) or _find_sidecar(parent.parent, draft_prefixes, quant)
     mtp_embedded = embedded_mtp_layers(header) > 0
     template = header.get("tokenizer.chat_template")
     template_tools = declares_tools(template if isinstance(template, str) else None)
@@ -1154,10 +1177,34 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     if vision:        entry["vision"]       = True
     if mmproj_path:   entry["mmproj_path"]  = str(mmproj_path)
     if mtp_path:      entry["mtp_path"]     = str(mtp_path)
+    if draft_path:    entry["draft_path"]   = str(draft_path)
     if mtp_embedded:  entry["mtp_embedded"] = True
     if template_tools: entry["template_tools"] = True
     if trust_rc:      entry["trust_remote_code"] = True
     return entry
+
+
+def _find_draft(model_dir: Path, display_name: str) -> Path | None:
+    """The speculative draft checkpoint published for this model, if one sits beside it.
+
+    A draft dir is named after its target plus the draft method ("Beam-1.0-501B-A23B-DFlash2");
+    it serves every variant of that model (BF16, FP8, NVFP4), matched by display name.
+    """
+    slug = _slugify(display_name)
+    try:
+        siblings = sorted(model_dir.parent.iterdir())
+    except OSError:
+        return None
+    for sibling in siblings:
+        if sibling == model_dir or not _slugify(sibling.name).startswith(f"{slug}-") or not sibling.is_dir():
+            continue
+        method = draft_method(_read_hf_config(sibling))
+        if not method:
+            continue
+        target = re.sub(rf"[-_]{method}\w*$", "", sibling.name, flags=re.IGNORECASE)
+        if _slugify(_dir_to_display_name(target)) == slug:
+            return sibling
+    return None
 
 
 def detect_hf_dir(
@@ -1182,9 +1229,12 @@ def detect_hf_dir(
     template_tools = declares_tools(read_template_at(model_dir))
     trust_rc      = _detect_trust_remote_code(cfg)
     fp8_min_sm    = _detect_fp8_min_sm(cfg)
-    ct_scheme     = _detect_compressed_tensors_scheme(cfg)
-    display_name  = _dir_to_display_name(model_dir.name)
-    fmt_short     = _FORMAT_SHORT.get(fmt, fmt)
+    scheme        = _detect_quant_scheme(cfg)
+    # A scheme tag ending the dir name ("Model-NVFP4") is carried by quant and the id suffix.
+    base_dirname  = re.sub(rf"[-_]{re.escape(scheme)}$", "", model_dir.name, flags=re.IGNORECASE) if scheme else model_dir.name
+    display_name  = _dir_to_display_name(base_dirname)
+    draft_path    = _find_draft(model_dir, display_name)
+    fmt_short     = _slugify(scheme) if scheme and fmt in _SCHEME_NAMED_FORMATS else _FORMAT_SHORT.get(fmt, fmt)
     entry_id      = f"{_slugify(display_name)}-{fmt_short}"
 
     # Collision guard: if entry_id already belongs to a different path, fall back to
@@ -1219,7 +1269,8 @@ def detect_hf_dir(
     if template_tools: entry["template_tools"] = True
     if trust_rc:    entry["trust_remote_code"] = True
     if fp8_min_sm:  entry["min_sm"]      = fp8_min_sm
-    if ct_scheme:   entry["quant"]       = ct_scheme
+    if scheme:      entry["quant"]       = scheme
+    if draft_path:  entry["draft_path"]  = str(draft_path)
     return entry
 
 
@@ -1361,8 +1412,8 @@ def build_entry(
 # favorite, server_status, server_params, min_sm, hw_note, comfyui_subdir,
 # quant, trust_remote_code) are never touched by refresh.
 _REFRESHABLE_FIELDS: frozenset[str] = frozenset({
-    "arch", "ctx", "moe_active", "moe_experts", "mmproj_path", "mtp_embedded", "mtp_path", "params_m", "size_gb",
-    "template_tools", "vision",
+    "arch", "ctx", "draft_path", "moe_active", "moe_experts", "mmproj_path", "mtp_embedded", "mtp_path",
+    "params_m", "size_gb", "template_tools", "vision",
 })
 
 
@@ -1408,7 +1459,7 @@ def _refresh_one(
         if field == "params_m":              return int(raw)   if raw else 0
         if field == "size_gb":               return float(raw) if raw else 0.0
         if field in ("arch",):               return str(raw) if raw else ""
-        if field in ("mmproj_path", "mtp_path"): return str(raw) if raw else ""
+        if field in ("mmproj_path", "mtp_path", "draft_path"): return str(raw) if raw else ""
         if field == "ctx":                   return int(raw) if raw else 32_768
         if field in ("moe_experts", "moe_active"): return int(raw) if raw else 0
         if field in ("vision", "mtp_embedded", "template_tools"): return bool(raw)
@@ -1417,7 +1468,7 @@ def _refresh_one(
     # Fields omitted from JSON when default — delete key rather than write falsy value
     _omit_when_default = frozenset({
         "params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path", "mtp_path", "mtp_embedded",
-        "template_tools",
+        "template_tools", "draft_path",
     })
 
     changes: list[str] = []

@@ -45,13 +45,13 @@ from typing import Any, Callable
 
 from launcher.data import AI_MODELS
 from launcher.chat_template import patched_template
-from launcher.hf_config import read_parallelism_fields
+from launcher.hf_config import draft_method_at, read_parallelism_fields
 from launcher.environments import ENVIRONMENTS, Environment
 from launcher.gpu_power import PowerLimitStep
 from launcher.models import (
     AIModel, GGUF_FULL_PRECISION, GGUF_QUANTS_LONGEST_FIRST, ModelFormat,
     QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key,
-    gguf_shard_paths, gguf_split_info,
+    gguf_draft_spec_type, gguf_shard_paths, gguf_split_info,
 )
 from launcher.params import AutoBoolParam, ParamSpec
 from launcher.config import CONFIG
@@ -368,8 +368,7 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
         cmd += ["--enable-chunked-prefill"]
     if p.get("expert_parallel"):
         cmd += ["--enable-expert-parallel"]
-    if p.get("mtp") and model.mtp_embedded:
-        spec = {"method": "mtp", "num_speculative_tokens": int(p["mtp_tokens"])}
+    if spec := _vllm_speculative_config(model, p):
         cmd += ["--speculative-config", json.dumps(spec, separators=(",", ":"))]
     if p.get("enforce_eager"):
         cmd += ["--enforce-eager"]
@@ -388,6 +387,18 @@ def _build_vllm(server: ServerSoftware, env: Environment, model: AIModel, p: dic
     cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
+
+
+def _vllm_speculative_config(model: AIModel, p: dict) -> dict[str, Any] | None:
+    """vLLM --speculative-config: a draft checkpoint when enabled, else embedded MTP layers."""
+    if p.get("draft") and model.draft_path:
+        method = draft_method_at(model.draft_path)
+        if not method:
+            raise ValueError(f"Unrecognised draft model (no known speculative method): {model.draft_path}")
+        return {"method": method, "model": model.draft_path, "num_speculative_tokens": int(p["draft_tokens"])}
+    if p.get("mtp") and model.mtp_embedded:
+        return {"method": "mtp", "num_speculative_tokens": int(p["mtp_tokens"])}
+    return None
 
 
 def _hf_rope_override(model: AIModel) -> dict[str, Any]:
@@ -447,10 +458,20 @@ def _build_llamacpp(server: ServerSoftware, env: Environment, model: AIModel, p:
         cmd += ["--cache-ram", str(p["cache_ram_mib"])]
     if model.mmproj_path:
         cmd += ["--mmproj", model.mmproj_path]
-    cmd += _mtp_args(model, p)
+    cmd += _gguf_draft_args(model, p) or _mtp_args(model, p)
     cmd += _chat_template_args(server, p)
     cmd.extend(p.get("extra_flags", []))
     return cmd
+
+
+def _gguf_draft_args(model: AIModel, p: dict) -> list[str]:
+    """llama-server flags for the model's draft sidecar (DSpark / DFlash) when its draft param is on."""
+    if not (p.get("draft") and model.draft_path):
+        return []
+    spec_type = gguf_draft_spec_type(model.draft_path)
+    if not spec_type:
+        raise ValueError(f"Unrecognised GGUF draft sidecar (no known --spec-type): {model.draft_path}")
+    return ["--spec-type", spec_type, "--model-draft", model.draft_path]
 
 
 def _mtp_args(model: AIModel, p: dict) -> list[str]:

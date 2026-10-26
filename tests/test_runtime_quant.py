@@ -157,8 +157,20 @@ class CompressedTensorsDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(ingest._detect_hf_format(Path(tmp), fp8), "safetensors_fp8")
             self.assertEqual(ingest._detect_hf_format(Path(tmp), int4), "compressed_tensors")
-        self.assertEqual(ingest._detect_compressed_tensors_scheme(fp8), "FP8_BLOCK")
-        self.assertEqual(ingest._detect_compressed_tensors_scheme(int4), "")
+        self.assertEqual(ingest._detect_quant_scheme(fp8), "FP8_BLOCK")
+        self.assertEqual(ingest._detect_quant_scheme(int4), "")
+
+    def test_modelopt_nvfp4_format_and_scheme(self) -> None:
+        cfg = {"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(ingest._detect_hf_format(Path(tmp), cfg), "modelopt")
+        self.assertEqual(ingest._detect_quant_scheme(cfg), "NVFP4")
+
+    def test_copy_configs_match_rejects_other_generation(self) -> None:
+        def match(a: str, b: str) -> bool:
+            return ingest._names_match(ingest._normalise_for_match(a), ingest._normalise_for_match(b))
+        self.assertFalse(match("DeepSeek-V4.1-Flash-1017-GGUF-UD-Q8_K_XL", "DeepSeek-V3"))
+        self.assertTrue(match("BeMag-123B-v0.1-GGUF", "BeMag-123B"))
 
     def test_block_structure_feeds_parallelism_fields(self) -> None:
         import json
@@ -287,6 +299,46 @@ class Fp8SourceTests(unittest.TestCase):
                 large = cmd(865)
         self.assertIn("--use-temp-file", large)
         self.assertEqual(large[:2], ["env", f"TMPDIR={out}"])
+
+
+class DraftModelTests(unittest.TestCase):
+    def test_draft_is_linked_to_every_variant_and_launched_by_vllm(self) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, cfg in (
+                ("Beam-1.0-501B-A23B-FP8", {"architectures": ["BeamForCausalLM"]}),
+                ("Beam-1.0-501B-A23B-DFlash2", {"dflash_config": {"block_size": 16}}),
+                ("Beam-1.0-501B-A23B-Other", {"architectures": ["BeamForCausalLM"]}),
+            ):
+                (root / name).mkdir()
+                (root / name / "config.json").write_text(json.dumps(cfg))
+            draft = root / "Beam-1.0-501B-A23B-DFlash2"
+            self.assertEqual(ingest._find_draft(root / "Beam-1.0-501B-A23B-FP8", "Beam 1.0 501B A23B"), draft)
+            self.assertIsNone(ingest._find_draft(root / "Beam-1.0-501B-A23B-Other", "Beam 1.0 501B A23B Other"))
+            self.assertNotIn(draft, [c for c, _ in ingest._iter_candidates(root)])
+
+            model = AIModel(
+                id="beam", name="Beam", path=str(root / "Beam-1.0-501B-A23B-FP8"),
+                format=ModelFormat.SAFETENSORS_FP8, ai_types=frozenset({AIType.TEXT_GEN}),
+                draft_path=str(draft),
+            )
+            spec = launch._vllm_speculative_config(model, {"draft": True, "draft_tokens": 7})
+        self.assertEqual(spec, {"method": "dflash", "model": str(draft), "num_speculative_tokens": 7})
+        self.assertIsNone(launch._vllm_speculative_config(model, {"draft": False}))
+
+    def test_gguf_draft_sidecar_is_a_companion_launched_by_llamacpp(self) -> None:
+        sidecar = Path("/m/Model-GGUF/dspark-Model-Q8_0.gguf")
+        self.assertTrue(ingest._is_companion_gguf(sidecar))
+        model = AIModel(
+            id="m", name="M", path="/m/Model-GGUF/Model-Q8_0.gguf", format=ModelFormat.GGUF,
+            ai_types=frozenset({AIType.TEXT_GEN}), draft_path=str(sidecar),
+        )
+        self.assertEqual(
+            launch._gguf_draft_args(model, {"draft": True}),
+            ["--spec-type", "draft-dspark", "--model-draft", str(sidecar)],
+        )
+        self.assertEqual(launch._gguf_draft_args(model, {"draft": False}), [])
 
 
 if __name__ == "__main__":
