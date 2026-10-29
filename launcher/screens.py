@@ -75,6 +75,7 @@ from launcher.models import (
     ServerSoftware,
     available_ai_types,
     fmt_ctx,
+    gguf_shard_paths,
     models_for_type,
     servers_for_model,
     servers_for_type,
@@ -473,6 +474,9 @@ class ServerSelectScreen(DataTableScreen):
             exists = p.is_file() if model.format == ModelFormat.GGUF else p.is_dir()
             if not exists:
                 self.notify(f"Path not found:\n{eff_path}", severity="error", timeout=4)
+                return
+            if problem := launcher.table_variant_problem(model):
+                self.notify(problem, severity="error", timeout=6)
                 return
 
         envs = ENVIRONMENTS.for_server(server.id)
@@ -2775,6 +2779,61 @@ class _TemplatePatchesRow(_PropRow):
             launcher.save_template_patch_enabled(screen.model, patch_id, True)
 
 
+def _table_variant_label(path: str) -> str:
+    """'Q6_K' for '…-engram-Q6_K.gguf_file' (the tag after the last '-'), else the file name."""
+    stem = Path(path).name.split(".")[0]
+    return stem.rsplit("-", 1)[-1] if "-" in stem else stem
+
+
+class _TableVariantRow(_PropRow):
+    label = "Lookup table (Engram / PLE)"
+    help = ("Precision of the split GGUF's lookup-table shard: as shipped, or an alternative table file "
+            "(launched in its place through linked shards) — e to choose, r to reset")
+    editable = True
+
+    def value(self, screen: "ModelPropertiesScreen") -> str:
+        m = screen.model
+        if m.table_variant:
+            return f"{escape(_table_variant_label(m.table_variant))}  [dim]({escape(Path(m.table_variant).name)})[/]"
+        return f"as shipped  [dim](shard {m.table_shard}; {len(m.table_variants)} alternatives)[/]"
+
+    def overridden(self, screen: "ModelPropertiesScreen") -> bool:
+        return bool(screen.model.table_variant)
+
+    def source(self, screen: "ModelPropertiesScreen") -> str:
+        return _source_cell(self.overridden(screen))
+
+    async def edit(self, screen: "ModelPropertiesScreen") -> None:
+        m = screen.model
+        shards = gguf_shard_paths(Path(m.path))
+        shipped = shards[m.table_shard - 1]
+        choices = [("shipped", f"As shipped  ({shipped.name})", "primary" if not m.table_variant else "default")]
+        for index, variant in enumerate(m.table_variants):
+            size = Path(variant).stat().st_size / 1e9 if Path(variant).exists() else 0
+            choices.append((
+                str(index), f"{_table_variant_label(variant)}  ({size:.1f} GB)",
+                "primary" if variant == m.table_variant else "default",
+            ))
+        choices.append(("", "Cancel", "default"))
+        choice = await screen.app.push_screen_wait(ChoiceScreen(
+            f"Lookup table — {escape(m.name)}",
+            f"Shard {m.table_shard} of {len(shards)} holds the model's lookup table.  A chosen alternative "
+            f"is stamped as that shard (two header values rewritten in place, as Unsloth's set_split.py "
+            f"does) and launched through linked shards in launcher/user_data/shard_sets/.",
+            choices,
+        ))
+        if not choice:
+            return
+        variant = "" if choice == "shipped" else m.table_variants[int(choice)]
+        try:
+            await asyncio.to_thread(launcher.save_table_variant, m, variant)  # header I/O may be on the NAS
+        except (OSError, ValueError) as e:
+            screen.notify(str(e), severity="error", timeout=6)
+
+    def reset(self, screen: "ModelPropertiesScreen") -> None:
+        launcher.save_table_variant(screen.model, "")
+
+
 class _SpecRow(_PropRow):
     """A row whose value is described by a ParamSpec (model field or server parameter)."""
 
@@ -2890,6 +2949,8 @@ class ModelPropertiesScreen(DataTableScreen):
         if any(s.chat_template_flag for s in self._servers):
             self._rows.append(_TemplatePatchesRow())
         self._rows += [_ModelFieldRow(spec) for spec in MODEL_FIELDS]
+        if model.table_variants:
+            self._rows.append(_TableVariantRow())
         for server in self._servers:
             self._rows.append(_SectionRow(server.label))
             self._rows += [_ServerParamRow(server, spec) for spec in server.model_params(model)]
@@ -2926,6 +2987,8 @@ class ModelPropertiesScreen(DataTableScreen):
             facts.append(f"MTP: {mtp}")
         if m.draft_path:
             facts.append(f"draft: {Path(m.draft_path).name}")
+        if m.table_variant:
+            facts.append(f"table: {_table_variant_label(m.table_variant)}")
         loc = location_of(m.path)
         copies = [c for c in (location_of(c.path) for c in launcher.copies_of(m)) if c is not None]
         where = f"[dim]{escape(loc.label if loc else 'path')}:[/] {escape(m.path)}"

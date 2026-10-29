@@ -53,6 +53,7 @@ from launcher.models import (
     QuantizationTool, RopeScaling, RuntimeQuant, ServerSoftware, _quant_key,
     gguf_draft_spec_type, gguf_shard_paths, gguf_split_info,
 )
+from launcher.gguf_header import read_gguf_metadata, split_position, stamp_split_position
 from launcher.params import AutoBoolParam, ParamSpec
 from launcher.config import CONFIG
 from launcher.storage import (
@@ -900,7 +901,7 @@ def launch_params(
     for spec, value, _reason in _resolve_auto(server, model, p):
         p[spec.key] = value
     if model is not None:
-        p["_model_path"] = model.path
+        p["_model_path"] = str(shard_set_entry(model)) if model.table_variant else model.path
     p["_runtime_quant"] = runtime_quant
     template = patched_template(model) if model is not None and server.chat_template_flag else None
     p["_chat_template"] = str(template.path) if template is not None else ""  # written by launch()
@@ -993,6 +994,79 @@ def _is_split_gguf(model: AIModel) -> bool:
     return model.format == ModelFormat.GGUF and len(gguf_shard_paths(Path(model.path))) > 1
 
 
+# ---------------------------------------------------------------------------
+# Split GGUF shard sets (table variants)
+# ---------------------------------------------------------------------------
+
+# Launcher-owned directories of shard links, one per model with a table variant chosen.
+_SHARD_SET_DIR = Path(__file__).parent / "user_data" / "shard_sets"
+
+
+def shard_links(model: AIModel) -> list[tuple[str, Path]]:
+    """(shard file name, file to load) for each shard, with the chosen table variant swapped in.
+
+    llama.cpp finds shards 2..N by name beside shard 1, so the variant is loaded
+    through a link carrying the replaced shard's name.
+    """
+    return [
+        (shard.name, Path(model.table_variant) if model.table_variant and index == model.table_shard else shard)
+        for index, shard in enumerate(gguf_shard_paths(Path(model.path)), 1)
+    ]
+
+
+def shard_set_entry(model: AIModel) -> Path:
+    """Shard 1 of *model*'s staged shard set (see stage_shard_set)."""
+    return _SHARD_SET_DIR / model.id / Path(model.path).name
+
+
+def table_variant_problem(model: AIModel) -> str | None:
+    """Why *model*'s chosen table variant cannot load as its shard, or None when it can."""
+    if not model.table_variant:
+        return None
+    variant = Path(model.table_variant)
+    if not variant.is_file():
+        return f"Table variant not found:\n{variant}"
+    expected = (model.table_shard, len(gguf_shard_paths(Path(model.path))))
+    if split_position(read_gguf_metadata(variant)) != expected:
+        return (
+            f"{variant.name} is not stamped as shard {expected[0]} of {expected[1]} — "
+            "choose it again on the model's settings page"
+        )
+    return None
+
+
+def stamp_table_variant(model: AIModel, variant: str) -> None:
+    """Stamp *variant* in place as *model*'s table shard (two header values; idempotent)."""
+    count = len(gguf_shard_paths(Path(model.path)))
+    if split_position(read_gguf_metadata(Path(variant))) != (model.table_shard, count):
+        stamp_split_position(Path(variant), model.table_shard, count)
+
+
+def _replace_link_dir(entry: Path) -> None:
+    """Remove a previous link entry — only ever a link or a dir of links we created."""
+    if entry.is_symlink():
+        entry.unlink()
+    elif entry.is_dir():
+        if not all(child.is_symlink() for child in entry.iterdir()):
+            raise FileExistsError(f"Staging path {entry} is a real directory; refusing to replace it")
+        shutil.rmtree(entry)
+
+
+def _link_shards(model: AIModel, directory: Path) -> None:
+    directory.mkdir(parents=True)
+    for name, target in shard_links(model):
+        (directory / name).symlink_to(target)
+
+
+def stage_shard_set(model: AIModel) -> None:
+    """Link *model*'s shards (chosen table variant swapped in) under shard_set_entry()'s directory."""
+    if problem := table_variant_problem(model):
+        raise ValueError(problem)
+    directory = shard_set_entry(model).parent
+    _replace_link_dir(directory)
+    _link_shards(model, directory)
+
+
 def _staged_name(server: ServerSoftware, model: AIModel) -> str:
     """Name of the entry _stage_model() creates for *model* in the staging dir."""
     if _is_split_gguf(model):
@@ -1010,19 +1084,11 @@ def _stage_model(server: ServerSoftware, model: AIModel, staging: Path) -> None:
     directory, so a single renamed link to shard 1 cannot load.
     """
     entry = staging / _staged_name(server, model)
-    if entry.is_symlink():
-        entry.unlink()
-    elif entry.is_dir():
-        # Only ever remove a dir we created (links only) — never real model data.
-        if not all(child.is_symlink() for child in entry.iterdir()):
-            raise FileExistsError(f"Staging path {entry} is a real directory; refusing to replace it")
-        shutil.rmtree(entry)
+    _replace_link_dir(entry)
     if not _is_split_gguf(model):
         entry.symlink_to(model.path)
         return
-    entry.mkdir()
-    for shard in gguf_shard_paths(Path(model.path)):
-        (entry / shard.name).symlink_to(shard)
+    _link_shards(model, entry)
 
 
 def _one_copy_each(models: list[AIModel]) -> list[AIModel]:
@@ -1133,6 +1199,9 @@ def launch(server: ServerSoftware, env: Environment, model: "AIModel | None", ru
     cuda_root = _bundled_cuda_root(server, env)
     if cuda_root is not None and server.lib_symlinks:
         _ensure_lib_symlinks(cuda_root / "lib", server.lib_symlinks)
+
+    if model is not None and model.table_variant:
+        stage_shard_set(model)
 
     if server.uses_staging_dir:
         p = _merged(server, model)
@@ -1506,6 +1575,25 @@ def save_model_field(model: AIModel, spec: ParamSpec, value: Any) -> None:
             entry.pop(spec.key, None)
         else:
             entry[spec.key] = value
+
+    _patch_catalog(model, _apply)
+
+
+def save_table_variant(model: AIModel, variant: str) -> None:
+    """Choose the table file launched as *model*'s table shard ('' = the shard as shipped).
+
+    A variant is stamped as that shard first (stamp_table_variant).  Mutates the
+    in-memory model immediately, then updates the JSON catalog.
+    """
+    if variant:
+        stamp_table_variant(model, variant)
+    model.table_variant = variant
+
+    def _apply(entry: dict) -> None:
+        if variant:
+            entry["table_variant"] = variant
+        else:
+            entry.pop("table_variant", None)
 
     _patch_catalog(model, _apply)
 

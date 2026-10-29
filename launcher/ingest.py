@@ -53,7 +53,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from launcher.gguf_header import arch_int, embedded_mtp_layers, read_gguf_metadata
+from launcher.gguf_header import arch_int, embedded_mtp_layers, read_gguf_metadata, read_gguf_tensor_names
 from launcher.chat_template import declares_tools, read_template_at
 from launcher.hf_config import draft_method
 from launcher.models import (
@@ -1012,6 +1012,36 @@ def _find_sidecar(bundle_root: Path, prefixes: tuple[str, ...], quant: str) -> P
     return matches[0] if matches else None
 
 
+# Bundle subdirectories holding alternative-precision lookup tables (Unsloth names them
+# *.gguf_file so model scanners skip them) that can replace a split GGUF's table shard.
+_TABLE_VARIANT_DIRS = ("engram",)
+_TABLE_VARIANT_GLOBS = ("*.gguf_file", "*.gguf")
+
+
+def _find_table_variants(gguf_path: Path) -> tuple[int, list[str]]:
+    """(1-based table shard, alternative table files) for a split GGUF; (0, []) when none.
+
+    The table shard is the one holding exactly the tensors a variant file holds
+    (e.g. only per_layer_token_embd.weight).
+    """
+    shards = gguf_shard_paths(gguf_path)
+    candidates = sorted({
+        f for d in _TABLE_VARIANT_DIRS for g in _TABLE_VARIANT_GLOBS for f in (gguf_path.parent / d).glob(g)
+    })
+    if len(shards) < 2 or not candidates:
+        return 0, []
+    try:
+        tables = {f: frozenset(read_gguf_tensor_names(f)) for f in candidates}
+        for index, shard in enumerate(shards, 1):
+            names = frozenset(read_gguf_tensor_names(shard))
+            variants = [str(f) for f, t in tables.items() if names and t == names]
+            if variants:
+                return index, variants
+    except (OSError, ValueError) as exc:
+        print(f"[ingest] Warning: could not read table variants: {exc}", file=sys.stderr)
+    return 0, []
+
+
 def do_copy_mmproj(scan_root: Path, dry_run: bool) -> None:
     """Copy mmproj files from original model dirs into their GGUF bundle directories.
 
@@ -1178,6 +1208,10 @@ def detect_gguf(gguf_path: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     if mmproj_path:   entry["mmproj_path"]  = str(mmproj_path)
     if mtp_path:      entry["mtp_path"]     = str(mtp_path)
     if draft_path:    entry["draft_path"]   = str(draft_path)
+    table_shard, table_variants = _find_table_variants(gguf_path)
+    if table_variants:
+        entry["table_shard"]    = table_shard
+        entry["table_variants"] = table_variants
     if mtp_embedded:  entry["mtp_embedded"] = True
     if template_tools: entry["template_tools"] = True
     if trust_rc:      entry["trust_remote_code"] = True
@@ -1413,7 +1447,7 @@ def build_entry(
 # quant, trust_remote_code) are never touched by refresh.
 _REFRESHABLE_FIELDS: frozenset[str] = frozenset({
     "arch", "ctx", "draft_path", "moe_active", "moe_experts", "mmproj_path", "mtp_embedded", "mtp_path",
-    "params_m", "size_gb", "template_tools", "vision",
+    "params_m", "size_gb", "table_shard", "table_variants", "template_tools", "vision",
 })
 
 
@@ -1461,14 +1495,15 @@ def _refresh_one(
         if field in ("arch",):               return str(raw) if raw else ""
         if field in ("mmproj_path", "mtp_path", "draft_path"): return str(raw) if raw else ""
         if field == "ctx":                   return int(raw) if raw else 32_768
-        if field in ("moe_experts", "moe_active"): return int(raw) if raw else 0
+        if field in ("moe_experts", "moe_active", "table_shard"): return int(raw) if raw else 0
         if field in ("vision", "mtp_embedded", "template_tools"): return bool(raw)
+        if field == "table_variants":        return list(raw) if raw else []
         return raw
 
     # Fields omitted from JSON when default — delete key rather than write falsy value
     _omit_when_default = frozenset({
         "params_m", "arch", "moe_experts", "moe_active", "vision", "mmproj_path", "mtp_path", "mtp_embedded",
-        "template_tools", "draft_path",
+        "template_tools", "draft_path", "table_shard", "table_variants",
     })
 
     changes: list[str] = []

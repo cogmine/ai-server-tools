@@ -430,6 +430,11 @@ class AIModel:
     mmproj_path: str = ""          # path to companion mmproj .gguf file (vision GGUF only)
     mtp_path: str = ""             # path to companion multi-token-prediction draft head .gguf (GGUF only)
     draft_path: str = ""           # speculative draft companion: HF draft dir (vLLM) or GGUF draft sidecar (llama.cpp)
+    # Split GGUFs whose Engram / PLE lookup table sits alone in one shard can swap that
+    # shard for an alternative-precision table file (e.g. Unsloth's engram/ variants).
+    table_shard: int = 0           # 1-based shard holding only the table (0 = none detected)
+    table_variants: tuple[str, ...] = ()  # alternative table files for that shard (detected)
+    table_variant: str = ""        # the alternative launched in its place ('' = the shard as shipped)
     mtp_embedded: bool = False     # the model carries its own MTP layers: GGUF nextn_predict_layers > 0, or an HF checkpoint declaring MTP layers that ships their weights
     trust_remote_code: bool = False  # servers must pass --trust-remote-code
     quant: str = ""                # quant suffix for display, e.g. "Q4_K_M" (mainly GGUF)
@@ -490,6 +495,9 @@ class AIModel:
             mmproj_path=d.get("mmproj_path", ""),
             mtp_path=d.get("mtp_path", ""),
             draft_path=d.get("draft_path", ""),
+            table_shard=int(d.get("table_shard", 0)),
+            table_variants=tuple(d.get("table_variants", ())),
+            table_variant=d.get("table_variant", ""),
             mtp_embedded=bool(d.get("mtp_embedded", False)),
             trust_remote_code=bool(d.get("trust_remote_code", False)),
             quant=d.get("quant", ""),
@@ -531,8 +539,8 @@ class AIModel:
 
     @property
     def companion_paths(self) -> list[str]:
-        """Companion files / dirs the model needs (mmproj, MTP head, draft model)."""
-        return [p for p in (self.mmproj_path, self.mtp_path, self.draft_path) if p]
+        """Companion files / dirs the model needs (mmproj, MTP head, draft model, chosen table)."""
+        return [p for p in (self.mmproj_path, self.mtp_path, self.draft_path, self.table_variant) if p]
 
     def derived_entry_fields(self) -> dict[str, Any]:
         """Catalog fields a converted / quantized model derived from this one inherits.

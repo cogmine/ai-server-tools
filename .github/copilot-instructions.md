@@ -122,18 +122,23 @@ Server tools scan config files at startup — on a NAS or slow drive this causes
 Three native environments (registered in the launcher, `kind: native`):
 - **`llama.cpp`** (default) — `~/llama.cpp`, build b10109 (2026-07-24), `~/llama.cpp/build/bin`.
 - **`llama.cpp-next`** — `~/llama.cpp-next`, a **git worktree** of the same repo at the latest
-  `origin/master` (detached), built into `~/llama.cpp-next/build/bin` (b11461, 2026-10-07; includes
-  `qwen4exp` / Qwen3.8-Flash-Next support). Binaries use RUNPATH to their own `build/bin`, so the
+  `origin/master` (detached), built into `~/llama.cpp-next/build/bin` (b11889, 2026-10-25; includes
+  `qwen4exp` / Qwen3.8-Flash-Next, `deepseek41` / DeepSeek-V4.1-Flash incl. its vision projector, and
+  `draft-dspark` / `draft-dflash` speculative types). Binaries use RUNPATH to their own `build/bin`, so the
   builds never share libraries.
-- **`llama.cpp-next-patched`** — `~/llama.cpp-next-patched`, a third worktree: `origin/master` b11706
-  (2026-10-16) plus one **local commit** (never pushed) applying the fix from ggml-org/llama.cpp#29811
+- **`llama.cpp-next-patched`** — `~/llama.cpp-next-patched`, a third worktree: `origin/master` b11889
+  (2026-10-25) plus one **local commit** (never pushed) applying the fix from ggml-org/llama.cpp#29811
   (`src/models/qwen4exp.cpp`: the MTP draft graph builds k-pool inputs only when the MTP block's
   `attention.compress_ratios` entry is > 0). Without it, Qwen4Exp MTP heads converted before llama.cpp's
   merged MTP support (ratio 0 for the MTP block — e.g. orcarouter's embedded `-Q8_0-MTP` GGUF) abort at
-  startup with `GGML_ASSERT(buffer)` in `set_input_k_idxs`. b11706 also fixes MTP + image input (#30257,
-  #30397), which crashes b11461. Validated: `qwen3-8-flash-next-uncensored-mtp-q8`, 3 × 256K, text + image,
+  startup with `GGML_ASSERT(buffer)` in `set_input_k_idxs` (issue still open, no PR, as of b11889).
+  b11706+ also fixes MTP + image input (#30257, #30397). Validated (b11706): `qwen3-8-flash-next-uncensored-mtp-q8`, 3 × 256K, text + image,
   ~60 t/s, draft acceptance 54–67%. **Update** (re-applies the patch; drop it once merged upstream):
   `cd ~/llama.cpp-next-patched && git fetch origin && git rebase origin/master && /usr/bin/cmake --build build -j 32`.
+- **DeepSeek-V4.1 GGUFs (Unsloth)** were made for their PR #30817, whose MXFP8 Engram table
+  (`per_layer_token_embd`, ggml type 43) never reached master ("invalid ggml type 43"). On master, swap
+  the Engram shard for one of Unsloth's standard-type tables (`engram/…-engram-Q6_K` etc., stamped with
+  their `set_split.py`); the other shards and the metadata match master's `deepseek41` loader.
 - **Build config** (identical for both): `/usr/bin/cmake` (the `~/.local/bin/cmake` pip shim is broken),
   `-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.5/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=ON
@@ -303,6 +308,7 @@ Status field: `"good"` (green), `"bad"` (red), `"unknown"` (white) — persisted
 `template_tools` field: `true` when the chat template renders a `tools` list (auto-detected by `ingest`/`refresh`) — sufficient for llama.cpp tool calling; vLLM/SGLang additionally need `tool_call_parser`. Model list tool column: 🔧 = parser set, dim ✓ = template only.
 `mtp_embedded` field: `true` when the model carries MTP/NextN layers — GGUF `<arch>.nextn_predict_layers` (`launcher/gguf_header.py`), or an HF checkpoint whose config declares `mtp_num_hidden_layers`/`num_nextn_predict_layers` and ships the weights (`ingest._detect_hf_mtp`). llama.cpp/ooba: `--spec-type draft-mtp` (no draft file) only when their `mtp` param is on — auto uses sidecar heads only, because llama.cpp may not implement MTP for the architecture (GLM5-Next does not yet). vLLM: `--speculative-config` when its `mtp` param is on (opt-in).
 `draft_path` field: speculative-decoding draft companion. HF models: draft checkpoint dir (e.g. `Beam-1.0-501B-A23B-DFlash2`, shared by Beam BF16/FP8/NVFP4), auto-detected by `ingest`/`refresh` as a sibling named `<model>-<method>…` whose config marks a draft (`hf_config.draft_method`); vLLM `draft` param. GGUF: a `dspark-*.gguf` / `dflash-*.gguf` sidecar in the bundle; llama.cpp `draft` param → `--spec-type draft-dspark|draft-dflash --model-draft`. Both opt-in, precedence over MTP; drafts are never ingested as models. Copied/deleted with the model as a companion.
+`table_shard` / `table_variants` / `table_variant` fields: split GGUFs whose Engram/PLE lookup table is alone in one shard can launch an alternative-precision table from the bundle's `engram/` dir (Unsloth DeepSeek-V4.1). Detected by `ingest`/`refresh`; chosen on the model properties page (*Lookup table* row), which stamps the file's split header as that shard; launches go through linked shards in `launcher/user_data/shard_sets/<id>/`.
 `tool_call_parser` field: vLLM tool-call parser name (e.g. `"openai"`, `"hermes"`, `"llama3_json"`). When set, vLLM emits `--enable-auto-tool-choice --tool-call-parser <name>` and SGLang emits `--tool-call-parser <translated_name>` (via `_SGLANG_TOOL_PARSER_MAP` in `launch.py`). Omitted from JSON when empty.
 `reasoning_parser` field: vLLM reasoning parser name (e.g. `"qwen3"`, `"deepseek_r1"`). When set, vLLM and SGLang emit `--reasoning-parser <name>` (SGLang names translated via `_SGLANG_REASONING_PARSER_MAP` in `launch.py`). Edited on the model properties page; inherited by quantizations. Omitted from JSON when empty.
 Model list sort is multi-column: `_sort_keys` list of `(col, reverse)` tuples. Default order: `fav → status → name`. Clicking a header promotes it to primary (ascending); clicking the primary toggles direction. `_STATUS_RANK` maps composite status symbols (✓, ✓?, ✓✗, ✗?, ✗, ?) to integers 0–5 for sort.

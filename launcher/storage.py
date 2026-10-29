@@ -79,9 +79,11 @@ def relocated_entry(entry: dict, dest: Location) -> dict:
     """A snapshot of JSON catalog *entry* for its copy at the mirrored path under *dest*."""
     relocated = json.loads(json.dumps(entry))  # deep copy: nested status / params dicts
     relocated["path"] = str(mirrored_path(entry["path"], dest))
-    for key in ("mmproj_path", "mtp_path", "draft_path"):
+    for key in ("mmproj_path", "mtp_path", "draft_path", "table_variant"):
         if relocated.get(key):
             relocated[key] = str(mirrored_path(relocated[key], dest))
+    if relocated.get("table_variants"):
+        relocated["table_variants"] = [str(mirrored_path(v, dest)) for v in relocated["table_variants"]]
     return relocated
 
 

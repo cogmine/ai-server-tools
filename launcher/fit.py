@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from launcher.environments import Environment
-from launcher.launch import launch_params, llamacpp_model_args
+from launcher.launch import launch_params, llamacpp_model_args, stage_shard_set
 from launcher.models import AIModel, ServerSoftware
 
 
@@ -215,4 +215,6 @@ def estimate_fit(
     if probe is None:
         return None
     params = launch_params(server, model, param_overrides=param_overrides)
+    if model.table_variant:
+        stage_shard_set(model)  # the probe loads the model through the staged shard set
     return probe.estimate(server, env, model, params, cuda_devices, cancelled, progress)

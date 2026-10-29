@@ -341,5 +341,50 @@ class DraftModelTests(unittest.TestCase):
         self.assertEqual(launch._gguf_draft_args(model, {"draft": False}), [])
 
 
+def _write_gguf(path: Path, tensors: list[str], split: tuple[int, int] | None = None) -> None:
+    """Minimal GGUF v3 header: optional split.no / split.count (u16) and named 1-D tensors."""
+    import struct
+
+    def string(s: str) -> bytes:
+        return struct.pack("<Q", len(s)) + s.encode()
+
+    kv = b""
+    if split is not None:
+        kv += string("split.no") + struct.pack("<IH", 2, split[0] - 1)
+        kv += string("split.count") + struct.pack("<IH", 2, split[1])
+    infos = b"".join(string(t) + struct.pack("<IQIQ", 1, 16, 0, 0) for t in tensors)
+    path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 2 if split else 0) + kv + infos)
+
+
+class TableVariantTests(unittest.TestCase):
+    def test_variant_is_detected_stamped_and_swapped_into_the_shard_set(self) -> None:
+        from launcher import gguf_header
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "Model-GGUF"
+            (bundle / "engram").mkdir(parents=True)
+            shards = [bundle / f"Model-0000{i}-of-00003.gguf" for i in (1, 2, 3)]
+            _write_gguf(shards[0], [], (1, 3))
+            _write_gguf(shards[1], ["per_layer_token_embd.weight"], (2, 3))
+            _write_gguf(shards[2], ["token_embd.weight", "output.weight"], (3, 3))
+            variant = bundle / "engram" / "Model-engram-Q6_K.gguf_file"
+            _write_gguf(variant, ["per_layer_token_embd.weight"], (1, 1))
+
+            self.assertEqual(ingest._find_table_variants(shards[0]), (2, [str(variant)]))
+            model = AIModel(
+                id="m", name="M", path=str(shards[0]), format=ModelFormat.GGUF,
+                ai_types=frozenset({AIType.TEXT_GEN}), table_shard=2, table_variants=(str(variant),),
+                table_variant=str(variant),
+            )
+            self.assertIsNotNone(launch.table_variant_problem(model))
+            launch.stamp_table_variant(model, str(variant))
+            self.assertEqual(gguf_header.split_position(gguf_header.read_gguf_metadata(variant)), (2, 3))
+            self.assertEqual(gguf_header.read_gguf_tensor_names(variant), ["per_layer_token_embd.weight"])
+            self.assertIsNone(launch.table_variant_problem(model))
+            self.assertEqual(
+                launch.shard_links(model),
+                [(shards[0].name, shards[0]), (shards[1].name, variant), (shards[2].name, shards[2])],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
