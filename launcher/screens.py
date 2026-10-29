@@ -2780,8 +2780,11 @@ class _TemplatePatchesRow(_PropRow):
 
 
 def _table_variant_label(path: str) -> str:
-    """'Q6_K' for '…-engram-Q6_K.gguf_file' (the tag after the last '-'), else the file name."""
-    stem = Path(path).name.split(".")[0]
+    """'Q6_K' for '…-engram-Q6_K.gguf_file' (the tag after the last '-'), else the file name.
+
+    Uses Path.stem so dots inside the model name ('V4.1') survive the suffix strip.
+    """
+    stem = Path(path).stem
     return stem.rsplit("-", 1)[-1] if "-" in stem else stem
 
 

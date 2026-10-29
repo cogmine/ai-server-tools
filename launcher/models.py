@@ -539,8 +539,16 @@ class AIModel:
 
     @property
     def companion_paths(self) -> list[str]:
-        """Companion files / dirs the model needs (mmproj, MTP head, draft model, chosen table)."""
-        return [p for p in (self.mmproj_path, self.mtp_path, self.draft_path, self.table_variant) if p]
+        """Companion files / dirs the model needs (mmproj, MTP head, draft model, lookup tables).
+
+        Every alternative table file is listed, not just the chosen one, so a copy
+        to another location keeps all the options the lookup-table picker offers.
+        """
+        out: list[str] = []
+        for p in (self.mmproj_path, self.mtp_path, self.draft_path, self.table_variant, *self.table_variants):
+            if p and p not in out:
+                out.append(p)
+        return out
 
     def derived_entry_fields(self) -> dict[str, Any]:
         """Catalog fields a converted / quantized model derived from this one inherits.
