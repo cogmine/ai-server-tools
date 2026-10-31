@@ -1015,8 +1015,10 @@ def shard_links(model: AIModel) -> list[tuple[str, Path]]:
 
 
 def shard_set_entry(model: AIModel) -> Path:
-    """Shard 1 of *model*'s staged shard set (see stage_shard_set)."""
-    return _SHARD_SET_DIR / model.id / Path(model.path).name
+    """Shard 1 of *model*'s staged shard set (see stage_shard_set); one set per copy."""
+    loc = location_of(model.path)
+    name = f"{model.id}@{loc.label}" if loc is not None else model.id
+    return _SHARD_SET_DIR / name / Path(model.path).name
 
 
 def table_variant_problem(model: AIModel) -> str | None:
