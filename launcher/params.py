@@ -21,10 +21,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
+    from launcher.environments import Environment
     from launcher.models import AIModel
 
-# Resolves an "auto" value for a launch: (model, merged params) → (value, reason).
-AutoResolver = Callable[["AIModel | None", dict[str, Any]], tuple[bool, str]]
+# Resolves an "auto" value for a launch: (model, merged params, environment) → (value, reason).
+# The environment is None only when the server has none registered.
+AutoResolver = Callable[["AIModel | None", dict[str, Any], "Environment | None"], tuple[bool, str]]
 
 
 @dataclass(frozen=True, kw_only=True)

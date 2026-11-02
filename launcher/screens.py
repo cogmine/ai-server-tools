@@ -1416,7 +1416,7 @@ class GpuSelectScreen(GpuSelectionScreen):
         # Concurrent request slots (server.concurrency_param); None = not adjustable.
         self._slots: int | None = None
         if server.concurrency_param and model is not None:
-            self._slots = int(launcher.launch_params(server, model)[server.concurrency_param])
+            self._slots = int(launcher.launch_params(server, model, env=env)[server.concurrency_param])
         self._fit_probe = fit_probe_for(server, env) if model is not None else None
         # Bumped on every settings change; results from older estimates are discarded.
         self._fit_generation = 0
@@ -1480,7 +1480,7 @@ class GpuSelectScreen(GpuSelectionScreen):
         elif self._server.gpu_count_param:
             parts.append(f"[dim]{self._server.gpu_count_param}[/] → [bold]{n}[/]")
         if self._model is not None:
-            for spec, value, _reason in launcher.auto_param_states(self._server, self._model, overrides):
+            for spec, value, _reason in launcher.auto_param_states(self._server, self._model, overrides, self._env):
                 if value:
                     parts.append(f"{spec.label.lower()}: [bold]on[/] [dim](auto)[/]")
         power_step = self._power_step()
@@ -2911,7 +2911,7 @@ class _ServerParamRow(_SpecRow):
         if self.spec.managed_by:
             return f"{escape(self.spec.format(preview[self.spec.key]))}  [dim](planned for {screen.gpu_count} GPUs)[/]"
         if self.current(screen) is None and isinstance(self.spec, AutoBoolParam):
-            resolved, reason = self.spec.resolve(screen.model, preview)
+            resolved, reason = self.spec.resolve(screen.model, preview, ENVIRONMENTS.default_for(self.server.id))
             return f"auto → {'on' if resolved else 'off'}  [dim]({escape(reason)})[/]"
         return super().value(screen)
 

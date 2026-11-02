@@ -894,11 +894,14 @@ def launch_params(
     model: "AIModel | None",
     runtime_quant: "RuntimeQuant | None" = None,
     param_overrides: dict[str, Any] | None = None,
+    env: Environment | None = None,
 ) -> dict[str, Any]:
     """Resolved builder params: merged defaults/overrides with "auto" values resolved,
-    plus the injected _model_path / _runtime_quant / _chat_template."""
+    plus the injected _model_path / _runtime_quant / _chat_template.
+
+    "auto" values are resolved for *env* (default: the server's default environment)."""
     p = _merged(server, model, param_overrides)
-    for spec, value, _reason in _resolve_auto(server, model, p):
+    for spec, value, _reason in _resolve_auto(server, model, p, env):
         p[spec.key] = value
     if model is not None:
         p["_model_path"] = str(shard_set_entry(model)) if model.table_variant else model.path
@@ -909,20 +912,24 @@ def launch_params(
 
 
 def _resolve_auto(
-    server: ServerSoftware, model: "AIModel | None", merged: dict[str, Any],
+    server: ServerSoftware, model: "AIModel | None", merged: dict[str, Any], env: Environment | None,
 ) -> list[tuple[AutoBoolParam, bool, str]]:
+    env = env or ENVIRONMENTS.default_for(server.id)
     return [
-        (spec, *spec.resolve(model, merged))
+        (spec, *spec.resolve(model, merged, env))
         for spec in server.auto_params()
         if merged.get(spec.key) is None
     ]
 
 
 def auto_param_states(
-    server: ServerSoftware, model: "AIModel | None", param_overrides: dict[str, Any] | None = None,
+    server: ServerSoftware,
+    model: "AIModel | None",
+    param_overrides: dict[str, Any] | None = None,
+    env: Environment | None = None,
 ) -> list[tuple[AutoBoolParam, bool, str]]:
     """(spec, resolved value, reason) for each parameter left at "auto" for this launch."""
-    return _resolve_auto(server, model, _merged(server, model, param_overrides))
+    return _resolve_auto(server, model, _merged(server, model, param_overrides), env)
 
 
 def gpu_param_overrides(
@@ -952,7 +959,7 @@ def build_cmd(server: ServerSoftware, env: Environment, model: "AIModel | None",
     used by GpuSelectScreen to inject gpu_count_param (e.g. pipeline_parallel)
     and the concurrency_param.
     """
-    p = launch_params(server, model, runtime_quant, param_overrides)
+    p = launch_params(server, model, runtime_quant, param_overrides, env)
     builder = _BUILDERS.get(server.id)
     if builder is None:
         raise ValueError(f"No command builder registered for server: {server.id!r}")

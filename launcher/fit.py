@@ -214,7 +214,7 @@ def estimate_fit(
     probe = fit_probe_for(server, env)
     if probe is None:
         return None
-    params = launch_params(server, model, param_overrides=param_overrides)
+    params = launch_params(server, model, param_overrides=param_overrides, env=env)
     if model.table_variant:
         stage_shard_set(model)  # the probe loads the model through the staged shard set
     return probe.estimate(server, env, model, params, cuda_devices, cancelled, progress)

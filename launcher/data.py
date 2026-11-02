@@ -18,9 +18,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from launcher.hf_config import expert_parallel_needed, fp8_block_size
+from launcher.capabilities import llamacpp_mtp_support, vllm_mtp_support
 from launcher.models import (
     AIModel, AIType, GGUFQuant, ModelFormat,
     HardwareRequirement, QuantizationTool, QuantOption, RuntimeQuant, RuntimeQuantOption,
@@ -30,6 +31,9 @@ from launcher.params import (
     AutoBoolParam, BoolParam, ChoiceParam, FlagsParam, FloatParam, IntParam, TextParam,
 )
 from launcher.config import CONFIG
+
+if TYPE_CHECKING:
+    from launcher.environments import Environment
 
 
 # ---------------------------------------------------------------------------
@@ -52,17 +56,43 @@ _EXTRA_FLAGS = FlagsParam(
 )
 
 
-def _vllm_expert_parallel(model: AIModel | None, p: dict[str, Any]) -> tuple[bool, str]:
+def _vllm_expert_parallel(model: AIModel | None, p: dict[str, Any], env: Environment | None) -> tuple[bool, str]:
     return expert_parallel_needed(model, int(p["tensor_parallel"]))
 
 
-def _sidecar_mtp(model: AIModel | None, p: dict[str, Any]) -> tuple[bool, str]:
-    """llama.cpp-style MTP: auto uses a sidecar mtp-*.gguf head; embedded heads are opt-in."""
+def _sidecar_mtp(model: AIModel | None, p: dict[str, Any], env: Environment | None) -> tuple[bool, str]:
+    """ooba's bundled llama.cpp: auto uses a sidecar mtp-*.gguf head; embedded heads are opt-in."""
     if model is not None and model.mtp_path:
         return True, "sidecar MTP head"
     if model is not None and model.mtp_embedded:
         return False, "embedded head is opt-in (the build may not support it for this architecture)"
     return False, "no MTP head"
+
+
+def _llamacpp_mtp(model: AIModel | None, p: dict[str, Any], env: Environment | None) -> tuple[bool, str]:
+    """auto: a sidecar mtp-*.gguf head, else the embedded head when the build implements MTP for its arch."""
+    if model is not None and model.mtp_path:
+        return True, "sidecar MTP head"
+    if model is None or not model.mtp_embedded:
+        return False, "no MTP head"
+    if env is None:
+        return False, "embedded head: no llama.cpp environment to check"
+    supported, reason = llamacpp_mtp_support(env.bin_dir, model.path)
+    if supported is None:
+        return False, f"embedded head is opt-in ({reason})"
+    return supported, reason
+
+
+def _vllm_mtp(model: AIModel | None, p: dict[str, Any], env: Environment | None) -> tuple[bool, str]:
+    """auto: on when the environment's vLLM has an MTP draft model for the checkpoint's architecture."""
+    if model is None or not model.mtp_embedded:
+        return False, "no MTP layers"
+    if env is None:
+        return False, "no vLLM environment to check"
+    supported, reason = vllm_mtp_support(env, model)
+    if supported is None:
+        return False, f"unknown ({reason})"
+    return supported, reason
 
 
 def _has_mtp_head(model: AIModel) -> bool:
@@ -194,12 +224,13 @@ SERVERS: list[ServerSoftware] = [
                 help="--max-model-len -1: start from the native context and lower it only as far "
                      "as needed to fit the KV cache (logged as \"Auto-fit max_model_len\")",
             ),
-            BoolParam(
-                key="mtp", label="MTP speculative decoding", default=False,
+            AutoBoolParam(
+                key="mtp", label="MTP speculative decoding", resolve=_vllm_mtp,
                 applies_to=_has_embedded_mtp,
                 help="Use the checkpoint's multi-token-prediction layers as a draft "
-                     "(--speculative-config method mtp).  Speeds up decoding but its weights "
-                     "and draft KV cost memory (the fitted context shrinks)",
+                     "(--speculative-config method mtp).  auto turns it on when the environment's "
+                     "vLLM has an MTP model for the architecture.  Speeds up decoding but its "
+                     "weights and draft KV cost memory (the fitted context shrinks)",
             ),
             IntParam(
                 key="mtp_tokens", label="MTP draft tokens", default=2, minimum=1, maximum=8,
@@ -299,10 +330,11 @@ SERVERS: list[ServerSoftware] = [
                 help="--cache-ram ceiling (default from [memory] host_cache_ram in config.toml)",
             ),
             AutoBoolParam(
-                key="mtp", label="MTP speculative decoding", resolve=_sidecar_mtp,
+                key="mtp", label="MTP speculative decoding", resolve=_llamacpp_mtp,
                 applies_to=_has_mtp_head,
-                help="auto uses a sidecar mtp-*.gguf head; on also uses the model's embedded head "
-                     "(opt-in: llama.cpp may not implement MTP for the architecture); off disables",
+                help="auto uses a sidecar mtp-*.gguf head, else the model's embedded head when the "
+                     "chosen build implements MTP for its architecture (read from the build's "
+                     "libllama.so and source); on forces the embedded head; off disables",
             ),
             BoolParam(
                 key="draft", label="Draft-model speculative decoding", default=False,
