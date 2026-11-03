@@ -22,8 +22,13 @@ A full-screen live dashboard for seeing what every NVIDIA GPU in the machine is 
 
 ## Requirements
 
-- Linux, NVIDIA GPUs with a compatible driver (NVML required)
+- NVIDIA GPUs with a compatible driver (NVML required)
 - [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda
+
+| Tool | Linux | Windows |
+|---|---|---|
+| GPU Monitor | ✓ | ✓ — PCIe slot grouping and port-width capping unavailable (they read Linux sysfs) |
+| Launcher | ✓ | ✗ — needs POSIX PTYs, `rsync`, bash scripts and Linux-only servers (vLLM, SGLang); WSL2 untested |
 
 ## Shared setup
 
@@ -31,6 +36,12 @@ Both tools use a single shared conda environment defined at the repo root:
 
 ```bash
 conda env create -f ~/ai-server-tools/environment.yml
+```
+
+On Windows (Anaconda Prompt or PowerShell with conda initialised), from the repo root:
+
+```powershell
+conda env create -f environment.yml
 ```
 
 This installs Python 3.11, `textual`, and `nvidia-ml-py`. The AI model servers (vLLM, tabbyAPI, etc.) each have their own separate conda environments — see [launcher/README.md](launcher/README.md) for details.
@@ -62,6 +73,14 @@ cd ~/ai-server-tools
 ```
 
 Or with convenience scripts — see each tool's README.
+
+Windows (GPU Monitor only; use Windows Terminal — the legacy console renders Textual poorly):
+
+```powershell
+cd ai-server-tools
+conda activate ai-tools
+python -m gpu_monitor
+```
 
 ## Repo layout
 

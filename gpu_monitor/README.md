@@ -19,6 +19,15 @@ cd ~/ai-server-tools
 ~/miniconda3/envs/ai-tools/bin/python -m gpu_monitor
 ```
 
+Windows (in Windows Terminal, from the repo root):
+
+```powershell
+conda activate ai-tools
+python -m gpu_monitor
+```
+
+On Windows the PCIe slot grouping and the port-width cap in the `Width` column are unavailable (they come from Linux sysfs); all other columns work.
+
 Press `q` or `Escape` to exit.
 
 ## Display columns
